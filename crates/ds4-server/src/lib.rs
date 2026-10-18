@@ -112,10 +112,10 @@ pub use render::{
     append_tool_result_text, render_chat, render_chat_choice, render_dots3_chat, render_dsml_chat,
     render_dsml_chat_choice, render_dsml_chat_choice_ex, render_exaone_chat, render_live_tool_tail,
     render_motif3_chat, render_motif3_chat_ex, render_qwen_chat_ex, render_solar_chat,
-    render_solar_chat_ex, role_is_system, role_is_user_like, syntax_for_model_id,
-    think_effort_prefix, tool_start_marker, DsmlHead, ModelSyntax, RenderError, DSML_ASSISTANT,
-    DSML_BOS, DSML_EOS, DSML_SYSTEM_TOKEN, DSML_THINK_END, DSML_THINK_START, DSML_USER,
-    THINK_HIGH_PREFIX, THINK_MAX_PREFIX, V41_THINK_HIGH_PREFIX, V41_THINK_MAX_PREFIX,
+    render_solar_chat_ex, responses_visible_assistant_suffix, role_is_system, role_is_user_like,
+    syntax_for_model_id, think_effort_prefix, tool_start_marker, DsmlHead, ModelSyntax, RenderError,
+    DSML_ASSISTANT, DSML_BOS, DSML_EOS, DSML_SYSTEM_TOKEN, DSML_THINK_END, DSML_THINK_START,
+    DSML_USER, THINK_HIGH_PREFIX, THINK_MAX_PREFIX, V41_THINK_HIGH_PREFIX, V41_THINK_MAX_PREFIX,
 };
 pub use retry::dump_script as retry_dump_script;
 pub use route::{

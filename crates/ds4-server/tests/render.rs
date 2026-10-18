@@ -1050,3 +1050,49 @@ fn dsml_v41_writes_a_tool_message_image_inside_its_envelope() {
     assert!(text.contains(&format!("<tool_result>shot:{DSML_IMAGE}done</tool_result>")));
     assert_eq!(text.matches(DSML_IMAGE).count(), 1);
 }
+
+/// The reference's own test (ds4_server.c:20386
+/// `test_responses_visible_suffix_matches_client_replay`): a final answer's
+/// reasoning stays out of the remembered visible prefix even when summaries
+/// were requested, while a tool-call turn carries its summary before the think
+/// close and the call block after it.
+#[test]
+fn responses_visible_suffix_matches_client_replay() {
+    use ds4_server::responses_visible_assistant_suffix;
+
+    let none: Vec<ToolCall> = Vec::new();
+    let suffix = responses_visible_assistant_suffix(
+        ModelSyntax::DeepSeek,
+        true,
+        ThinkMode::High,
+        true,
+        b"5",
+        b"hidden summary",
+        &none,
+        &[],
+    );
+    let text = String::from_utf8(suffix).unwrap();
+    assert!(!text.contains("hidden summary"), "{text}");
+    assert!(text.contains("</think>5"), "{text}");
+    assert!(text.ends_with(DSML_EOS), "{text}");
+
+    let calls = vec![ToolCall {
+        id: "call_live".into(),
+        name: "bash".into(),
+        arguments: r#"{"command":"pwd"}"#.into(),
+    }];
+    let suffix = responses_visible_assistant_suffix(
+        ModelSyntax::DeepSeek,
+        true,
+        ThinkMode::High,
+        true,
+        b"",
+        b"tool summary",
+        &calls,
+        &[],
+    );
+    let text = String::from_utf8(suffix).unwrap();
+    assert!(text.contains("tool summary</think>"), "{text}");
+    assert!(text.contains(DSML_TOOL_CALLS_START_SPACED), "{text}");
+    assert!(text.ends_with(DSML_EOS), "{text}");
+}

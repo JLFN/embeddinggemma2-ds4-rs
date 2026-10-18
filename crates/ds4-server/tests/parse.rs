@@ -1040,3 +1040,32 @@ mod v41_media {
         }
     }
 }
+
+/// CTR clause 2.3.7, the server's half: the client echoes `reasoning_content` on
+/// every assistant message, empty included, and the server must not require the
+/// key.  Both shapes parse, and the reasoning the message carried is what the
+/// render sees -- an omitted key is not an error and an empty value stays empty
+/// (`types.rs` 526-538; `conversation.rs` 3691-3740).
+#[test]
+fn assistant_reasoning_is_optional_and_may_be_empty() {
+    let eng = ParseEnv {
+        engine_defaults: true,
+        ..env()
+    };
+    let empty = parse_chat_request(
+        &eng,
+        r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok","reasoning_content":""},{"role":"user","content":"again"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(empty.messages[1].role, "assistant");
+    assert_eq!(empty.messages[1].content, "ok");
+    assert_eq!(empty.messages[1].reasoning, "");
+
+    let omitted = parse_chat_request(
+        &eng,
+        r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":"again"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(omitted.messages[1].content, "ok");
+    assert_eq!(omitted.messages[1].reasoning, "");
+}

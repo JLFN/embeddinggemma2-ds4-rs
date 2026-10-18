@@ -1636,6 +1636,50 @@ pub fn render_dsml_chat_choice_ex(
     Ok(out)
 }
 
+/// The visible assistant tail a Responses client can replay (C
+/// `build_responses_visible_assistant_suffix`, ds4_server.c:12821-12855).
+///
+/// This mirrors what the client can echo, not every token in KV: hidden
+/// reasoning joins the remembered prefix only when the turn ended in tool calls
+/// and the request asked for reasoning summaries, because pi replays summaries
+/// for tool-call turns but not for final answers, and Codex asks for none.  A
+/// client that does replay a final answer's reasoning simply misses this
+/// visible shortcut and still has the exact token-prefix replay.  GLM writes no
+/// EOS (the reference's own twist) and every other syntax writes the EOS.  The
+/// reference writes the literal `</think>` for whatever syntax it serves, and so
+/// does this.
+pub fn responses_visible_assistant_suffix(
+    syntax: ModelSyntax,
+    spaced: bool,
+    think_mode: ThinkMode,
+    summary_emit: bool,
+    content: &[u8],
+    reasoning: &[u8],
+    calls: &[ToolCall],
+    orders: &[ToolSchemaOrder],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if think_mode_enabled(think_mode) {
+        if summary_emit && !calls.is_empty() {
+            out.extend_from_slice(reasoning);
+        }
+        out.extend_from_slice(DSML_THINK_END.as_bytes());
+    }
+    out.extend_from_slice(content);
+    let m = ChatMsg {
+        calls: calls.to_vec(),
+        ..Default::default()
+    };
+    match syntax {
+        ModelSyntax::Glm53 => append_glm_tool_calls_text(&mut out, &m, orders),
+        _ => append_dsml_tool_calls_text(&mut out, &m, spaced),
+    }
+    if syntax != ModelSyntax::Glm53 {
+        out.extend_from_slice(DSML_EOS.as_bytes());
+    }
+    out
+}
+
 fn is_c_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
