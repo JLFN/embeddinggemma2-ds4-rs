@@ -126,14 +126,44 @@ evidence index or in the test itself.
 | O-03 | tool results are ordered by the preceding assistant's call order (encoding.py:233-266); our chat route keeps arrival order, and the C reference orders results only on the Anthropic/Responses path (`live_tool_call_order`, `ds4_server.c:10580`, CTR clause 2.3.8 "open, deferred") | `enc-toolresults-order` | decision owed: requirement 2.3.8 is already open, and the client sends `parallel_tool_calls = true` |
 | O-04 | our call arguments minify a composite child (`tool_call_json_args_add`, `tools.rs:150-166`, mirroring `ds4_server.c:5971-5982` over `json_minify_raw_value` :411) while the oracle keeps the parameter body verbatim; the values are equal and both parse | `composite_arguments_are_minified_as_the_reference_does` (pass) | recorded delta, pinned from our side; no action |
 
-## 6. What blocks an "all covered" claim
+## 6. Part E — the client of record's wire contract
 
-The OPEN rows, in the order the plan would close them: R-12 and R-15's served
-leg (`--trace`, unit 3.2), R-17 and R-18 (the gate, unit 3.3), G8 and G9's
-repair-side scan (P3, unit 3.4), G6 (P4), G5 (needs the Anthropic live path to
-be probed), O-01..O-03 (decisions above), and R-07..R-10 together with G1's
-remainder and G3/G4, which are reserved to a unit that may alter KV state.
+The operator's goal for this line is stated as OpenAI compatibility with
+`/data/open-grok`, the configured consumer, so the client's own wire types are
+the second acceptance oracle beside the CTR.  Every row below was read out of
+the client's source at `27b48a6` in this session; "satisfied by construction"
+means our writer's branch was read, and the case is what measures it end to
+end.
+
+| Row | The client's requirement (source) | Our counterpart | Case | Verdict |
+| --- | --- | --- | --- | --- |
+| E-01 | `ChatCompletionResponse` requires `id`, `object`, `created`, `model`, `choices` (no serde default) — `xai-grok-sampling-types/src/types.rs:353-359` | final writer emits all five (`stream.rs:2347`), chunks emit id/object/chat.completion.chunk/created/model (`stream.rs:561, 637, 657, 678, 962, 992, 1002`) | tests/stream.rs, tests/generate.rs, client leg | satisfied by construction |
+| E-02 | `ChatChoice.index` and `ChatResponseMessage.role` are required; `Role` is `system|user|assistant|tool` (`types.rs:366-370`, `:273-278`, `:384-385`) | writers emit `index:0` and `role:"assistant"` | tests/stream.rs, client leg | satisfied by construction |
+| E-03 | `finish_reason` is a CLOSED enum `stop|length|tool_calls|content_filter|function_call`; any other value fails that chunk's deserialization (`types.rs:373-381`) | the ds41 route remaps `error` to `stop` before every writer (`generate.rs:3324`) | R-17's C-02/C-03 probes at the gate | satisfied on the ds41 route; the truncation loss is R-17's open half |
+| E-04 | every tool delta needs `index`: `ToolCallDelta.index` has `#[serde(default)]`, so an omitted index collapses distinct calls onto 0 (`types.rs:495-499`; assembly `stream/chat_completions.rs:74-77`, `:199-231`) | every delta carries `"index":N` (`stream.rs:206`) | tests/stream.rs, tests/tool_stream.rs | satisfied by construction |
+| E-05 | a call id is required: `ToolCallResponse.id` is a plain `String` (`types.rs:399-401`) | the writer falls back to a generated id when the parse left none (`stream.rs:171-176`, `:200-205`) | tests/stream.rs | satisfied by construction |
+| E-06 | `function.name` and `function.arguments` are required strings, arguments a single string (`types.rs:406-409`) | both always emitted, arguments as one JSON object string | tests/stream.rs | satisfied by construction |
+| E-07 | streaming is read as SSE `data:` chunks with a tool-call accumulator and a `[DONE]` terminator (`stream/chat_completions.rs:120-260`) | our SSE framing (`stream.rs:561` onward) | the client leg (G1/G2) | OPEN until the client leg runs (unit 3.3) |
+| E-08 | reasoning is read from `reasoning_content` only, and the client synthesizes a reasoning sibling only when it carried text (`types.rs:384-396`; `stream/chat_completions.rs:262-266`) | we emit `reasoning_content` on the reasoning channel (`stream.rs:816`, `:859`, `:2357`) | R-15/R-16 host legs; the client leg | partially measured: the host legs pass, the served leg is open |
+| E-09 | in thinking mode the client echoes `reasoning_content` on EVERY assistant message, empty included, and replays `function.arguments` as the raw string it holds (invalid JSON replaced by `{}`) (`conversation.rs:3727-3741`, `:3516-3527`) | our parse reads both fields and does not require reasoning; unknown keys are skipped | R-15's host leg (four surfaces parse the client's own echo) | host pass |
+| E-10 | tool results are appended in completion order with `parallel_tool_calls = true`, so the server receives them out of call order | we render them in the order received (O-03) | enc-toolresults-order | OPEN, O-03 |
+
+## 7. What blocks an "all covered" claim
+
+The OPEN rows, in the order the plan would close them: E-07 and E-08's served
+half and R-18, which are the same measurement (the client leg, unit 3.3), then
+R-12 and R-15's served leg (`--trace`, unit 3.2), R-17 (the gate's C-01..C-03
+probes), E-10 with O-03, G8 and G9's repair-side scan (P3, unit 3.4), G6 (P4),
+G5 (needs the Anthropic live path to be probed), O-01..O-02 (decisions above),
+and R-07..R-10 together with G1's remainder and G3/G4, which are reserved to a
+unit that may alter KV state.
 
 Covered today, measured in this session or quoted from the CTR's evidence
 index: R-01..R-06, R-11 at host level, R-13, R-14, R-15's host leg, R-16's
-host leg, and every part A case marked pass.
+host leg, E-01..E-06 and E-09 by construction and host test, and every part A
+case marked pass.
+
+For the operator's stated goal -- OpenAI compatibility with `/data/open-grok`
+-- the shortest path is E-07 and E-08: everything the client's deserializer
+requires is emitted today, but no leg has yet driven the client itself against
+a served binary (unit 3.3).
