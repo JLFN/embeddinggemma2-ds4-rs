@@ -1,7 +1,10 @@
 # DS41-DSML reference coverage matrix
 
 Status: draft for CTR revision R3 (the report folds this in whole as its
-reference section). Prepared by ds4-dfm-rs work session, 2026-10-18.
+reference section). Prepared by ds4-dfm-rs work session, 2026-10-18; updated the
+same evening at a2937a4c (O-01), 0bf8c79d (G8 and the repair half of G9),
+54afd0bc (G6's builder) and 2debe05c (R-12's host half), which also adds the
+`enc-think-budget` case.
 
 This document answers one question: for every DSML requirement this project
 has written down, which case exercises it, and what did that case actually
@@ -59,7 +62,8 @@ Encode side: our route renders the case, the fixture is the oracle's bytes
 | `enc-argtypes-chat` | the type attribute — `string="true"` for a string child, `string="false"` with the value in json.dumps shape otherwise (encode_arguments_to_dsml, encoding.py:524-556) — plus a merged tool result | pass |
 | `enc-think-tools` | thinking mode with tools: the effort header at 75 and the open `<think>` the assistant turn must carry | pass |
 | `enc-think-max` | the numeric effort header at 100 (encoding.py:443-472) | pass |
-| `enc-think-low` | the same header at the low effort | OPEN O-01 (two halves, see part D) |
+| `enc-think-low` | the same header at the low effort, which the oracle maps to 50 (encoding.py:448-453) | pass (closed 2026-10-18, `render.rs` `v41_effort_prefix` with `RequestedEffort`, `route/mod.rs`) |
+| `enc-think-budget` | the numeric effort the client asked for, rendered as itself | pass (added with the low fix, same commit) |
 | `enc-midsystem-chat` | a mid-conversation system message | pass (closed 2026-10-18, render.rs `pending_merge` + the in-place system branch) |
 | `enc-toolresults-order` | tool results ordered by the assistant's call order (encoding.py:233-266) | pass (closed 2026-10-18, render.rs `tool_run_in_call_order`) |
 
@@ -94,7 +98,7 @@ evidence index or in the test itself.
 | R-09 | Anthropic turn 2 reuses the sampled block | B-03 | reserved as R-07 |
 | R-10 | Responses continuation reuses the sampled call | B-04 | reserved as R-07 |
 | R-11 | a cut block is not served as assistant content | C-01 (suite) + `tests/dsml.rs::live_tool_root_block_recovers_its_calls` (parser) + `tests/dsml.rs::tracker_enters_tool_mode_on_the_quoted_tool_root` and `tests/generate.rs::v41_live_tool_root_turn_streams_calls_without_markup` (tracker) | host pass: the parser half landed at 23eb6b2, the tracker half at d5ad35a, where the recorded turn streams its calls with no markup in the body (A/B: with the new scan off the wrapper close reaches the client as content); the served verdict is the C-01 suite re-run at the gate |
-| R-12 | replay and trace diagnostics are available | `--help` check (Annex B, `flags-baseline-20261018.txt`) | OPEN: 2 of 3 at HEAD (`--disable-exact-dsml-tool-replay`, `--tool-memory-max-ids`, `crates/ds4-server/src/bin/ds4-server-rs.rs:225-231`, advertised at :1329); `--trace` is unit 3.2 |
+| R-12 | replay and trace diagnostics are available | `--trace` module test (`trace.rs::tests::a_section_carries_the_prompt_tokens_and_parsed_message`) and the usage text | host pass at 2debe05c: all three flags exist (`--disable-exact-dsml-tool-replay` `:225`, `--tool-memory-max-ids` `:226`, `--trace FILE` `:236`, `bin/ds4-server-rs.rs`), advertised in the usage block `:1336-1337`; the served capture (a turn's trace carries the rendered prompt) rides the gate |
 | R-13 | plain-text KV reuse intact (protection) | TP-13 / D-01 | measured pass at the baseline; re-run every phase |
 | R-14 | determinism witness reproducible (protection) | TP-14 / D-02, witness sha16 `adf7157c8a5bbb4b` | measured pass at the baseline; re-run every phase |
 | R-15 | exact replay reaches every chat-shaped surface | host: `generate.rs::dsml_replay::sampled_bytes_reach_the_prompt_on_every_chat_surface` (:7184); served: B-01..B-04 with `--trace` | host leg pass (run this session); the served leg is OPEN until `--trace` lands (unit 3.2) and the gate serves it (unit 3.3) |
@@ -111,16 +115,16 @@ evidence index or in the test itself.
 | G3 | no tool-checkpoint canonicalization | none | out of scope for this line (CTR clause 1.3 excludes the KV store; clause 9 reserves it) |
 | G4 | no invalid-DSML tool-error continuation | none yet | reserved in full; the repair half is P3 (unit 3.4) |
 | G5 | no `complete_tool_call_inside_thinking` equivalent | none | OPEN, unverified: an Anthropic live-path decision (NC-06), which the oracle leg does not reach |
-| G6 | no `build_responses_visible_assistant_suffix` | none yet | OPEN, P4 (unit 3.5) |
+| G6 | no `build_responses_visible_assistant_suffix` | `render.rs` `responses_visible_assistant_suffix` + `tests/render.rs::responses_visible_suffix_matches_client_replay`, the reference's own test (ds4_server.c:20386) | half closed 2026-10-18: the builder and its test exist; the store that consumes it (`responses_live_remember`, :14559) is the reserved checkpoint unit, so no caller lands here |
 | G7 | the two replay flags were absent | R-12's flag check | partially closed: both flags exist at HEAD; `--trace` is unit 3.2 |
-| G8 | `try_repair_dsml` deviates: (a) closes unbalanced invokes/params, (b) omits the spaced spelling, (c) picks the style by presence not by earliest occurrence | `tests/parity/retry_c_oracle.c` + `crates/ds4-server/tests/retry.rs` today; the port of `test_dsml_repair_produces_parseable_calls` is P3 | OPEN, P3 (unit 3.4): NC-05 stands as written, and the reference's own refusal comment (`ds4_server.c:6697-6700`) is what the fix must satisfy |
-| G9 | no `find_tool_structural_text` counterpart | parse side: `dec-marker-in-value` (pass); streaming side: `stream.rs::text_stream_stray`; repair side: none | partially covered: the rule that a marker inside a value is not structure is measured green on the decode side; the think-scope scan inside the repair path is OPEN with G8 |
+| G8 | `try_repair_dsml` deviates: (a) closes unbalanced invokes/params, (b) omits the spaced spelling, (c) picks the style by presence not by earliest occurrence | `tests/retry.rs::dsml_repair_matches_the_reference_balance_contract` (the reference's self-test, ds4_server.c:19322) + the C-Rust tapes `repair-dsml`, `repair-dsml-param-open`, `repair-dsml-invoke-open`, `repair-dsml-spaced` (`tests/parity/retry_c_oracle.c`) | closed 2026-10-18 at 0bf8c79d: only a missing wrapper is supplied, the style comes from the earliest tool start (:6730-6745), and the spaced spelling is repaired; measured before the fix the truncated-parameter input came back with `</…parameter></…invoke></…tool_calls>` appended |
+| G9 | no `find_tool_structural_text` counterpart | parse side: `dec-marker-in-value` (pass); streaming side: `stream.rs::text_stream_stray`; repair side: `retry.rs` `find_last_structural` with the balance test above | partially closed 2026-10-18: the structural scan is ported for the repair path (a marker inside a parameter body is not structure, and the think scope uses it); the parse-side wrapper-aware scan stays UNVERIFIED as covered |
 
 ## 5. Part D — the leg's own findings
 
 | Row | Finding | Evidence | Class |
 | --- | --- | --- | --- |
-| O-01 | the oracle renders the requested budget verbatim: a name maps to 50/75/100, an integer in [1,100] renders as itself, and either is written only in thinking mode at index 0 (encoding.py:443-473). Two halves on our side. (a) The low name renders nothing: on the ds41 route the requested effort never reaches the renderer, because `engine_defaults` (set on the V4.1 branch, `bin/ds4-server-rs.rs:611`) collapses low into high through `engine_think_mode` (`parse.rs:2894`), and `head_effort_prefix` knows only high and max (`render.rs:69-74`). (b) A numeric `reasoning_effort` is refused: the value parser reads a string name and nothing else (`format.rs:96-102`) | `enc-think-low` (fixture 1372 bytes vs our 1311) | OPEN, both halves are one designed change: carry the requested budget to the head prefix as a number (with the low name as the 50 case), accept a number in the parse, and leave the engine's own mode collapsed so the reasoning cap and sampling switches do not move |
+| O-01 | CLOSED 2026-10-18: the oracle renders the requested budget verbatim: a name maps to 50/75/100, an integer in [1,100] renders as itself, and either is written only in thinking mode at index 0 (encoding.py:443-473) | `enc-think-low`, `enc-think-budget`, `tests/parse.rs::requested_effort_budget_survives_the_engine_collapse` | pass at a2937a4c: `ParsedRequest::effort` (`RequestedEffort`) carries the requested mode beside the collapsed `think_mode`, the V4.1 head writes the number, and the engine's mode, reasoning cap and sampling switches do not move. Measured before the fix: low drew no line (fixture 1372 bytes against our 1311) and a numeric effort was refused at the parse |
 | O-02 | CLOSED 2026-10-18: a mid-conversation system message writes the system token again at its position, introduces its own turn, and counts as user-like for the assistant header that follows it (encoding.py:621-627, :733-739, `find_last_user_index` :562-582) | `enc-midsystem-chat` | pass; measured before the fix, "Answer in one line." landed before the tools preamble instead of after the user turn. The fix added the in-place system branch and split `pending_merge` from `pending_assistant` in `render.rs`, so a user message following a mid system opens its own `<｜User｜>` exactly as the oracle's merge rule requires (encoding.py:184-231) |
 | O-03 | CLOSED 2026-10-18: tool results are ordered by the preceding assistant's call order, not by arrival (encoding.py:233-266) | `enc-toolresults-order` | pass; measured before the fix, the oracle's block carried body a then body b and ours body b then body a, with the other 1767 bytes matching. `tool_run_in_call_order` (`render.rs`) sorts a run of tool-result messages by the ids the preceding assistant declared; a result whose id was never declared keeps the oracle's default key 0 and the sort is stable. This also makes the prompt canonical for a client that sends results in completion order, which the OpenAI wire permits (CTR clause 2.3.8) |
 | O-04 | our call arguments minify a composite child (`tool_call_json_args_add`, `tools.rs:151-167`, mirroring `ds4_server.c:5971-5982` over `json_minify_raw_value`, `crates/ds4-server/src/json.rs:379`, called at `tools.rs:160`) while the oracle keeps the parameter body verbatim; the values are equal and both parse | `composite_arguments_are_minified_as_the_reference_does` (pass) | recorded delta, pinned from our side; no action |
@@ -149,18 +153,22 @@ end.
 
 ## 7. What blocks an "all covered" claim
 
-The OPEN rows, in the order the plan would close them: E-07 and E-08's served
-half and R-18, which are the same measurement (the client leg, unit 3.3), then
-R-12 and R-15's served leg (`--trace`, unit 3.2), R-17 (the gate's C-01..C-03
-probes), G8 and G9's repair-side scan (P3, unit 3.4), G6 (P4), G5 (needs the
-Anthropic live path to be probed), O-01 (the effort budget, both halves),
-and R-07..R-10 together with G1's remainder and G3/G4, which are reserved to a
-unit that may alter KV state.
+The OPEN rows after 2026-10-18, in the order the plan would close them: E-07
+and E-08's served half with R-18, which are one measurement (the client leg),
+then R-17 (the gate's C-01..C-03 probes) and R-12/R-15's served half, which is
+the same gate run now that `--trace` exists.  G5 needs the Anthropic live path
+to be probed, so it is the one row with no unit behind it.  R-07..R-10 with
+G1's remainder, G3/G4 and G6's caller are reserved to a unit that may alter KV
+state.  Three parts of the oracle's surface still have no case at all: the six
+image functions (the carriage is base64-only by rule, so a case would pin the
+refusals), `response_format` rendering (parsed, not rendered) and the
+`namespace::name` form.
 
 Covered today, measured in this session or quoted from the CTR's evidence
-index: R-01..R-06, R-11 at host level, R-13, R-14, R-15's host leg, R-16's
-host leg, E-01..E-06 and E-09 by construction and host test, and every part A
-case marked pass.
+index: R-01..R-06, R-11 at host level, R-12 at host level, R-13, R-14, R-15's
+host leg, R-16's host leg, E-01..E-06 and E-09 by construction and host test,
+G8 and the repair half of G9, G6's builder, O-01, and every part A case marked
+pass.
 
 For the operator's stated goal -- a plain OpenAI server any compatible caller
 can drive, the way a hosted DeepSeek endpoint is driven -- the shortest path is

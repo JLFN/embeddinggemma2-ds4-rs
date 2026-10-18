@@ -54,7 +54,7 @@ parse yields the oracle's call names and argument values
 | `process_image_messages` (370) | the per-message image pass, and `content` rebuilt from text blocks with `\n\n` | `crates/ds4-server/src/parse.rs:1029` `parse_openai_message_content`, `:546` `append_text_part` | none | no case |
 | `_read_until_stop` (399) | the earliest-of-stops scan the whole parser is built on | `crates/ds4-server/src/tools.rs:169` `split_reasoning_content` | every `dec-*` case | pass |
 | `find_last_user_index` (562) | the last user-like index; a mid-conversation system message counts as one; a tool-result-only user message does not start a turn | `crates/ds4-server/src/render.rs:1397`-`:1429`, `:222` `role_is_user_like` | `enc-plain-chat`, `enc-midsystem-chat` | pass, mid-system half included (closed 2026-10-18); the tool-result-only half has no case |
-| `render_reasoning_effort` (456) | the effort header: thinking mode, index 0 only, `low/high/max` mapped to 50/75/100, an integer in [1,100] taken as itself, `None` to high | `crates/ds4-server/src/render.rs:67` `head_effort_prefix`, `:36`/`:38` the V4.1 prefixes | `enc-think-max` pass; `enc-think-low` | OPEN O-01, two halves: the low name renders nothing because the requested effort never reaches the renderer on the ds41 route, and a numeric `reasoning_effort` is refused at the parse (`format.rs:96-102`) |
+| `render_reasoning_effort` (456) | the effort header: thinking mode, index 0 only, `low/high/max` mapped to 50/75/100, an integer in [1,100] taken as itself, `None` to high | `crates/ds4-server/src/render.rs` `head_effort_prefix`/`v41_effort_prefix` with `crates/ds4-server/src/route/mod.rs` `RequestedEffort` | `enc-think-low`, `enc-think-max`, `enc-think-budget` | pass (closed 2026-10-18) |
 | `render_tools` (509) | the tools preamble verbatim, with the schema list appended | `crates/ds4-server/src/render.rs:412` `append_dsml_tools_prompt_text` | `enc-tools-chat` | pass |
 | `encode_arguments_to_dsml` (524) | one parameter element per argument key, in the call's key order, `string="true"` for a string child and its raw form otherwise; a non-dict `arguments` falls back to a single `arguments` key, a JSON string is decoded twice | `crates/ds4-server/src/render.rs:349` `append_dsml_arg`, `:375` `append_dsml_arguments_from_json` | `enc-argtypes-chat` | pass for a dict; the JSON-string and double-encoded fallbacks have no case |
 | `render_message` (585) | one message's bytes, the role branches, the transition tokens, and the assistant header rule | `crates/ds4-server/src/render.rs:1432` `render_dsml_chat_choice_ex` | 8 encode cases | pass on 7 of 8; O-01 is the one rule still open, and O-02/O-03's rules closed 2026-10-18 |
@@ -99,8 +99,8 @@ model family outside this line.
 | `tool_call_tag_name` (429) `" invoke"` | `:46` `DSML_INVOKE_START_SPACED`, `:47` end | pass |
 | `tool_parameter_tag_name` (430) `" parameter"` | `:48` `DSML_PARAM_START_SPACED`, `:49` end | pass |
 | `tool_call_template` / `tool_calls_template` (432, 435) | `crates/ds4-server/src/render.rs:535`-`:560` | pass |
-| `REASONING_EFFORT_TEMPLATE` (443) | `:36` `V41_THINK_HIGH_PREFIX`, `:38` `V41_THINK_MAX_PREFIX` | pass for high and max; the low value has no constant (O-01) |
-| `REASONING_EFFORT_MAPPINGS` / `DEFAULT_REASONING_EFFORT` (448, 453) | `crates/ds4-server/src/parse.rs:2334` `apply_think_aliases`, `:2894` `engine_think_mode` | OPEN for low (O-01); the `None` default is measured green |
+| `REASONING_EFFORT_TEMPLATE` (443) | the line shape | `crates/ds4-server/src/render.rs` `V41_EFFORT_TEMPLATE` with the 75/100 constants | `enc-think-low`, `enc-think-max`, `enc-think-budget` | pass |
+| `REASONING_EFFORT_MAPPINGS` / `DEFAULT_REASONING_EFFORT` (448, 453) | low 50, high 75, max 100, `None` to high | `crates/ds4-server/src/route/mod.rs` `mode_budget`/`RequestedEffort::head_budget` | `enc-think-low`, `enc-think-budget` | pass (closed 2026-10-18) |
 
 ## 4. Ours with no oracle counterpart
 
@@ -113,6 +113,9 @@ kept because a served turn needs them, not because the oracle asks for them.
 | `crates/ds4-server/src/dsml.rs:550` `dsml_decode_state_for_text` | the incremental decode state machine that decides when markup is withheld from the stream |
 | `crates/ds4-server/src/tools.rs` `DSML_*_SHORT`, `DSML_*` (25-36) | the two older root spellings the artifact still emits; the oracle knows only the spaced one |
 | `crates/ds4-server/src/retry.rs:137` `try_repair_dsml` | truncated-call repair; the oracle has no repair path (matrix G8, P3) |
+| `crates/ds4-server/src/render.rs` `responses_visible_assistant_suffix` | the visible assistant tail a Responses client can replay (ds4_server.c:12821); the store that consumes it (`responses_live_remember` :14559) is the reserved checkpoint unit |
+| `crates/ds4-server/src/trace.rs` | C `--trace FILE` (ds4_help.c:323): one section per request with the prompt, its token ids and the parsed message (unit 3.2, TP-12/TP-15) |
+| `crates/ds4-server/src/retry.rs` `find_any_tool_start`, `find_last_structural` | the repair path's style choice and think scope (ds4_server.c:5842, :5890), ported with G8 |
 | `crates/ds4-server/src/render.rs:93`-`:138`, other-family markers | Motif, EXAONE, Solar, Qwen, GLM, K2 tag sets: other families, outside this line |
 | `crates/ds4-server/src/render.rs:161` `syntax_for_model_id` | family dispatch; the oracle covers V4.1 only |
 
@@ -120,21 +123,13 @@ kept because a served turn needs them, not because the oracle asks for them.
 
 Ordered by what unblocks them, with the evidence each needs.
 
-1. O-01 low effort (row `render_reasoning_effort`, `enc-think-low`): two halves
-   in one change. The low name renders nothing today because the requested
-   effort never reaches the renderer on the ds41 route — `engine_defaults`
-   (set on the V4.1 branch, `bin/ds4-server-rs.rs:611`) collapses low into high
-   through `engine_think_mode` (`parse.rs:2894`) — and a numeric
-   `reasoning_effort`, which the oracle also renders verbatim, is refused at the
-   parse (`format.rs:96-102`). The fix carries the requested budget to the head
-   prefix as a number and accepts a number in the parse, leaving the engine's
-   own mode collapsed so the reasoning cap and sampling switches do not move.
-2. The image surface (rows `parse_tagged_text`, `_is_image_block`,
+1. The image surface (rows `parse_tagged_text`, `_is_image_block`,
    `_extract_image`, `_process_image_blocks`, `_validate_no_image_sp_tokens`,
    `process_image_messages`): six functions, no case.  The reference harness
    asserts text-only, so nothing here is measured against the oracle.  The
    server's base64-only rule is a deliberate deviation from the oracle's
-   path and URL forms (AGENTS.md, the carriage section).
+   path and URL forms (AGENTS.md, the carriage section), so the cases owed here
+   are the refusals.
 3. `response_format` rendering (row `response_format_template`): parsed on our
    side, not rendered, no case.
 4. The namespace surface (rows `_split_tool_name`, `_tool_name_for_encoding`):
@@ -143,9 +138,11 @@ Ordered by what unblocks them, with the evidence each needs.
    verbatim.  Values agree; the strings differ.  Recorded, not a defect
    against the wire, since the client echoes our string.
 
-Closed since the map was written: O-02 (a mid-conversation system message
-renders in place) and O-03 (tool results ordered by call order); both were
-measured against their fixture before the fix and after it.
+Closed since the map was written: O-01 (the effort budget, both halves: the
+requested effort now reaches the V4.1 head and a numeric `reasoning_effort` is
+accepted), O-02 (a mid-conversation system message renders in place), O-03 (tool
+results ordered by call order) and the repair rows of G8/G9.  Every one of them
+was measured against its fixture before the fix and after it.
 
 ## 6. Reproducing
 

@@ -322,28 +322,31 @@ help lists them (`crates/ds4-server/src/bin/ds4-server-rs.rs:225-231`, help at
 'disable-exact\|tool-memory' crates/` matching only a comment; `ToolMemory` had
 `DEFAULT_MAX_IDS = 100_000` (`tool_memory.rs:14`) without exposing it.
 
-G8. `try_repair_dsml` deviates from the reference in two ways.
-Evidence: `retry.rs:137-225` versus `ds4_server.c:6707-6774`.
-(a) It closes unbalanced parameter and invoke tags as well as the wrapper
-(`retry.rs:213-222` appends `pe`, `ie`, `te`), while the reference refuses any
-repair unless the invocations and parameters are already balanced and then
-supplies only the wrapper (`ds4_server.c:6771-6773`; the comment at
-`:6697-6700` states that closing an unfinished invocation or value "would
-invent an executable action"). This is a correctness divergence, not a missing
-feature.
-(b) It omits the DS41 spaced style entirely: it tests DSML full, DSML short and
-plain `<tool_calls>` (`retry.rs:146-176`), while the reference tries
-`DS41_TOOL_CALLS_START` first (`ds4_server.c:6731`). So a truncated spaced DS41
-block is never repaired.
-(c) Style detection differs: reference picks the earliest tag occurrence
-(`find_any_tool_start` `:5842`, `:6730`), Rust picks by presence priority.
+G8. `try_repair_dsml` deviates from the reference in two ways. CLOSED
+2026-10-18 (0bf8c79d), and kept as the record of what was wrong.
+Evidence: `retry.rs` against `ds4_server.c:6707-6776`.
+(a) It closed unbalanced parameter and invoke tags as well as the wrapper
+(`retry.rs` appended `pe`, `ie`, `te`), while the reference refuses any repair
+unless the invocations and parameters are already balanced and then supplies
+only the wrapper (`:6768-6776`; the comment at `:6697-6700` states that closing
+an unfinished invocation or value "would invent an executable action").  The
+port now refuses both and supplies the wrapper alone; measured before the fix,
+the truncated-parameter input came back with
+`</…parameter></…invoke></…tool_calls>` appended.
+(b) It omitted the DS41 spaced style: it tested DSML full, DSML short and plain
+`<tool_calls>`, while the reference tries `DS41_TOOL_CALLS_START` first
+(`:6731`).  So a truncated spaced DS41 block was never repaired.  The port now
+takes the style from the earliest tool start.
+(c) Style detection differed: reference picks the earliest tag occurrence
+(`find_any_tool_start` `:5842`, `:6730`), the old port picked by presence
+priority.  Fixed with (b).
 
 G9. `find_tool_structural_text` (`ds4_server.c:5890`) has no Rust counterpart:
 markers inside parameter values or keys must not be treated as structure, and
-the think-scope rule (only after the last `</think>`) lives in it. The Rust
-repair does the think scoping inline (`retry.rs:142-146`) and
-`text_stream_stray` (`stream.rs:376`) covers the streaming shape; the parse-side
-wrapper-aware scan is UNVERIFIED as covered.
+the think-scope rule (only after the last `</think>`) lives in it.  The repair
+path now carries the port (`retry.rs` `find_last_structural`, used for the think
+scope, closed with G8); `stream.rs::text_stream_stray` covers the streaming
+shape; the parse-side wrapper-aware scan is still UNVERIFIED as covered.
 
 ## 5. Phase plan
 
