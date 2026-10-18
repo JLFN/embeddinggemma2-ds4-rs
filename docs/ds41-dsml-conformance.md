@@ -14,7 +14,7 @@ test report).
 | Status | Issued — partial conformance |
 | Implementation under test | `ds4-dfm-rs` ds41 serving path, binary `/home/leandro/ds4-dfm-rs/ds4-server` |
 | Branch under assessment | R1: `feat/ds41-dsml-complete` base `c942523` (the served binary precedes the line). R2: `feat/ds41-dsml-carriage`, base `c942523` |
-| Normative reference | `/data/ds4` at `fc80bd6` |
+| Normative reference | `tests/ds41_ref/oracle/encoding.py` (vendored, sha256 `13231c59…e2`); the C tree it was first read from is no longer consulted |
 | Client of record | `/data/open-grok` at `27b48a6`, the configured consumer of this server (clause 2.3) |
 | Prepared by | ds4-dfm-rs work session (Spark gate line) |
 | Acceptance regime | operator decision 2026-10-18: this Spark conformance suite replaces the rule 19 QA gate for this line |
@@ -72,8 +72,16 @@ measurable.
 
 ### 2.1 Reference implementation
 
-`/data/ds4` at `fc80bd6`, file `ds4_server.c`. The clauses that state the
-requirements assessed here:
+`tests/ds41_ref/oracle/encoding.py`, vendored into this repo on 2026-10-18 and
+pinned by sha256 in `tests/ds41_ref/ref_drive.py`. It is the authority for the
+carriage assessed here.
+
+The line numbers in the table below are quoted from the C implementation these
+requirements were first written from. That tree is no longer consulted and the
+numbers are historical quotation, kept so the clause texts stay traceable to
+where they came from. Where the two references disagreed, the delta rows of
+`docs/ds41-dsml-reference-matrix.md` part D carry both citations, and a row is
+decided by the oracle. The clauses that state the requirements assessed here:
 
 | Clause | Reference mechanism | Line |
 | --- | --- | --- |
@@ -135,10 +143,10 @@ Requirement-to-IUT status at R2, each checked against the source:
   summary of that review).
 - `docs/ds41-dsml-reference-matrix.md` — the reference leg: the coverage
   matrix that pairs every requirement in clause 6.3 and every gap in the
-  inventory with the case that exercises it, over the operator-supplied V4.1
-  encoding oracle `/data/ds4/test/encoding.py`.  Revision R3 folds it in whole
-  as this report's reference section, so it is maintained as the third document
-  of this line.
+  inventory with the case that exercises it, over the official V4.1 encoding
+  oracle vendored at `tests/ds41_ref/oracle/encoding.py`.  Revision R3 folds it
+  in whole as this report's reference section, so it is maintained as the third
+  document of this line.
 - `docs/deepseek41-port-plan.md` — the ds41 port's own record.
 
 ## 3 Terms and definitions

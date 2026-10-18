@@ -9,25 +9,22 @@ therefore canonical by construction: if the oracle rejects one, the oracle
 pinned here is not the revision this harness was written against, and the
 script says so instead of leaving a bad fixture behind.
 
-Beware the literal: the DSML markers are assembled from the reference's own
+Beware the literal: the DSML markers are assembled from the oracle's own
 constants (missile-shaped text in a chat message is parsed as a real tool
-call by the harness).  Same reason the reference is imported, never copied.
+call by the harness).  Same reason the oracle is loaded here, never
+paraphrased.
 
 Usage: python3 mk_decode_input.py OUTDIR
 """
 
-import importlib.util
 import pathlib
 import sys
 
-REF = pathlib.Path("/data/ds4/test/encoding.py")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-
-def load_ref() -> object:
-    spec = importlib.util.spec_from_file_location("encoding_dsv41_ref", REF)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# The oracle's loader carries the hash pin, so both authors and the driver
+# read one revision of the reference and one place that says which.
+from ref_drive import load_ref  # noqa: E402
 
 
 def invoke(ref: object, name: str, args: dict) -> str:

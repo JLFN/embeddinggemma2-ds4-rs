@@ -19,8 +19,11 @@ that actually consumes the server.
 
 Branch under this revision: `feat/ds41-dsml-carriage`, base `c942523`
 (origin/main tip).
-Reference: `/data/ds4` at `fc80bd6` (branch `main`). All C
-line citations are into `/data/ds4/ds4_server.c` unless the file is named.
+Reference: `tests/ds41_ref/oracle/encoding.py`, the official V4.1 encoding
+implementation, vendored in this repo and pinned by sha256 in
+`tests/ds41_ref/ref_drive.py`. All C line citations in this document are
+historical quotation of the implementation these gaps were reviewed against;
+that tree is no longer consulted.
 Rust citations are into `/data/ds4-dfm-rs` at `c942523`.
 
 Goal of the line: a DS41 (DeepSeek V4.1) serving path whose DSML tool calls are
@@ -60,7 +63,7 @@ host on every route.
 
 ```mermaid
 flowchart LR
-  subgraph ref["/data/ds4 ds41"]
+  subgraph ref["reference carriage (oracle)"]
     A1[render spaced DSML] --> A2[session decode]
     A2 --> A3[parse + tolerant]
     A3 --> A4[tool memory + exact replay]

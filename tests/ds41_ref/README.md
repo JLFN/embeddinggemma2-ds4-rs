@@ -7,18 +7,18 @@ exercises it.
 
 ## The oracle
 
-`/data/ds4/test/encoding.py` — the official DeepSeek-V4.1 text/vision encoding
-implementation, operator-supplied 2026-10-18.  It is the implementation that
-teaches the format to the model, so it decides the prompt bytes and asserts
-the completion shape.  The file lives in the read-only reference tree
-`/data/ds4` at `fc80bd6`, where `test/` is UNTRACKED: cite it by hash
-(`13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2`), never
-by a commit of that tree.  `ref_drive.py` refuses any other revision, so a
-later edit of the file cannot move the oracle silently.
+`oracle/encoding.py` — the official DeepSeek-V4.1 text/vision encoding
+implementation, operator-supplied and vendored here on 2026-10-18.  It is the
+implementation that teaches the format to the model, so it decides the prompt
+bytes and asserts the completion shape.  It is the carriage's single
+authority: the C implementation that once served as a second reference is not
+consulted, and where the two disagreed the disagreement is recorded in
+`docs/ds41-dsml-reference-matrix.md` part D with both citations.
 
-The C reference (`/data/ds4/ds4_server.c`, `/data/ds4/ds4.c`) stays the
-normative reference of the CTR; where the two disagree, the disagreement is a
-recorded delta (O-01, O-03, O-04 in the matrix), not a silent choice.
+`ref_drive.py` pins the vendored file by sha256
+(`13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2`),
+so a later edit of the reference cannot move the oracle silently; see
+`oracle/README.md` for the provenance and the refresh procedure.
 
 ## Layout
 

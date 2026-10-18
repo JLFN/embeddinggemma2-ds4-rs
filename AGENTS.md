@@ -15,20 +15,66 @@ The [v0.1.2 ledger](docs/releases/v0.1.2.md) records shared Jinja qualification.
 New families use [official input templates](docs/chat-templates.md); keep
 tokenizer/media processing and output protocol work outside input grammar.
 
-## DeepSeek V4.1 (ds41) — the port's reference is /data/ds4
+## DeepSeek V4.1 (ds41) — the reference is the vendored encoding oracle
 
-The `ds41` family is a port of the DeepSeek V4.1 Flash engine.  Read the
-reference before changing, explaining, or planning anything the port covers:
-the tree `/data/ds4` at commit `fc80bd6` (READ-ONLY), whose `ds4.c` and
-`ds4_server.c` are the normative reference for ds41 behavior, plus the
-operator-supplied V4.1 encoding oracle `/data/ds4/test/encoding.py` (pinned by
-hash in `tests/ds41_ref/ref_drive.py`).  Every ported function mirrors the
-reference with file:line citations and every deviation is named and measured
-against it, so a behavior question is answered by that code and not by a
-summary, a comment, or a memory note.  The DSML carriage line keeps its own
+The `ds41` family is a port of the DeepSeek V4.1 Flash engine.  Its carriage
+reference is the official V4.1 text/vision encoding implementation at
+`tests/ds41_ref/oracle/encoding.py`, an operator-supplied file vendored into
+this repo on 2026-10-18 and pinned by sha256 in `tests/ds41_ref/ref_drive.py`.
+Read it before changing, explaining, or planning anything the carriage
+covers: it decides the prompt bytes and asserts the completion shape, so a
+behavior question is answered by that file and not by a summary, a comment,
+or a memory note.  Every deviation from it is named and measured, with both
+sides cited in the evidence and the commit message.
+
+DSML is the only markup this family serves.  The carriage line keeps its own
 documents: `docs/ds41-dsml-conformance.md` (the CTR and port checklist),
-`docs/ds41-dsml-port-inventory.md` (the static gap review) and
-`docs/ds41-dsml-reference-matrix.md` (the coverage matrix).
+`docs/ds41-dsml-port-inventory.md` (the static gap review),
+`docs/ds41-dsml-reference-matrix.md` (the coverage matrix), and
+`docs/ds41-dsml-function-map.md` (the oracle's functions against ours).
+
+## The DS41 DSML carriage server executes nothing
+
+This branch carries the full DeepSeek V4.1 DSML surface and no other markup
+for that family.  The server is an inference host in the llama.cpp-server
+sense: it renders the prompt, samples, parses the DSML out of the sampled
+bytes, and frames it as OpenAI tool calls.  It never executes a tool, never
+resolves a client-supplied path, and never fetches a URL.  It ships no client:
+it is a standalone OpenAI-compatible endpoint, driven by any caller exactly as
+a hosted DeepSeek endpoint is.  Whoever calls it owns the tool loop and does
+every file and search action; open-grok is only the caller the conformance leg
+drives, never a component of the server.
+
+Binding:
+
+- The client-visible contract is the OpenAI wire alone: chat completions,
+  completions, messages, responses.  Any compatible caller must work against
+  it.  No request may require a field, a header, or a call sequence that only
+  one client emits, and no caller-specific branch enters the server.
+
+- No tool implementation enters `crates/ds4-server`: no filesystem read or
+  write, no process spawn, and no network fetch reachable from a request
+  body.  Tool handling stops at framing: rendering the client's schemas into
+  the prompt, parsing calls out of the sampled bytes, emitting them as OpenAI
+  `tool_calls`, carrying the client's tool results back into the transcript,
+  and the on-disk replay store of (call id, exact DSML bytes)
+  (`crates/ds4-server/src/tool_memory.rs`).
+- Pixels arrive base64-only.  `image_url` must be a base64 data URI
+  (`crates/ds4-server/src/parse.rs:433`), an Anthropic image source must be
+  `type: "base64"` (`:1379`, `:1506`), and so must `video_url` (`:1103`).
+  The path and URL image forms of the encoding oracle (encoding.py:273, :305)
+  belong to the training-side encoder and are not served here.
+- Server filesystem writes stay limited to operator-configured state: the
+  SSD/disk KV directory (which also carries the replay store) and the file
+  named by `--expect-plan`.
+- The one piece of conversation text the server authors is the malformed-call
+  retry suffix (`crates/ds4-server/src/retry.rs:279`); it is prompt-side
+  repair, not a tool.
+
+Verify before touching tool handling, and report the result:
+`grep -rn "fn execute\|exec_tool\|run_tool\|tool_executor" crates/ds4-server/src`
+must stay empty, and no outbound client (`reqwest`, `ureq`, `hyper::Client`)
+may be introduced into the crate.
 
 ## New model-family serving contract
 

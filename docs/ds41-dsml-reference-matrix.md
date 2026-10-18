@@ -21,22 +21,21 @@ two references, or a decision the operator owes.
 
 | Field | Value |
 | --- | --- |
-| File | `/data/ds4/test/encoding.py` |
+| File | `tests/ds41_ref/oracle/encoding.py` (vendored in this repo) |
 | sha256 | `13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2` |
-| Reference tree | `/data/ds4` at `fc80bd6`; `test/` is untracked there, so the file is cited by hash, never by a commit of that tree |
-| What it is | the official DeepSeek-V4.1 text/vision encoding implementation, operator-supplied 2026-10-18: the implementation that writes the prompt the model was trained on and asserts the completion shape it produces |
+| Provenance | operator-supplied, read 2026-10-18 from `/data/ds4/test/encoding.py`; the vendored copy is byte-identical, and that external tree is no longer consulted |
+| What it is | the official DeepSeek-V4.1 text/vision encoding implementation: the implementation that writes the prompt the model was trained on and asserts the completion shape it produces |
 | Driver | `tests/ds41_ref/ref_drive.py` — `encode CASE MODE` prints the prompt bytes, `parse COMPLETION MODE` prints the parsed message; a hash other than the pinned one aborts the run |
 | Inputs | `tests/ds41_ref/cases/*.json` (encode cases, the oracle's own case format), `tests/ds41_ref/decode/*.txt` (completion bytes, built from the oracle's templates by `tests/ds41_ref/mk_decode_input.py`) |
 | Fixtures | `crates/ds4-server/tests/fixtures/ds41-ref/` — `<case>.prompt.txt` (oracle prompt bytes), `<case>.calls.json` (oracle parse), `<case>.txt` (the completion the oracle parsed). Regenerate with `bash tests/ds41_ref/regen_fixtures.sh` |
 | Rust tests | `crates/ds4-server/tests/ref_encoding.rs` (encode side), `crates/ds4-server/tests/ref_decode.rs` (decode side) |
 
-The oracle is a second reference, not a replacement for the CTR's normative
-one. Where the two references disagree the disagreement is recorded as a delta
-with both citations (O-01, O-03, O-04) instead of being resolved silently.
-The C reference is `/data/ds4/ds4_server.c` (the server) and `/data/ds4/ds4.c`
-(the engine's chat encoding); the oracle decides what the *training-side*
-encoder produces, and the requirement texts in the CTR decide which of the
-two binds a row.
+The oracle is the carriage's single authority. The CTR still quotes clause
+text and line numbers taken from the C implementation that once served as a
+second reference; those citations are historical quotations of the texts the
+requirements were written from, not a live reference, and where the two
+disagreed the disagreement is a delta row with both citations (O-01, O-03,
+O-04). A row is decided by the oracle.
 
 Traps measured on this host (python 3.13.5) while building the leg, recorded
 so the next reader does not re-learn them:

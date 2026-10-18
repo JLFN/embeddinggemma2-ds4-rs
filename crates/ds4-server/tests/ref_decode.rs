@@ -1,8 +1,9 @@
 //! The reference leg, decode side: our DSML parse against the official
 //! DeepSeek-V4.1 encoding implementation (the oracle).
 //!
-//! The oracle is `/data/ds4/test/encoding.py` (sha256
-//! 13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2).  Both
+//! The oracle is vendored at `tests/ds41_ref/oracle/encoding.py` (sha256
+//! 13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2), pinned
+//! by that digest in `tests/ds41_ref/ref_drive.py`.  Both
 //! halves of every case under `tests/fixtures/ds41-ref/` are the oracle's own
 //! output: `<case>.txt` is the completion the oracle's templates rendered, and
 //! `<case>.calls.json` is the oracle parsing that same text with
@@ -13,8 +14,9 @@
 //! What is compared: the content and reasoning split byte for byte, and each
 //! call's name and arguments as JSON values.  The arguments *string* is not
 //! compared byte for byte on purpose -- our shape minifies non-string children
-//! exactly as the reference server does (`tool_call_json_args_add`,
-//! ds4_server.c:5971-5982, over json_minify_raw_value :411), while the oracle
+//! exactly as the C implementation this port descends from does
+//! (`tool_call_json_args_add`, quoted there at ds4_server.c:5971-5982, over
+//! json_minify_raw_value :411), while the oracle
 //! keeps the parameter body verbatim; both decode to the same value, and the
 //! client echoes whichever string it received (requirement 2.3.5).  The
 //! minified shape is pinned by our own test below, so the difference is

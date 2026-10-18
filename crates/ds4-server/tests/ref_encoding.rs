@@ -1,9 +1,11 @@
 //! The reference leg, encode side: our DS41 prompt bytes against the official
 //! DeepSeek-V4.1 encoding implementation (the oracle).
 //!
-//! The oracle is the operator-supplied file `/data/ds4/test/encoding.py`
-//! (sha256 13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2),
-//! untracked in the read-only reference tree `/data/ds4` at fc80bd6.  Each
+//! The oracle is vendored at `tests/ds41_ref/oracle/encoding.py` (sha256
+//! 13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2), an
+//! operator-supplied file that `tests/ds41_ref/ref_drive.py` pins by that
+//! digest; the external tree it was first read from is no longer consulted.
+//! Each
 //! fixture beside this test is the oracle's own output for the case of the
 //! same name under `tests/ds41_ref/cases/`, regenerated with
 //! `bash tests/ds41_ref/regen_fixtures.sh`; driving the oracle is what

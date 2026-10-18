@@ -1,11 +1,11 @@
-"""Drive the DS41 DSML conformance oracle (/data/ds4/test/encoding.py).
+"""Drive the DS41 DSML conformance oracle (oracle/encoding.py, beside us).
 
 The oracle is the operator-supplied DeepSeek-V4.1 text/vision encoding
-implementation.  It is the reference for the DSML carriage: tag spellings,
-the tools preamble, the parameter type attribute, the decode side's
-acceptance shape.  It lives in the read-only reference tree /data/ds4, where
-test/ is untracked, so it is pinned by file hash and never by a commit of
-that tree.
+implementation, vendored into this repo on 2026-10-18 so the carriage's
+single authority travels with the tests instead of sitting in an external
+tree.  It is the reference for the DSML carriage: tag spellings, the tools
+preamble, the parameter type attribute, the effort header, and the decode
+side's acceptance shape.
 
 Two subcommands, both printing the oracle's own bytes so a fixture records
 what the oracle produced and not what we believe it produces:
@@ -13,8 +13,10 @@ what the oracle produced and not what we believe it produces:
     ref_drive.py encode CASE.json MODE        -> the prompt bytes on stdout
     ref_drive.py parse  COMPLETION.txt MODE   -> the parsed message as JSON
 
-MODE is chat or thinking.  A hash mismatch fails the run loudly: a later
-edit of the reference file must not move the oracle silently.
+MODE is chat or thinking.  ORACLE_SHA256 pins the vendored copy, so a later
+edit of the file cannot move the oracle silently: a mismatch fails the run
+loudly, and the answer is to re-read the reference, re-pin the constant and
+regenerate the fixtures in the same act.
 
 Traps measured on this host (2026-10-18, python 3.13.5), recorded so the
 next reader does not re-learn them:
@@ -33,19 +35,19 @@ import json
 import pathlib
 import sys
 
-REF = pathlib.Path("/data/ds4/test/encoding.py")
-REF_SHA256 = "13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2"
+REF = pathlib.Path(__file__).resolve().parent / "oracle" / "encoding.py"
+ORACLE_SHA256 = "13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2"
 
 MODES = ("chat", "thinking")
 
 
 def load_ref() -> object:
-    """Import the reference file, refusing any revision but the pinned one."""
+    """Import the vendored oracle, refusing any revision but the pinned one."""
     digest = hashlib.sha256(REF.read_bytes()).hexdigest()
-    if digest != REF_SHA256:
+    if digest != ORACLE_SHA256:
         raise SystemExit(
-            f"oracle hash moved: {REF} is {digest}, pinned {REF_SHA256}\n"
-            "re-read the reference and re-pin both this constant and the "
+            f"oracle hash moved: {REF} is {digest}, pinned {ORACLE_SHA256}\n"
+            "re-read the reference, re-pin this constant and regenerate the "
             "fixtures it produced before trusting a verdict"
         )
     spec = importlib.util.spec_from_file_location("encoding_dsv41_ref", REF)
