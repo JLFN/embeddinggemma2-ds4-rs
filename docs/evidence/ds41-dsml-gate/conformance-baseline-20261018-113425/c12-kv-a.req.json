@@ -1,0 +1,12 @@
+{
+  "model": "DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarise in one sentence what a KV cache does in an inference server."
+    }
+  ],
+  "max_tokens": 48,
+  "temperature": 0,
+  "stream": false
+}

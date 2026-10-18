@@ -1,0 +1,69 @@
+stage:  baseline
+base:   http://192.168.1.91:8008
+model:  DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative
+out:    docs/evidence/ds41-dsml-gate/baseline-lan-20261018-113202
+date:   2026-10-18T11:32:02+02:00
+
+=== openai chat non-stream tool call ===
+finish_reason=tool_calls id=call_4eb5b21d7cf8bed5697d43f46c3c3790 name=get_weather args={"city":"Stockholm"}
+timings: cached=0 prompt=334 ttft_ms=777.4 decode_tok_s=45.3 prefill_tok_s=430.2 tok_per_step=3.55
+PASS  openai non-stream finish_reason (tool_calls)
+PASS  openai non-stream tool name (get_weather)
+PASS  openai non-stream arguments are JSON (yes)
+PASS  openai non-stream call id prefix (call_)
+PASS  openai non-stream city argument (Stockholm)
+
+=== openai chat stream tool call ===
+sse data lines=10 tool_calls-bearing lines=8 finish=tool_calls done=1
+PASS  openai stream produced SSE data lines (10)
+PASS  openai stream carried a tool_calls delta (8 lines)
+PASS  openai stream finish_reason (tool_calls)
+PASS  openai stream terminated (1)
+
+=== openai chat turn 2 (tool result) - replay/reuse evidence ===
+turn2 timings: cached=334 prompt=395 ttft_ms=710.9 decode_tok_s=32.0 prefill_tok_s=556.4 tok_per_step=2.75
+turn2 content: Stockholm: 7°C, clear sky.
+PASS  turn2 prefill_token count reported (395)
+BENEFIT(openai turn2): prefill_cached_tokens=334 of prefill_tokens=395
+
+=== openai responses tool call (function_call) ===
+responses function_call items=1 name=get_weather call_id=call_4eb5b21d7cf8bed5697d43f46c3c3792 args={"city":"Stockholm"}
+PASS  responses served a function_call item
+PASS  responses function name (get_weather)
+PASS  responses arguments are JSON (yes)
+responses turn2 timings: cached=334 prompt=390 ttft_ms=663.1 decode_tok_s=34.4 prefill_tok_s=589.0 tok_per_step=4.00
+BENEFIT(responses turn2): cached=334
+PASS  responses continuation accepted the function_call_output
+
+=== anthropic messages tool call (tool_use) ===
+tool_use blocks=1 id=toolu_4eb5b21d7cf8bed5697d43f46c3c3793 name=get_weather input={"city":"Stockholm"} stop_reason=tool_use
+PASS  anthropic served a tool_use block
+PASS  anthropic tool name (get_weather)
+PASS  anthropic stop_reason (tool_use)
+PASS  anthropic tool id prefix (toolu_)
+PASS  anthropic input is a JSON object ({"city":"Stockholm"})
+anthropic turn2 timings: cached=338 prompt=394 ttft_ms=664.0 decode_tok_s=34.5 prefill_tok_s=594.3 tok_per_step=4.00
+BENEFIT(anthropic turn2): cached=338
+PASS  anthropic continuation accepted the tool_result
+
+=== truncated DSML block (max_tokens too small) ===
+finish_reason=stop content=
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="get_weather">
+<｜DSML｜ parameter name="city" string="true
+NOTE  this leg records behaviour, it asserts nothing: before the port a cut block ends the turn, after it a model-visible tool error continues it
+
+=== plain text KV prefix reuse (outside DSML) ===
+KV reuse: first cached=0 second cached=19
+timings b: cached=19 prompt=19 ttft_ms=9.0 decode_tok_s=33.6 prefill_tok_s=2136.7 tok_per_step=2.00
+PASS  plain KV reuse still reuses a prefix (second read 19)
+
+=== determinism witness (identical text across stages) ===
+PASS  same-process determinism at temperature 0
+witness text: alpha beta gamma
+WITNESS value for cross-stage comparison: adf7157c8a5bbb4b
+
+=== summary ===
+stage=baseline pass=22 fail=0
+raw bodies: docs/evidence/ds41-dsml-gate/baseline-lan-20261018-113202

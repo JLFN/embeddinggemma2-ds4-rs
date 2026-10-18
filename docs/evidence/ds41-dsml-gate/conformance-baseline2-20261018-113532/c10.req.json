@@ -1,0 +1,64 @@
+{
+  "model": "DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative",
+  "input": [
+    {
+      "role": "user",
+      "content": "Call get_weather for Stockholm. Call the tool; do not answer in prose. [ref c06 1792316132-10807]"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_4eb5b21d7cf8bed5697d43f46c3c37a1",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Stockholm\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_4eb5b21d7cf8bed5697d43f46c3c37a1",
+      "output": "{\"temp_c\":7}"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "set_timer",
+        "description": "Set a timer",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "seconds": {
+              "type": "integer"
+            },
+            "label": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "seconds"
+          ]
+        }
+      }
+    }
+  ],
+  "max_output_tokens": 192,
+  "temperature": 0,
+  "stream": false
+}

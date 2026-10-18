@@ -1,0 +1,15 @@
+base=http://192.168.1.91:8008
+model=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative
+date=2026-10-18T11:34:25+02:00
+
+PASS=9 FAIL=4
+
+Failing requirements:
+  C-07  Second chat turn reuses the sampled assistant DSML block
+  observed: cached=334 of prompt=390; turn-1 prompt was 334; replay gain=0 tokens
+  C-09  Anthropic second turn reuses the sampled tool_use block
+  observed: cached=0 of prompt=394; turn-1 prompt was 338; replay gain=-338 tokens
+  C-10  Responses continuation reuses the sampled function_call
+  observed: cached=0 of prompt=390; turn-1 prompt was 334; replay gain=-334 tokens
+  C-11  A truncated DSML block is not served as assistant content
+  observed: finish=stop calls=0 raw-DSML-in-content-lines=3 content-first-line=

@@ -1,0 +1,20 @@
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_4eb5b21d7cf8bed5697d43f46c3c379f","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"city\":\""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Stock"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"holm"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-88","object":"chat.completion.chunk","created":1792316138,"model":"DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

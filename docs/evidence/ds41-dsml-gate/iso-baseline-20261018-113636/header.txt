@@ -1,0 +1,17 @@
+base=http://192.168.1.91:8008
+model=DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative
+date=2026-10-18T11:36:36+02:00
+run=1792316196-2342
+PASS=8 FAIL=5
+
+Failing requirements:
+  B-01  Chat turn 2 reuses the sampled assistant DSML block
+  observed: turn-1 prompt=347 finish=tool_calls; turn-2 prompt=403 cached=347; replay gain=0 tokens
+  B-02  Replay survives a differently spelled client echo
+  observed: echo={"city": "Stockholm"}; turn-1 prompt=347; turn-2 prompt=403 cached=347; replay gain=0 tokens
+  B-03  Anthropic turn 2 reuses the sampled tool_use block
+  observed: turn-1 prompt=351; turn-2 prompt=407 cached=351; replay gain=0 tokens
+  B-04  Responses continuation reuses the sampled function_call
+  observed: turn-1 prompt=347; turn-2 prompt=403 cached=347; replay gain=0 tokens
+  C-01  A truncated DSML block is not served as assistant content
+  observed: finish=stop calls=0 raw-DSML lines in content=2

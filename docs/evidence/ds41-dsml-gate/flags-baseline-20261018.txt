@@ -1,0 +1,13 @@
+Evidence: DSML diagnostic flags on the served binary (R-12)
+Date: 2026-10-18
+Host: gx10-e1d2 (Spark), binary /home/leandro/ds4-dfm-rs/ds4-server
+Method: tmux pane command, one grep -c per flag against --help
+Result:
+  disable-exact-dsml-tool-replay: 0
+  tool-memory-max-ids: 0
+  trace: 0
+Reference (present, ds4_help.c:378-379, :323):
+  --disable-exact-dsml-tool-replay   "Disable exact sampled DSML tool replay map."
+  --tool-memory-max-ids N            "Exact tool-call IDs kept in RAM. Default: 100000"
+  --trace FILE                       prompt/token/DSML debug trace
+Verdict: R-12 NONCONFORMING (0 of 3 flags advertised).

@@ -1,0 +1,13 @@
+{
+  "model": "DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly the words: alpha beta gamma"
+    }
+  ],
+  "max_tokens": 32,
+  "temperature": 0,
+  "seed": 1234,
+  "stream": false
+}
