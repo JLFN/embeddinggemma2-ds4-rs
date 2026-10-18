@@ -41,6 +41,7 @@ mod tool_memory;
 pub use tool_memory::{ExactReplay, ToolMemoryConfig};
 pub mod tool_stream;
 pub mod tools;
+pub mod trace;
 #[cfg(any(feature = "native", test))]
 mod v41_disk;
 pub mod worker;

@@ -2832,6 +2832,43 @@ pub(crate) fn generate_terminal_prepared(
     if finish != "error" && finish != "length" {
         engine.remember_chat(&parsed, &parsed_gen);
     }
+    // The reference's --trace section (`ds4_server.c:12011-12017`), written
+    // after the wire bytes: the turn above holds the engine, and an engine call
+    // here cannot disturb what the client already received.
+    if crate::trace::enabled() {
+        let prompt_ids = engine.tokenize_rendered_chat(&prompt).unwrap_or_default();
+        let mut text_of = |token: i32| engine.token_text(token).unwrap_or_default();
+        crate::trace::write_request(
+            &crate::trace::TraceRequest {
+                api: req.api,
+                kind: parsed.kind,
+                stream: req.stream,
+                model_id: engine.model_id(),
+                model: &req.model,
+                tools: req.tool_orders.len(),
+                think: req.think_mode,
+                prompt: &prompt,
+                tokens: &prompt_ids,
+                cached: req.cache_read_tokens,
+                prompt_tokens: prompt_n,
+                max_tokens: parsed.max_tokens,
+                temperature: parsed.temperature,
+                top_k: parsed.top_k,
+                top_p: parsed.top_p,
+                min_p: parsed.min_p,
+                seed: parsed.seed,
+                finish,
+                completion,
+                saw_tool_start: acc.saw_tool_start,
+                saw_tool_end: acc.saw_tool_end,
+                elapsed_sec: t_arrive.elapsed().as_secs_f64(),
+                content: &parsed_gen.content,
+                reasoning: &parsed_gen.reasoning,
+                calls: &parsed_gen.calls,
+            },
+            &mut text_of,
+        );
+    }
     let outcome = GenerateOutcome {
         tool_ids: parsed_gen
             .calls
@@ -3181,6 +3218,9 @@ fn generate_terminal_v41(
     // The tool dialect is a property of the served family, chosen before the
     // first update (ds4_server.c:20591); GLM's block is not a DSML spelling.
     acc.set_model_syntax(syntax);
+    // The trace's own copy of the cache account: the state below takes the
+    // request, and the engine borrow it holds outlives this line.
+    let trace_cached = req.cache_read_tokens;
     let state = RefCell::new(V41EmitState {
         engine,
         parsed,
@@ -3520,7 +3560,45 @@ fn generate_terminal_v41(
     // here the next turn's attach reads an empty map.  It sits after the wire
     // bytes because the emit state holds the engine for the whole run
     // (`V41EmitState`, :3164).
+    // Read the tracker's verdicts before the engine is touched again: the emit
+    // state holds the engine for the whole run, so its last use must come first.
+    let (saw_tool_start, saw_tool_end) = (st.acc.saw_tool_start, st.acc.saw_tool_end);
     engine.remember_tool_replay(&parsed_gen.calls, &parsed_gen.raw_dsml);
+    // The same rule for the trace: it is written after the wire bytes, and this
+    // route's own prompt ids are the ones the engine preprint used.
+    if crate::trace::enabled() {
+        let mut text_of = |token: i32| engine.token_text(token).unwrap_or_default();
+        crate::trace::write_request(
+            &crate::trace::TraceRequest {
+                api: parsed.api,
+                kind: parsed.kind,
+                stream: parsed.stream,
+                model_id: engine.model_id(),
+                model: &parsed.model,
+                tools: parsed.tool_orders.len(),
+                think: parsed.think_mode,
+                prompt,
+                tokens: prompt_tokens,
+                cached: trace_cached,
+                prompt_tokens: prompt_n,
+                max_tokens: parsed.max_tokens,
+                temperature: parsed.temperature,
+                top_k: parsed.top_k,
+                top_p: parsed.top_p,
+                min_p: parsed.min_p,
+                seed: parsed.seed,
+                finish,
+                completion,
+                saw_tool_start,
+                saw_tool_end,
+                elapsed_sec: t_arrive.elapsed().as_secs_f64(),
+                content: &parsed_gen.content,
+                reasoning: &parsed_gen.reasoning,
+                calls: &parsed_gen.calls,
+            },
+            &mut text_of,
+        );
+    }
     Ok((outcome, terminal))
 }
 

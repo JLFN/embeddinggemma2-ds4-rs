@@ -231,6 +231,13 @@ fn main() {
                     ))
                 });
             }
+            // The reference's debug trace (`ds4_help.c:323`; the file is opened
+            // `w` and announced at `ds4_server.c:16010-16019`).
+            "--trace" => {
+                let raw = args.next().unwrap_or_else(|| usage());
+                ds4_server::trace::set_path(std::path::PathBuf::from(&raw));
+                eprintln!("ds4-server-rs: tracing session to {raw}");
+            }
             "--ignore-eos-in-reasoning" => {
                 if cfg.eos_policy == EosPolicy::Default {
                     cfg.eos_policy = EosPolicy::Reasoning;
@@ -1327,6 +1334,7 @@ Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-disk-space 32G] [--kv-
          [--kv-cache-boundary-align-tokens N]\n\
          [--kv-cache-reject-different-quant]\n\
 Tool replay: [--disable-exact-dsml-tool-replay] [--tool-memory-max-ids N]\n\
+         [--trace FILE]\n\
          V4.1 (ds41): --zchain DIR [--posttrain DIR] [--engram-dir DIR] [--v41-no-engram]\n\
          [--dspark] [--no-dspark] [--dspark-verify K] [--no-graph] [--no-kv-reuse] [--v41-prof]\n\
          [--emit-trace] [--mem-budget-mb N]\n\
