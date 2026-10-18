@@ -60,7 +60,7 @@ Binding:
   and the on-disk replay store of (call id, exact DSML bytes)
   (`crates/ds4-server/src/tool_memory.rs`).
 - Pixels arrive base64-only.  `image_url` must be a base64 data URI
-  (`crates/ds4-server/src/parse.rs:433`), an Anthropic image source must be
+  (`crates/ds4-server/src/parse.rs:450`), an Anthropic image source must be
   `type: "base64"` (`:1379`, `:1506`), and so must `video_url` (`:1103`).
   The path and URL image forms of the encoding oracle (encoding.py:273, :305)
   belong to the training-side encoder and are not served here.

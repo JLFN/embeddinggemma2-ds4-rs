@@ -130,12 +130,12 @@ Requirement-to-IUT status at R2, each checked against the source:
 
 | Clause | Status | Evidence |
 | --- | --- | --- |
-| 2.3.1 index on every tool delta | satisfied | `stream.rs:655`, `:676`; reference `ds4_server.c:7270-7285` |
+| 2.3.1 index on every tool delta | satisfied | `stream.rs:663`/`:670` (`start_invoke`), `:681`/`:691` (`args_fragment`); reference `ds4_server.c:7270-7285` |
 | 2.3.2 a non-empty call id | satisfied | `stream.use_random_ids()` on both routes; reference `:10743` |
-| 2.3.3 a closed `finish_reason` enum | satisfied on the ds41 route | `generate.rs:3324` remaps `error` to `stop` before every writer, with the client's own rejection recorded in the comment there. See NC-07, which R2 first raised and then withdrew |
+| 2.3.3 a closed `finish_reason` enum | satisfied on the ds41 route | `generate.rs:3348` remaps `error` to `stop` before every writer, with the client's own rejection recorded in the comment there. See NC-07, which R2 first raised and then withdrew |
 | 2.3.4 a truncated call is executed as complete | risk noted | the same remap turns a lost truncation signal into `stop`; C-02/C-03 measure it (NC-07 restated) |
 | 2.3.5 arguments echoed raw | satisfied | `conversation.rs:3516-3527` is client-side; the server-side consequence is the re-render, which is NC-01 |
-| 2.3.6 unknown message fields tolerated | satisfied | `parse.rs:1199` region skips unknown keys |
+| 2.3.6 unknown message fields tolerated | satisfied | `parse.rs:1223` skips an unknown key (`json_skip_value`) |
 | 2.3.7 `reasoning_content` on every assistant turn | open | assessed by TP-18's second half and the inventory's G-08 |
 | 2.3.8 tool results in completion order | open, deferred | reference counterpart `live_tool_call_order` `:10580` applies to Anthropic/Responses only, not the chat path this client uses |
 
@@ -220,7 +220,7 @@ ds41 on the shared session path, so a `ds4_session` exists for it and every
 session-addressed mechanism applies (`ds4_server.c:15981`, syntax at `:1218`,
 render at `:3366`/`:3438`). The Rust host declares ds41 a no-session engine
 (`crates/ds4-server/src/generate.rs:144`) and dispatches it to a push route
-whose own documentation lists what it drops (`generate.rs:3019-3028`).
+whose own documentation lists what it drops (`generate.rs:3042-3046`).
 
 ```mermaid
 flowchart LR
@@ -351,10 +351,15 @@ prompt (347 / 351) reused. The 56-token assistant DSML block is re-prefilled
 from the canonical re-render instead of being replayed from the sampled bytes.
 
 Root cause: exact replay is gated to OpenAI chat, non-thinking, with no live
-call ids (`crates/ds4-server/src/generate.rs:1350-1360`), and the attach and
+call ids (`crates/ds4-server/src/generate.rs:1367-1369`, with the caller's
+emptiness conditions at `:2342-2345`), and the attach and
 remember wiring exists only on the session route
-(`generate.rs:4496`, `:4507`, `:4515`, call sites `:2335`, `:2448`, `:2677`).
-The ds41 route attaches nothing at all (`generate.rs:3019-3028`).
+(`generate.rs:4538`, `:4549`, `:4557`, call sites `:2347`, `:2459`, `:2694`).
+The ds41 route attaches nothing at all (`generate.rs:3042-3046`).
+
+R2 reading. The carriage landed after this assessment (8891d3e, matrix G1/G2):
+the scope is now `kind == Chat` and the attach is wired per chat-shaped
+surface, so the last two sentences describe the assessed revision, not HEAD.
 
 Why it matters: 56 tokens of re-prefill per tool continuation, on a box whose
 measured prefill rate in these runs was 560–600 tokens/s, so roughly 0.1 s
@@ -371,7 +376,7 @@ Observed: with the output budget cut mid-block the turn returns
 The client cannot execute that, and the turn ends without the model knowing.
 
 Root cause: the ds41 route turns an unterminated tool start into an error
-(`generate.rs:3256-3264`) and there is no `continue_after_invalid_dsml`
+(`generate.rs:3282-3289`) and there is no `continue_after_invalid_dsml`
 equivalent (`ds4_server.c:12611`, call sites `:14344`, `:14446`); the model never
 sees the tool-error suffix (`:12260`).
 
@@ -417,20 +422,20 @@ are unverified. Not measured here.
 restated as a lost truncation signal
 
 Raised: R2 read the ds41 route's `finish = "error"` assignment
-(`crates/ds4-server/src/generate.rs:3254-3264`) together with the writers that
-emit the finish verbatim (`stream.rs:2352-2367`, `:568-583`) and concluded that
+(`crates/ds4-server/src/generate.rs:3282-3289`) together with the writers that
+emit the finish verbatim (`stream.rs:2360-2375`, `:576-591`) and concluded that
 the model-output condition would reach the wire, where the client's closed enum
 (clause 2.3.3) fails the stream.
 
-Withdrawn, with the evidence that refutes it: `generate.rs:3324` remaps `error`
+Withdrawn, with the evidence that refutes it: `generate.rs:3348` remaps `error`
 to `stop` before every writer on this route, and its comment records that the
 client's own rejection ("serialization error: unknown variant `error`", session
 2026-10-10 23:17) is why. The R2 reading stopped at the writer and missed the
 remap between the two. The illegal-value nonconformity does not exist on main.
 
 Restated, because the same code loses information the reference keeps: the
-assignment at `:3254-3264` overwrites a true `length` stop with `error`, which
-`terminal_finish` (`retry.rs:455-462`) and `intern_finish` (`tools.rs:2007-2013`)
+assignment at `:3282-3289` overwrites a true `length` stop with `error`, which
+`terminal_finish` (`retry.rs:520-526`) and `intern_finish` (`tools.rs:2103-2109`)
 both carry through, and the remap then flattens it to `stop`. The reference
 refuses to do that: `tool_parse_failure_recovery_finish` (`:6776-6784`) keeps
 `length` because "callers can distinguish truncation from a completed turn", and
@@ -452,9 +457,9 @@ machine and therefore cannot be read to confirm the engine's own mapping.
 ### 8.8 Recorded outside this line — the serial route can serve `error`
 
 Found while checking 8.7, and recorded rather than acted on: the serial path
-also reaches `finish = "error"` (`generate.rs:2596`, `:2599`) and has no remap,
+also reaches `finish = "error"` (`generate.rs:2611`, `:2614`) and has no remap,
 and the terminal body is written before the settlement decision that reads it
-(`serve.rs:1733`). That path serves families other than ds41, so it is outside
+(`serve.rs:1748`). That path serves families other than ds41, so it is outside
 this line's scope; it is listed here because it fails the same clause 2.3.3 for
 the same client.
 

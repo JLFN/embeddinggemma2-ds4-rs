@@ -1363,7 +1363,7 @@ pub(crate) fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
 /// surface carries no messages at all, and the reference has no such parser.
 /// Whether a given family's renderer honours the replayed bytes is the
 /// renderer's own decision (`render.rs:539`, `:698`, `:765`, `:835`, `:1053`,
-/// `:1078`, `:2504`), not a gate here.
+/// `:1078`, `:2595`), not a gate here.
 fn tool_replay_scope(parsed: &ParsedRequest) -> bool {
     parsed.kind == ReqKind::Chat
 }

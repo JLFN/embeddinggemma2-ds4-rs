@@ -53,11 +53,11 @@ checkpoints) is available to DS41 by construction.
 The Rust host does the opposite. `DecodeIo::is_v41` is documented as "this
 engine serves the V4.1 (ds41) family: no ds4_session"
 (`crates/ds4-server/src/generate.rs:144`), and dispatch hands DS41 to a
-separate push route (`generate.rs:2419`, `generate_terminal_v41`,
-`generate.rs:3076`). That route's own doc states what it drops: "no
+separate push route (`generate.rs:2431`, `generate_terminal_v41`,
+`generate.rs:3093`). That route's own doc states what it drops: "no
 invalid-DSML retry (needs a session), no tool replay / live bindings / thinking
 checkpoints (all session-addressed), and no tool-memory write"
-(`generate.rs:3019-3028`). Everything in the gap list below is a consequence of
+(`generate.rs:3042-3046`). Everything in the gap list below is a consequence of
 that split, plus three finish-path mechanisms that are missing from the Rust
 host on every route.
 
@@ -216,63 +216,67 @@ DS41-specific: `test_deepseek41_server_stream` `:22759`,
 ## 3. Rust host inventory (what exists)
 
 ### 3.1 Present and equivalent
-- Tag literals incl. the spaced v41 set: `crates/ds4-server/src/tools.rs:24-48`.
-- Parse: `dsml_parse_leaf_param` `tools.rs:203`,
-  `dsml_parse_nested_params_object` `tools.rs:241`, `dsml_find_block`
-  `tools.rs:329`, `parse_dsml_generated` `tools.rs:375`, `dsml_normalize`
-  `tools.rs:511`, `dsml_clean_name` `tools.rs:548`, `parse_dsml_tolerant`
-  `tools.rs:565` (+ tool-root scan `:701`, param `:796`, declared coercion
-  `:883`, child binding `:911`), `split_reasoning_content` `tools.rs:168`,
-  `parse_generated_message` `tools.rs:1855`,
-  `parse_generated_for_response` `tools.rs:1946`, `find_tool_start` `:2026`,
-  `find_tool_end` `:2064`, `observe_tool_markers` `:2093`,
-  `assign_tool_ids` `:2232` (random seed, uniqueness),
-  `tool_marker_stream_safe_len` `:2271`, `SemAccum` `:2342`.
-- Decode tracker: `DsmlDecodeState` `crates/ds4-server/src/dsml.rs:20`,
+- Tag literals incl. the spaced v41 set: `crates/ds4-server/src/tools.rs:25-49`.
+- Parse: `dsml_parse_leaf_param` `tools.rs:204`,
+  `dsml_parse_nested_params_object` `tools.rs:242`, `dsml_find_block`
+  `tools.rs:330`, `parse_dsml_generated` `tools.rs:376`, `dsml_normalize`
+  `tools.rs:512`, `dsml_clean_name` `tools.rs:549`, `parse_dsml_tolerant`
+  `tools.rs:566` (+ tool-root scan `:702`, param `:797`, declared coercion
+  `:884`, child binding `:912`), `split_reasoning_content` `tools.rs:169`,
+  `parse_generated_message` `tools.rs:1941`,
+  `parse_generated_for_response` `tools.rs:2032`, `find_tool_start` `:2155`,
+  `find_tool_end` `:2200`, `observe_tool_markers` `:2229`,
+  `assign_tool_ids` `:2369` (random seed, uniqueness),
+  `tool_marker_stream_safe_len` `:2408`, `SemAccum` `:2447`.
+- Decode tracker: `DsmlDecodeState` `crates/ds4-server/src/dsml.rs:21`,
   `dsml_decode_state_is_syntax` `:54`, `SYNTAXES` incl. the spaced v41 entry
-  `:66-109`, `DsmlDecodeTracker` `:112-287`, `dsml_decode_scan_json_param`
-  `:414`, `dsml_decode_state_for_text` `:446`, `sampling_override` `:565`.
-- Live tool stream: `ToolStream` `tool_stream.rs:116-360`,
-  `dsml_entity_stream_safe_len` `:485`, `tool_param_value_stream_safe_len`
+  `:95-134`, `DsmlDecodeTracker` `:137-372`, `dsml_decode_scan_json_param`
+  `:513`, `dsml_decode_state_for_text` `:550`, `sampling_override` `:669`.
+- Live tool stream: `DsmlToolStream` `tool_stream.rs:81` (struct), `:115-371`
+  (impl), `dsml_entity_stream_safe_len` `:485`, `tool_param_value_stream_safe_len`
   `:544`, `partial_invoke_index` `:180`.
-- SSE surfaces: `append_tool_calls_json` `stream.rs:165`,
-  `append_tool_call_deltas_json` `:188`, `append_anthropic_tool_use` `:232`,
-  `openai_sse_stream_update` `:793`, `openai_sse_finish_live` `:937`,
-  `anthropic_sse_start_live` `:1104`, `anthropic_sse_stream_update` `:1141`,
-  `anthropic_sse_finish_live` `:1382`, `anthropic_sse_tool_blocks_live`
-  `:1409`, `responses_sse_function_calls` `:1847`,
-  `responses_sse_stream_update` `:2026`.
+- SSE surfaces: `append_tool_calls_json` `stream.rs:173`,
+  `append_tool_call_deltas_json` `:196`, `append_anthropic_tool_use` `:240`,
+  `openai_sse_stream_update` `:808`, `openai_sse_finish_live` `:954`,
+  `anthropic_sse_start_live` `:1121`, `anthropic_sse_stream_update` `:1158`,
+  `anthropic_sse_finish_live` `:1401`, `anthropic_sse_tool_blocks_live`
+  `:1428`, `responses_sse_function_calls` `:1866`,
+  `responses_sse_stream_update` `:2045`.
 - Repair and retry helpers: `try_repair_dsml` `retry.rs:137`,
-  `try_repair_tool_call_format` `:262`, truncation decision `:395`, plus the
-  session-route retry `retry_chat` at `generate.rs:2633`.
-- Tool memory: `remember` `tool_memory.rs:233`, `checkpoint` `:287`,
-  `restore_store` `:375`, `lookup` `:410`, KTM trailer codec, `EXT_TOOL_MAP`
+  `try_repair_tool_call_format` `:262`, truncation decision `:452`
+  (`truncation_outcome` `:460`), plus the
+  session-route retry `retry_chat` at `generate.rs:1694` (`:2599`, `:2650`).
+- Tool memory: `remember` `tool_memory.rs:283`, `checkpoint` `:345`,
+  `restore_store` `:443`, `lookup` `:482`, KTM trailer codec, `EXT_TOOL_MAP`
   (`ds4-kv/src/format.rs:19`), loaded only on the tool-replay lane
   (`generate.rs:1096`).
 - Session primitives for canonicalization: `common_prefix` /
   `rewrite_from_common` (`ds4-core/src/session.rs:143/:170`,
-  `ds4-core/src/lib.rs:3035`), `Restore`/`RewriteKind`.
-- DS41 host surface: push route `generate.rs:3076`, KV checkpoint/prefix reuse
+  `ds4-core/src/lib.rs:3038`), `Restore`/`RewriteKind`.
+- DS41 host surface: push route `generate.rs:3093`, KV checkpoint/prefix reuse
   bridge (`ds4_bridge_v41_kvreuse_*`, used `v41_run.rs:1812-1840`), streaming
-  state for all three surfaces `generate.rs:3121-3136`.
+  state for all three surfaces `generate.rs:3125-3140`.
 
 ### 3.2 Present but gated narrower than the reference
-- `tool_replay_scope` (`generate.rs:1350`) admits only
+- `tool_replay_scope` (`generate.rs:1367`) admits only
   `api == Api::Openai`, `kind == Chat`, NOT think mode, no live call ids, and
-  syntax DeepSeek / Solar / Qwen4. The reference attaches exact DSML on chat,
+  syntax DeepSeek / Solar / Qwen4 — the R2 reading. The carriage (matrix G1/G2)
+  narrowed it to `kind == Chat` alone, so the other arms are gone; the reference
+  attaches exact DSML on chat,
   Anthropic and Responses, thinking included (`:4272`, `:4498`, `:5529`).
   DS41 is a `ModelSyntax::DeepSeek` on that axis, so the syntax arm passes; the
   route does not.
 - Attach/remember are wired only into the session route
-  (`restore_tool_replay` `generate.rs:4496`, `sync_tool_replay_prompt` `:4507`,
-  `remember_tool_replay` `:4515`, call sites `:2335/:2448/:2677`).
+  (`restore_tool_replay` `generate.rs:4538`, `sync_tool_replay_prompt` `:4549`,
+  `remember_tool_replay` `:4557`, call sites `:2347/:2459/:2694`); the carriage
+  moved the attach to every chat-shaped surface (matrix R-15).
 
 ## 4. Gap list: what we do not have
 
 G1. DS41 has no session, so it has no exact DSML replay, no tool-memory write,
 no invalid-DSML continuation, no tool-checkpoint canonicalization and no
 thinking checkpoint.
-Evidence: `generate.rs:144`, `:2419`, `:3019-3028`; reference creates a session
+Evidence: `generate.rs:144`, `:2431`, `:3042-3046`; reference creates a session
 for every engine `ds4_server.c:15981` and attaches tool memory on all surfaces
 `:4272/:4498/:5529`. Consequence: the next turn re-renders canonical DSML
 instead of replaying the sampled bytes, so the DS41 prompt/KV alignment that
@@ -280,7 +284,7 @@ the reference buys with replay is unavailable, and a
 malformed or unterminated DSML block ends the turn with raw text.
 
 G2. Exact DSML replay is OpenAI-chat-only and disabled under thinking and under
-live continuations. Evidence: `generate.rs:1350-1360`. Missing versus
+live continuations. Evidence: `generate.rs:1367-1369`. Missing versus
 `ds4_server.c:4272` (chat), `:4498` (Anthropic), `:5529` (Responses), and
 `:14566/:14578` (live registries).
 
@@ -297,8 +301,8 @@ shape. The reference builds a model-visible tool error that carries the system
 prompt reminder and appends it to the LIVE session, then keeps decoding in the
 same turn (`ds4_server.c:12260`, `:12611`, call sites `:14344`, `:14446`), with
 an output-budget rule (`:19597`). The Rust retry restarts a chat turn
-(`generate.rs:2633`); on DS41 there is no retry at all
-(`generate.rs:3256-3264` turns an unterminated tool call into `error`).
+(`generate.rs:1694`, called at `:2599`/`:2650`); on DS41 there is no retry at all
+(`generate.rs:3282-3289` turns an unterminated tool call into `error`).
 
 G5. No `complete_tool_call_inside_thinking` equivalent
 (`ds4_server.c:12211`, used `:14145`). UNVERIFIED whether the Rust Anthropic
@@ -312,11 +316,11 @@ G6. No `build_responses_visible_assistant_suffix`
 `test_responses_stateless_tool_replay_requires_reasoning` `:20310`).
 
 G7. No `--disable-exact-dsml-tool-replay` and no `--tool-memory-max-ids`.
-Evidence: `grep -rn 'disable-exact\|tool-memory' crates/` matches only a
-comment at `generate.rs:3027`; the usage line in
-`crates/ds4-server/src/bin/ds4-server-rs.rs:1302` carries neither flag.
-`ToolMemory` has `DEFAULT_MAX_IDS = 100_000` (`tool_memory.rs:14`) but it is not
-exposed.
+Closed 2026-10-18 (356d52b): both flags exist on the Rust host and the usage
+help lists them (`crates/ds4-server/src/bin/ds4-server-rs.rs:225-231`, help at
+`:1329`). As recorded at R2, the evidence was `grep -rn
+'disable-exact\|tool-memory' crates/` matching only a comment; `ToolMemory` had
+`DEFAULT_MAX_IDS = 100_000` (`tool_memory.rs:14`) without exposing it.
 
 G8. `try_repair_dsml` deviates from the reference in two ways.
 Evidence: `retry.rs:137-225` versus `ds4_server.c:6707-6774`.
@@ -338,7 +342,7 @@ G9. `find_tool_structural_text` (`ds4_server.c:5890`) has no Rust counterpart:
 markers inside parameter values or keys must not be treated as structure, and
 the think-scope rule (only after the last `</think>`) lives in it. The Rust
 repair does the think scoping inline (`retry.rs:142-146`) and
-`text_stream_stray` (`stream.rs:367`) covers the streaming shape; the parse-side
+`text_stream_stray` (`stream.rs:376`) covers the streaming shape; the parse-side
 wrapper-aware scan is UNVERIFIED as covered.
 
 ## 5. Phase plan
@@ -357,7 +361,7 @@ Work happens on `feat/ds41-dsml-carriage`.
 Deliverable: this document. Gate: every gap cites both trees.
 
 ### Phase 1 - exact DSML replay on every surface (host-only; applies to DS41)
-Scope: widen `tool_replay_scope` (`generate.rs:1350`) to the reference's rule
+Scope: widen `tool_replay_scope` (`generate.rs:1367`) to the reference's rule
 (any surface, thinking included, live continuations included where the
 reference attaches), wire attach/remember for the Anthropic and Responses parse
 paths (counterparts of `ds4_server.c:4498` and `:5529`), add the
@@ -444,7 +448,7 @@ stealth.
 ## 6. Open questions to settle before Phase 1
 
 Q1. Does the DS41 route already participate in the continuation registry
-(`serve.rs:785`, `:929`, `crates/ds4-server/src/cont.rs`)? If yes, G2's live
+(`serve.rs:790`, `:934`, `crates/ds4-server/src/cont.rs`)? If yes, G2's live
 continuation half is narrower than it looks and Phase 1 shrinks.
 Q2. What does the native DS41 KV checkpoint do about a re-generate after a
 tool error: is the prefix reuse (`ds4-core/src/v41_run.rs:1819-1840`) enough to

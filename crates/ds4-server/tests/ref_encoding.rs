@@ -50,7 +50,7 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
 }
 
 /// A `tool` role message as the chat parse builds it: the body plus the id of
-/// the call it answers (`add_tool_call_id`, parse.rs:868).  The id is what the
+/// the call it answers (`add_tool_call_id`, parse.rs:885).  The id is what the
 /// renderer orders a run of results by, so a case that omits it cannot
 /// exercise the order rule.
 fn tool_result(id: &str, body: &str) -> ChatMsg {
