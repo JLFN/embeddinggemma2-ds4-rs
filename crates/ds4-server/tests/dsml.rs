@@ -1,6 +1,8 @@
 //! C↔Rust DSML decode-state + sampling-override tapes (no model).
 
 use ds4_server::dsml_dump_script;
+use ds4_server::parse::ToolSchemaOrder;
+use ds4_server::tools::parse_dsml_tolerant;
 use ds4_server::tools::{
     DSML_INVOKE_END_SPACED, DSML_INVOKE_START_SPACED, DSML_PARAM_END_SPACED,
     DSML_PARAM_START_SPACED, DSML_TOOL_CALLS_END_SPACED, DSML_TOOL_CALLS_START_SPACED,
@@ -164,4 +166,73 @@ fn tracker_accepts_bare_parameter_tags() {
         dsml_decode_state_for_text(block.as_bytes()),
         DsmlDecodeState::Outside
     );
+}
+
+// ---------------------------------------------------------------------------
+// The live served turn (Spark ds41 deployment, open-grok session 01a14f5d,
+// 2026-10-18).  Fixtures are the assistant content exactly as the client
+// recorded it.
+// ---------------------------------------------------------------------------
+
+fn live_orders() -> Vec<ToolSchemaOrder> {
+    let mut out = Vec::new();
+    for (name, props, types) in [
+        ("memory_search", vec!["query"], vec!["string"]),
+        ("read_file", vec!["target_file", "limit"], vec!["string", "integer"]),
+        (
+            "list_dir",
+            vec!["target_directory", "description"],
+            vec!["string", "string"],
+        ),
+    ] {
+        out.push(ToolSchemaOrder {
+            name: name.to_string(),
+            wire_name: name.to_string(),
+            namespace: name.to_string(),
+            responses_tool_search: false,
+            prop: props.into_iter().map(str::to_string).collect(),
+            prop_type: types.into_iter().map(str::to_string).collect(),
+        });
+    }
+    out
+}
+
+fn live_turn(file: &str) -> Vec<ds4_server::parse::ToolCall> {
+    let path = format!(
+        "{}/tests/fixtures/ds41-dsml/{file}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let parsed = parse_dsml_tolerant(&text, &live_orders(), false)
+        .unwrap_or_else(|| panic!("{file}: the finished turn recovered no call at all"));
+    parsed.calls
+}
+
+/// The artifact roots each call on the TOOL NAME and never writes the
+/// wrapper or invoke opens; its closes are the decorated DS41 forms, and the
+/// root tag carries the residue of the `name="` attribute the reference's own
+/// prompt teaches (`<read_file">`).  Measured before this case: the tolerant
+/// parse recovered nothing from either turn, so the route served the block as
+/// assistant text and no tool ran (the client's turn recorded zero tool
+/// calls).
+#[test]
+fn live_tool_root_block_recovers_its_calls() {
+    let t1 = live_turn("live-01a14f5d-turn1.txt");
+    let names: Vec<&str> = t1.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["memory_search", "memory_search", "read_file", "read_file"]);
+    assert!(t1[0].arguments.contains("SolidCraft GUI worker app visible display headless session"));
+
+    let t2 = live_turn("live-01a14f5d-turn2.txt");
+    let names: Vec<&str> = t2.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["read_file", "read_file", "read_file", "list_dir"],
+        "the malformed list_dir (its child close is the wrong tag) must be dropped, not invented"
+    );
+    assert!(
+        t2[2].arguments.contains("\"limit\": 200"),
+        "a declared integer child keeps its type: {}",
+        t2[2].arguments
+    );
+    assert!(t2[3].arguments.contains("/data/3D"));
 }

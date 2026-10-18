@@ -707,7 +707,9 @@ pub fn parse_dsml_tolerant(
 /// when its tag names a tool the request's schema declares, every child
 /// goes through the bare-child binding (declared property, matching close,
 /// schema coercion), and the close must match the root; every other shape
-/// keeps the pre-existing behavior.
+/// keeps the pre-existing behavior.  The root tag body may also carry the
+/// single stray quote the served turn of 2026-10-18 shows (`<read_file">`,
+/// open-grok session 01a14f5d); see the body check below for the measurement.
 fn dsml_tolerant_tool_root_scan(
     text: &[u8],
     norm: &[u8],
@@ -722,26 +724,44 @@ fn dsml_tolerant_tool_root_scan(
     while p < norm.len() {
         // The earliest declared-tool root tag from here wins; a tag naming
         // no declared tool is model text and stays untouched.
-        let mut best: Option<(usize, &ToolSchemaOrder, &str)> = None;
+        let mut best: Option<(usize, &ToolSchemaOrder, &str, usize)> = None;
         for o in orders {
             for n in [o.name.as_str(), o.wire_name.as_str()] {
                 if n.is_empty() {
                     continue;
                 }
-                let mut open = Vec::with_capacity(n.len() + 2);
+                let mut open = Vec::with_capacity(n.len() + 1);
                 open.extend_from_slice(b"<");
                 open.extend_from_slice(n.as_bytes());
-                open.push(b'>');
-                if let Some(rel) = find_substr(&norm[p..], &open) {
-                    let at = p + rel;
-                    if best.as_ref().map_or(true, |(b, _, _)| at < *b) {
-                        best = Some((at, o, n));
-                    }
+                let Some(rel) = find_substr(&norm[p..], &open) else {
+                    continue;
+                };
+                let at = p + rel;
+                let Some(gt) = norm[at + open.len()..].iter().position(|&c| c == b'>') else {
+                    continue;
+                };
+                // The tag body is empty (`<name>`) or one stray quote
+                // (`<name">`): the artifact keeps the closing quote of the
+                // `name="` attribute the reference's own prompt teaches
+                // (ds4_server.c:2580-2589) while dropping the attribute name,
+                // and its closes carry the decorated DS41 forms
+                // (ds4_server.c:679-683).  Measured 2026-10-18 on the served
+                // Spark turn (open-grok session 01a14f5d): with that one byte
+                // present the scan recovered nothing and no tool ran; removed,
+                // both turns recover four calls each.  Any other body is not
+                // this rule's shape.
+                let body = &norm[at + open.len()..at + open.len() + gt];
+                let stray_quote: &[u8] = b"\"";
+                if !body.is_empty() && body != stray_quote {
+                    continue;
+                }
+                if best.as_ref().map_or(true, |(b, _, _, _)| at < *b) {
+                    best = Some((at, o, n, at + open.len() + gt + 1));
                 }
             }
         }
-        let Some((at, o, n)) = best else { break };
-        let mut q = at + n.len() + 2;
+        let Some((at, o, n, tag_end)) = best else { break };
+        let mut q = tag_end;
         let mut args = Vec::new();
         loop {
             q = skip_ws(norm, q);
