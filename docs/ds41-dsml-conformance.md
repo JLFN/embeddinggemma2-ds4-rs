@@ -24,7 +24,7 @@ test report).
 | Revision | Change |
 | --- | --- |
 | R1 | Baseline: the conformance requirements, the test purposes and the measured nonconformities of the ds41 carriage as served. Clause 7.1 keeps those measurements unchanged. |
-| R2 | Scope restated at the operator's instruction: this line ports DSML carriage only and touches no KV, session or context code. Clause 1.3 replaces R1's "the KV store is in scope" claim, which was the assessor's own reading and not the operator's instruction, and is what admitted an invented checkpoint change into R1's planned phase P1. Clause 3 restates the replay acceptance as prompt byte fidelity and records the arithmetic ceiling that makes a cached-token criterion unreachable without the excluded KV work. Clause 6.3 reserves TP-07..TP-10 to the KV-carrier unit and adds TP-15..TP-18, including the client-bound test purposes and the wire-legality requirement. Clause 8 adds NC-07 and drops the R1 phase table for clause 9's restated one. |
+| R2 | Scope restated at the operator's instruction: this line ports DSML carriage only and touches no KV, session or context code. Clause 1.3 replaces R1's "the KV store is in scope" claim, which was the assessor's own reading and not the operator's instruction, and is what admitted an invented checkpoint change into R1's planned phase P1. Clause 3 restates the replay acceptance as prompt byte fidelity and records the arithmetic ceiling that makes a cached-token criterion unreachable without the excluded KV work. Clause 6.3 reserves TP-07..TP-10 to the KV-carrier unit and adds TP-15..TP-18, including the client-bound test purposes. Clause 8 adds NC-07 and NC-08; clause 9 replaces the R1 phase table. NC-07 was raised as an illegal wire value and withdrawn the same day once `generate.rs:3324` was read; clause 8.7 keeps both halves of that record. |
 | R3 | Reserved for the post-port re-measurement. |
 
 ## 1 Scope
@@ -115,12 +115,18 @@ clauses 6.3 and 8:
 | 2.3.7 | Reasoning is read from `reasoning_content` only; when thinking is active every assistant message must carry it, even empty | `types.rs` 526-538; `conversation.rs` 3691-3740 |
 | 2.3.8 | Tool results are appended in completion order, not call order; the client sets `parallel_tool_calls = true` | `tool_calls.rs` 577-596; `client.rs` 2032 |
 
-Requirement-to-IUT status at R2: 2.3.1 satisfied by both trees
-(`crates/ds4-server/src/stream.rs:655`, `:676`; reference
-`sse_chat_tool_call_start_delta` `ds4_server.c:7270-7285`); 2.3.2 satisfied;
-2.3.3 NOT satisfied (NC-07); 2.3.6 satisfied (`parse.rs:1199` region, unknown
-keys skipped); 2.3.7 and 2.3.8 open, assessed at 6.3 TP-18 and reserved
-respectively.
+Requirement-to-IUT status at R2, each checked against the source:
+
+| Clause | Status | Evidence |
+| --- | --- | --- |
+| 2.3.1 index on every tool delta | satisfied | `stream.rs:655`, `:676`; reference `ds4_server.c:7270-7285` |
+| 2.3.2 a non-empty call id | satisfied | `stream.use_random_ids()` on both routes; reference `:10743` |
+| 2.3.3 a closed `finish_reason` enum | satisfied on the ds41 route | `generate.rs:3324` remaps `error` to `stop` before every writer, with the client's own rejection recorded in the comment there. See NC-07, which R2 first raised and then withdrew |
+| 2.3.4 a truncated call is executed as complete | risk noted | the same remap turns a lost truncation signal into `stop`; C-02/C-03 measure it (NC-07 restated) |
+| 2.3.5 arguments echoed raw | satisfied | `conversation.rs:3516-3527` is client-side; the server-side consequence is the re-render, which is NC-01 |
+| 2.3.6 unknown message fields tolerated | satisfied | `parse.rs:1199` region skips unknown keys |
+| 2.3.7 `reasoning_content` on every assistant turn | open | assessed by TP-18's second half and the inventory's G-08 |
+| 2.3.8 tool results in completion order | open, deferred | reference counterpart `live_tool_call_order` `:10580` applies to Anthropic/Responses only, not the chat path this client uses |
 
 ### 2.4 Project-internal references
 
@@ -184,10 +190,13 @@ tool stream emitters and the SSE projections for all three surfaces are present
 in the Rust host. Absent or narrowed, in the same review: the replay attach on
 two of three surfaces, the checkpoint canonicalization, the invalid-DSML
 continuation, the Responses visible suffix, the in-thinking completion probe,
-the two replay flags and the trace surface, and the parse-failure finish mapping
-found at R2 by comparing the finish path against the reference's
-`tool_parse_failure_recovery_finish` (`:6776-6784`) — that one is NC-07. Clause 7
-measures the client-visible consequence of these absences.
+the two replay flags and the trace surface. Clause 7 measures the
+client-visible consequence of these absences.
+
+One candidate nonconformity raised at R2 was withdrawn on the same day: the
+finish path was read only as far as the writers, and the remap that guards them
+was missed. Clause 8.7 records both the retraction and the smaller defect the
+reading did establish, which is measured before it is acted on.
 
 The structural fact that decides the replay requirements: the reference serves
 ds41 on the shared session path, so a `ds4_session` exists for it and every
@@ -257,7 +266,7 @@ Dashed: the stages the measured nonconformities fall in.
 | TP-14 | R-14 determinism witness reproducible | D-02 | two calls identical; witness hash recorded |
 | TP-15 | R-15 exact replay reaches every chat-shaped surface (2.3.5) | B-01, B-02, B-03, B-04 with `--trace` | turn 2's traced prompt carries the sampled DSML block verbatim on chat, Anthropic and Responses |
 | TP-16 | R-16 the replay path has a kill switch | B-01 with `--disable-exact-dsml-tool-replay` | switch on: sampled bytes in the traced prompt; switch off: the canonical re-render |
-| TP-17 | R-17 a truncated or malformed DSML turn stays legal on the wire (2.3.3) | C-01, C-02 | `finish_reason` drawn only from the client's closed enum; the turn's own text returned as content |
+| TP-17 | R-17 a cut turn keeps its truncation signal and a legal finish (2.3.3, 2.3.4) | C-01, C-02, C-03 | every `finish_reason` inside the client's closed enum (holds on main: `generate.rs:3324`), and a turn cut inside its block reports `length`; the change lands only if the probe shows the signal is lost |
 | TP-18 | R-18 the client of record completes a real tool loop | client leg (6.4) | one-tool and two-tool turns complete end to end under `/data/open-grok`; the malformed turn does not fail the stream |
 
 ### 6.4 Client-of-record leg
@@ -387,58 +396,69 @@ that should be refused may be applied.
 counterpart; the parse-side wrapper-aware scan and the Anthropic live decision
 are unverified. Not measured here.
 
-### 8.7 NC-07 (TP-17, requirement 2.3.3) — a failed DSML turn can put an illegal
-value on the wire
+### 8.7 NC-07 (TP-17) — raised at R2 as an illegal wire value, then withdrawn;
+restated as a lost truncation signal
 
-Reachability, read from the source: the ds41 route sets `finish = "error"` when
-the live scan entered a tool block and the block never closed
-(`crates/ds4-server/src/generate.rs:3254-3264`); the finish is mapped by
-`terminal_finish`, which passes `error` through unchanged
-(`retry.rs:455-462`); `parse_generated_for_response` preserves it because its
-recovery arm is gated on `finish != "error"` (`tools.rs:1996-2005`, mapping that
-otherwise yields `length` or `stop` as the reference does); and both OpenAI
-writers emit the string verbatim (`stream.rs:2352-2367`, `:568-583`), as the
-ds41 stream path does at `generate.rs:3359-3370`. The one entry condition is
-`acc.saw_tool_start && !acc.saw_tool_end`, which the accumulator sets the moment
-a start marker appears and only clears on the closing marker
-(`tools.rs:2489-2502`), so a generation cut anywhere inside the block reaches
-it.
+Raised: R2 read the ds41 route's `finish = "error"` assignment
+(`crates/ds4-server/src/generate.rs:3254-3264`) together with the writers that
+emit the finish verbatim (`stream.rs:2352-2367`, `:568-583`) and concluded that
+the model-output condition would reach the wire, where the client's closed enum
+(clause 2.3.3) fails the stream.
 
-Consequence for the client of record: `finish_reason` is a closed enum
-(2.3.3), so the chunk fails to deserialize and the whole turn is a stream error
-instead of the model's text.
+Withdrawn, with the evidence that refutes it: `generate.rs:3324` remaps `error`
+to `stop` before every writer on this route, and its comment records that the
+client's own rejection ("serialization error: unknown variant `error`", session
+2026-10-10 23:17) is why. The R2 reading stopped at the writer and missed the
+remap between the two. The illegal-value nonconformity does not exist on main.
 
-Reference behaviour: a DSML parse failure is model output, not a server failure.
-The reference maps the finish to a wire-legal value — `length` stays `length`,
-everything else becomes `stop` — and returns the raw text as content
-(`tool_parse_failure_recovery_finish` `:6776-6784`, called from
-`parse_generated_message_for_response_for_syntax` `:6818-6826`; its own comment
-at `:6804-6811` states the contract).
+Restated, because the same code loses information the reference keeps: the
+assignment at `:3254-3264` overwrites a true `length` stop with `error`, which
+`terminal_finish` (`retry.rs:455-462`) and `intern_finish` (`tools.rs:2007-2013`)
+both carry through, and the remap then flattens it to `stop`. The reference
+refuses to do that: `tool_parse_failure_recovery_finish` (`:6776-6784`) keeps
+`length` because "callers can distinguish truncation from a completed turn", and
+the mapping applies only to genuine parse failures, not to a server error.
 
-Status: reachable by construction; R1's C-01 probe observed `finish=stop` because
-that cut fell before the accumulator entered the block, which is why the
-condition had to be read from the source rather than from the R1 run. C-02
-(cut inside the block, after a complete open marker) is the probe that exercises
-it; TP-17 scores it.
+Client consequence (2.3.4): a turn cut inside its tool block can be presented as
+a completed answer instead of a truncated one, so the agent loop does not know
+its output was cut. The reference's own truncation discipline is pinned by
+`test_incomplete_tool_call_keeps_stop_reason` (`:19613`) and
+`test_tool_parse_failure_returns_recoverable_finish` (`:19517`).
+
+Status: not implemented, and deliberately not implemented before measurement.
+The C-02/C-03 probes (which sweep output budgets and report every observed
+finish) decide whether the loss is reachable on the served artifact; only then
+does a change land, and it would be a named deviation from the engine's
+`v41_finish` (server_generate_v41.c:230-235), whose source is absent from this
+machine and therefore cannot be read to confirm the engine's own mapping.
+
+### 8.8 Recorded outside this line — the serial route can serve `error`
+
+Found while checking 8.7, and recorded rather than acted on: the serial path
+also reaches `finish = "error"` (`generate.rs:2596`, `:2599`) and has no remap,
+and the terminal body is written before the settlement decision that reads it
+(`serve.rs:1733`). That path serves families other than ds41, so it is outside
+this line's scope; it is listed here because it fails the same clause 2.3.3 for
+the same client.
 
 ## 9 Determination and required port work
 
 The IUT conforms for DSML decoding and client-visible shape on all four surfaces
-(TP-01..TP-06) and does not conform for replay (TP-07..TP-10, reserved),
-recovery and repair (TP-11, NC-02, NC-05), diagnostics (TP-12, NC-03),
-checkpoint canonicalization and the Responses visible suffix (NC-04), the
-thinking-scope probes (NC-06) and wire legality (TP-17, NC-07). The port work is
-phased as follows; each phase names the nonconformities it closes and the test
-purposes it must flip, and each is re-verified by re-running the whole suite so
-that the pass set can only grow.
+(TP-01..TP-06), for wire legality on the ds41 route (TP-17's first half, 8.7),
+and does not conform for replay (TP-07..TP-10, reserved), recovery and repair
+(TP-11, NC-02, NC-05), diagnostics (TP-12, NC-03), checkpoint canonicalization
+and the Responses visible suffix (NC-04) and the thinking-scope probes (NC-06).
+The port work is phased as follows; each phase names the nonconformities it
+closes and the test purposes it must flip, and each is re-verified by re-running
+the whole suite so that the pass set can only grow.
 
 | Phase | Scope | Closes | Acceptance |
 | --- | --- | --- | --- |
-| P0 | Restore the instruments: this report, the inventory, both suites, the trace module (`--trace FILE`, `ds4_help.c:323`; reference write points `ds4_server.c:11976-12017`), and the client leg of 6.4 | NC-03 (instrument half) | the suites and the client leg run against a served binary and record a baseline |
-| P1 | Diagnostics, then wire legality: `--disable-exact-dsml-tool-replay` and `--tool-memory-max-ids` (`ds4_help.c:378-379`, parsed `:15700-15702`), then `tool_parse_failure_recovery_finish` (`:6776-6784`) on the ds41 finish path | NC-03, NC-07 | TP-12, TP-17 pass; TP-01..TP-06, TP-13, TP-14 unchanged (witness identical) |
-| P2 | Exact replay carriage on every chat-shaped surface: attach at the request-parse stage and remember at the finish (`:4272`, `:4498`, `:5529`, `:14524`), the scope widened to the reference's rule (`generate.rs:1350-1359`), bounded and gated by P1's switches | NC-01 (fidelity half only) | TP-15, TP-16 pass; TP-07..TP-10 recorded and still reserved |
+| P0 | Restore the instruments: this report, the inventory, both suites, the client leg of 6.4, and the C-02/C-03 probes | NC-03 (instrument half) | the suites and the client leg run against a served binary and record a baseline |
+| P1 | Diagnostics: `--disable-exact-dsml-tool-replay` and `--tool-memory-max-ids` (`ds4_help.c:378-379`, parsed `:15700-15703`), on both the serial engine and the continuous lane | NC-03 | TP-12 passes; TP-01..TP-06, TP-13, TP-14 unchanged (witness identical) |
+| P2 | Exact replay carriage on every chat-shaped surface: attach at the request-parse stage and remember at the finish (`:4272`, `:4498`, `:5529`, `:14524`), the scope widened to the reference's rule (`generate.rs:1350-1359`), bounded and gated by P1's switches; the `--trace FILE` instrument (`ds4_help.c:323`, reference write points `ds4_server.c:11976-12017`) lands here because it is what makes the prompt bytes assertable | NC-01 (fidelity half only) | TP-15, TP-16 pass; TP-07..TP-10 recorded and still reserved |
 | P3 | The repair contract (`:6707-6774`): refuse unfinished invocations and parameters, supply only the wrapper, accept the spaced DS41 spelling, choose the style by earliest occurrence; the structural scan (`:5894`) only if this exposes it | NC-02 (repair half), NC-05, NC-06 | TP-11 passes; the repair unit test is written failing first |
-| P4 | The Responses visible suffix (`:12821`) with `:20386`, and the reasoning_content check of 2.3.7 | NC-04 (suffix half) | the suffix test passes; the 2.3.7 check is recorded either way |
+| P4 | The Responses visible suffix (`:12821`) with `:20386`; the reasoning_content check of 2.3.7; and, if C-02/C-03 show the loss, the truncation-signal deviation of 8.7 | NC-04 (suffix half) | the suffix test passes; the 2.3.7 check and the 8.7 measurement are recorded either way |
 | P5 | Per-function verdict, then revision R3 of this report from re-measured results with the evidence pack | — | one row per landed function with reference citation, test, measured before/after and a keep-or-revert verdict |
 
 Reserved, not performed by this line: TP-07..TP-10 (cached-token replay gain),
