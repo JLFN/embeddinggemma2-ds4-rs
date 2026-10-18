@@ -671,6 +671,16 @@ pub fn parse_dsml_tolerant(
     if calls.is_empty() {
         return None;
     }
+    // The reference's raw span ends at the closing wrapper
+    // (`ds4_server.c:6218-6219`: `raw_block_end = p + strlen(tool_calls_end)`),
+    // and exact replay re-emits these bytes verbatim, so a span that stopped at
+    // the last invocation would put an unclosed tool block back in the prompt.
+    // This scan leaves `p` ON the close marker; step over it.
+    if norm[p..].starts_with(b"</tool_calls") || norm[p..].starts_with(b"</calls") {
+        if let Some(gt) = norm[p..].iter().position(|&c| c == b'>') {
+            p += gt + 1;
+        }
+    }
     let orig_start = map[start];
     let content_len = trim_tool_separator_ws(text, 0, orig_start);
     let (content, reasoning) = split_reasoning_content(text, content_len, ChatFormat::DeepSeek);

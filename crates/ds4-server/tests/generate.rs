@@ -3,8 +3,10 @@
 use ds4_server::parse::{parse_request, ChatMsg, ChatPart, ImageMime, RequestImage, ToolCall};
 use ds4_server::route::WireSurface;
 use ds4_server::tools::{
-    DSML_INVOKE_END, DSML_INVOKE_START, DSML_PARAM_END, DSML_PARAM_START, DSML_TOOL_CALLS_END,
-    DSML_TOOL_CALLS_START,
+    DSML_INVOKE_END, DSML_INVOKE_END_SPACED, DSML_INVOKE_START, DSML_INVOKE_START_SPACED,
+    DSML_PARAM_END, DSML_PARAM_END_SPACED, DSML_PARAM_START, DSML_PARAM_START_SPACED,
+    DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SPACED, DSML_TOOL_CALLS_START,
+    DSML_TOOL_CALLS_START_SPACED,
 };
 use ds4_server::{
     generate_and_write, generation_blocked, handle_client_inner, render_prompt,
@@ -2408,6 +2410,8 @@ struct ScriptedV41 {
     stop_id: i32,
     ctx: i32,
     runs: std::cell::RefCell<Vec<(Vec<i32>, i32)>>,
+    /// What the route handed `remember_tool_replay`: (wire ids, sampled bytes).
+    remembered: std::cell::RefCell<Vec<(Vec<String>, String)>>,
 }
 
 impl ScriptedV41 {
@@ -2420,6 +2424,7 @@ impl ScriptedV41 {
             stop_id: 99,
             ctx,
             runs: std::cell::RefCell::new(Vec::new()),
+            remembered: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -2431,6 +2436,17 @@ impl DecodeIo for ScriptedV41 {
 
     fn is_v41(&self) -> bool {
         true
+    }
+
+    /// The real engine writes the sampled block here (`NativeDecode`,
+    /// generate.rs:4525, a port of `tool_memory_remember` at
+    /// ds4_server.c:14524). The fake records what the route handed it, so the
+    /// write is observable without a model.
+    fn remember_tool_replay(&mut self, calls: &[ToolCall], raw_dsml: &str) {
+        self.remembered.borrow_mut().push((
+            calls.iter().map(|call| call.id.clone()).collect(),
+            raw_dsml.to_string(),
+        ));
     }
 
     fn tokenize_text(&self, text: &str) -> Result<Vec<i32>, GenerateError> {
@@ -2521,9 +2537,54 @@ fn v41_completion_req(body: &str) -> ParsedRequest {
     r
 }
 
+/// The ds41 route builds its own outcome and returns before the shared finish
+/// path, so it has to write the sampled block itself, the way
+/// `tool_memory_remember` does at ds4_server.c:14524. Before this the route
+/// wrote nothing and the next turn's attach read an empty map, which is what
+/// kept replay at zero on this family.
 #[test]
-fn v41_completion_pushes_the_script() {
-    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":8}"#);
+fn v41_tool_turn_hands_the_sampled_block_to_the_tool_memory() {
+    // The artifact's own spelling: the spaced wrapper with a plain invocation.
+    let block = format!(
+        "{DSML_TOOL_CALLS_START_SPACED}\n{DSML_INVOKE_START_SPACED} name=\"get_weather\">\n\
+         {DSML_PARAM_START} name=\"city\" string=\"true\">Stockholm{DSML_PARAM_END}\n\
+         {DSML_INVOKE_END_SPACED}\n{DSML_TOOL_CALLS_END_SPACED}"
+    );
+    let body = r#"{"model":"t","messages":[{"role":"user","content":"weather?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"max_tokens":192,"temperature":0}"#;
+    let parsed = parse_request(WireSurface::OpenaiChat, &env(), body).unwrap();
+    let mut engine = ScriptedV41::new(&[(1, block.as_str()), (99, "")], 1 << 20);
+    let mut out = Vec::new();
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-mem",
+        CREATED_TEST,
+        false,
+        192,
+        &mut out,
+    )
+    .unwrap();
+
+    let remembered = engine.remembered.borrow();
+    assert_eq!(
+        remembered.len(),
+        1,
+        "the ds41 route never wrote the sampled block"
+    );
+    assert_eq!(
+        remembered[0].1, block,
+        "the remembered bytes are not the sampled block"
+    );
+    assert_eq!(remembered[0].0.len(), 1, "{:?}", remembered[0].0);
+    assert!(
+        remembered[0].0[0].starts_with("call_"),
+        "the map key must be the id that reached the wire: {:?}",
+        remembered[0].0
+    );
+}
+
+#[test]
+fn v41_completion_pushes_the_script() {    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":8}"#);
     let mut engine = ScriptedV41::new(&[(1, "Hello"), (2, " world"), (99, "")], 1 << 20);
     let mut out = Vec::new();
     let result = generate_and_write(

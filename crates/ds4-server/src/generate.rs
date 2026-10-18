@@ -1347,19 +1347,29 @@ pub(crate) fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
         && parsed.live_call_ids.is_empty()
 }
 
-fn tool_replay_scope(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
+/// Whether this request may carry exact sampled DSML.
+///
+/// The reference attaches in all three chat-shaped parsers — OpenAI chat
+/// (`ds4_server.c:4272`), Anthropic (`:4498`), Responses (`:5529`) — and the
+/// attach itself refuses nothing but the disable switch
+/// (`tool_memory_attach_to_messages`, `:10682`): a miss is counted in the
+/// replay stats (`:10684-10692`), never refused. Thinking mode, live call ids
+/// and the model syntax therefore do not narrow it. The Rust host used to
+/// narrow to OpenAI chat, non-thinking, no live ids and three syntaxes, which
+/// sent an Anthropic or Responses turn whose history carried a call down the
+/// canonical-render lane.
+///
+/// The one condition kept is `kind == Chat`: the legacy `/v1/completions`
+/// surface carries no messages at all, and the reference has no such parser.
+/// Whether a given family's renderer honours the replayed bytes is the
+/// renderer's own decision (`render.rs:539`, `:698`, `:765`, `:835`, `:1053`,
+/// `:1078`, `:2504`), not a gate here.
+fn tool_replay_scope(parsed: &ParsedRequest) -> bool {
     parsed.kind == ReqKind::Chat
-        && parsed.api == Api::Openai
-        && !think_mode_enabled(parsed.think_mode)
-        && parsed.live_call_ids.is_empty()
-        && matches!(
-            syntax,
-            ModelSyntax::DeepSeek | ModelSyntax::SolarOpen2 | ModelSyntax::Qwen4Exp
-        )
 }
 
-fn tool_replay_disk_cache_eligible(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
-    tool_replay_scope(parsed, syntax)
+fn tool_replay_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
+    tool_replay_scope(parsed)
         && parsed.messages.iter().any(|message| {
             !message.calls.is_empty()
                 || !message.tool_call_id.is_empty()
@@ -1367,8 +1377,8 @@ fn tool_replay_disk_cache_eligible(parsed: &ParsedRequest, syntax: ModelSyntax) 
         })
 }
 
-fn tool_replay_producer_eligible(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
-    tool_replay_scope(parsed, syntax) && parsed.has_tools
+fn tool_replay_producer_eligible(parsed: &ParsedRequest) -> bool {
+    tool_replay_scope(parsed) && parsed.has_tools
 }
 
 fn thinking_visible_cache_eligible(parsed: &ParsedRequest) -> bool {
@@ -2331,7 +2341,7 @@ pub(crate) fn prepare_serial_prompt(
     let tool_replay = parsed.images.is_empty()
         && parsed.audios.is_empty()
         && parsed.videos.is_empty()
-        && tool_replay_disk_cache_eligible(&parsed, syntax);
+        && tool_replay_disk_cache_eligible(&parsed);
     if tool_replay {
         engine.restore_tool_replay(&mut parsed.messages);
     }
@@ -2673,7 +2683,7 @@ pub(crate) fn generate_terminal_prepared(
                 "call_"
             },
         );
-        if tool_replay_producer_eligible(&parsed, syntax) {
+        if tool_replay_producer_eligible(&parsed) {
             engine.remember_tool_replay(&parsed_gen.calls, &parsed_gen.raw_dsml);
         }
         finish = "tool_calls";
@@ -3488,6 +3498,14 @@ fn generate_terminal_v41(
         lane: None,
         fallback_reason: None,
     };
+    // The reference writes the sampled block on the shared finish path
+    // (`tool_memory_remember`, ds4_server.c:14524, after `assign_tool_call_ids`
+    // at :10743, so the keys are the ids that reached the wire).  This route
+    // builds its own outcome and returns before that path, so without the write
+    // here the next turn's attach reads an empty map.  It sits after the wire
+    // bytes because the emit state holds the engine for the whole run
+    // (`V41EmitState`, :3164).
+    engine.remember_tool_replay(&parsed_gen.calls, &parsed_gen.raw_dsml);
     Ok((outcome, terminal))
 }
 
@@ -6810,38 +6828,31 @@ mod disk_sync_tests {
             }],
             ..Default::default()
         }];
-        assert!(tool_replay_disk_cache_eligible(
-            &replay,
-            ModelSyntax::DeepSeek
-        ));
-        assert!(tool_replay_disk_cache_eligible(
-            &replay,
-            ModelSyntax::SolarOpen2
-        ));
-        assert!(tool_replay_producer_eligible(
-            &replay,
-            ModelSyntax::DeepSeek
-        ));
-        for syntax in [ModelSyntax::Motif3, ModelSyntax::Exaone, ModelSyntax::Dots3] {
-            assert!(!tool_replay_disk_cache_eligible(&replay, syntax));
-        }
-        for mutate in 0..4 {
-            let mut rejected = replay.clone();
+        // The reference attaches in all three chat-shaped parsers and refuses
+        // nothing but its own disable switch (ds4_server.c:4272, :4498, :5529,
+        // :10682), so the cases the old rule narrowed away must all take the
+        // lane: another surface, thinking mode, or live call ids.
+        assert!(tool_replay_disk_cache_eligible(&replay));
+        assert!(tool_replay_producer_eligible(&replay));
+        for mutate in 0..3 {
+            let mut accepted = replay.clone();
             match mutate {
-                0 => rejected.api = Api::Anthropic,
-                1 => rejected.think_mode = ThinkMode::Low,
-                2 => rejected.live_call_ids.push("call_live".into()),
-                _ => rejected.kind = crate::route::ReqKind::Completion,
+                0 => accepted.api = Api::Anthropic,
+                1 => accepted.think_mode = ThinkMode::Low,
+                _ => accepted.live_call_ids.push("call_live".into()),
             }
-            assert!(!tool_replay_disk_cache_eligible(
-                &rejected,
-                ModelSyntax::DeepSeek
-            ));
-            assert!(!tool_replay_producer_eligible(
-                &rejected,
-                ModelSyntax::DeepSeek
-            ));
+            assert!(
+                tool_replay_disk_cache_eligible(&accepted),
+                "widened scope still rejected mutation {mutate}"
+            );
         }
+
+        // The one request the reference cannot serve: the legacy completion
+        // surface carries no messages, and the reference has no such parser.
+        let mut completion = replay.clone();
+        completion.kind = crate::route::ReqKind::Completion;
+        assert!(!tool_replay_disk_cache_eligible(&completion));
+        assert!(!tool_replay_producer_eligible(&completion));
     }
 }
 
@@ -7075,5 +7086,142 @@ mod mimo_prepare {
         assert_eq!(split_media.videos.len(), 1);
         assert_eq!(split_media.audios.len(), 1);
         assert_eq!(pads(&split_media.tokens, ds4_core::AUDIO_PAD), audio_len);
+    }
+}
+
+/// Exact sampled DSML replay (docs/ds41-dsml-conformance.md TP-15, TP-16).
+///
+/// The reference keeps the sampled block per tool-call id and puts those bytes
+/// back into the messages before rendering (`tool_memory_attach_to_messages`,
+/// ds4_server.c:10679), attached at all three chat-shaped parsers (:4272 chat,
+/// :4498 Anthropic, :5529 Responses); its own tests assert the message bytes
+/// (`test_tool_memory_replays_sampled_dsml` :19933,
+/// `test_anthropic_tool_memory_replays_sampled_dsml` :19996). These assert the
+/// rendered prompt instead, which is what the model reads.
+#[cfg(test)]
+mod dsml_replay {
+    use super::{render_prompt_ex, tool_replay_disk_cache_eligible};
+    use crate::parse::{parse_request, ParseEnv};
+    use crate::render::dsml_head;
+    use crate::route::WireSurface;
+    use crate::tool_memory::{ExactReplay, Source, ToolMemory, ToolMemoryConfig};
+    use crate::tools::{
+        DSML_INVOKE_END, DSML_INVOKE_START, DSML_PARAM_END, DSML_PARAM_START,
+        DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_START,
+    };
+
+    /// The ds41 model id. Its canonical render uses the spaced spelling
+    /// (`render.rs:1387`), which is what makes the plain spelling below
+    /// unmistakable: only a replayed block can put it in the prompt.
+    const MODEL_ID: i32 = ds4_core::Variant::DeepSeek41Flash as i32;
+
+    const CHAT_ID: &str = "call_echoed";
+    const TOOLU_ID: &str = "toolu_echoed";
+    const CALL_ID_PLACEHOLDER: &str = "__ID__";
+
+    fn sampled() -> String {
+        format!(
+            "{DSML_TOOL_CALLS_START}\n{DSML_INVOKE_START} name=\"get_weather\">\n\
+             {DSML_PARAM_START} name=\"city\" string=\"true\">Stockholm{DSML_PARAM_END}\n\
+             {DSML_INVOKE_END}\n{DSML_TOOL_CALLS_END}"
+        )
+    }
+
+    /// The client's own echo of the call, respaced the way a re-serializing
+    /// client sends it (`{"city": "Stockholm"}` against the sampled
+    /// `{"city":"Stockholm"}`).
+    const OPENAI_BODY: &str = r#"{"model":"t","max_tokens":16,"messages":[
+        {"role":"user","content":"weather?"},
+        {"role":"assistant","content":"","tool_calls":[{"id":"__ID__","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Stockholm\"}"}}]},
+        {"role":"tool","tool_call_id":"__ID__","content":"{\"temp_c\":7}"},
+        {"role":"user","content":"and tomorrow?"}],
+        "tools":[{"type":"function","function":{"name":"get_weather","description":"Current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}"#;
+
+    const ANTHROPIC_BODY: &str = r#"{"model":"t","max_tokens":16,"tools":[{"name":"get_weather","description":"Current weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"messages":[
+        {"role":"user","content":"weather?"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"__ID__","name":"get_weather","input":{"city":"Stockholm"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"__ID__","content":"{\"temp_c\":7}"}]}]}"#;
+
+    const RESPONSES_BODY: &str = r#"{"model":"t","max_output_tokens":16,"tools":[{"type":"function","function":{"name":"get_weather","description":"Current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"input":[
+        {"role":"user","content":"weather?"},
+        {"type":"function_call","call_id":"__ID__","name":"get_weather","arguments":"{\"city\": \"Stockholm\"}"},
+        {"type":"function_call_output","call_id":"__ID__","output":"{\"temp_c\":7}"}]}"#;
+
+    fn body(template: &str, id: &str) -> String {
+        template.replace(CALL_ID_PLACEHOLDER, id)
+    }
+
+    fn memory(replay: ExactReplay, id: &str) -> ToolMemory {
+        let mut memory = ToolMemory::from_config(ToolMemoryConfig {
+            max_ids: 1000,
+            replay,
+        });
+        memory.put(id, &sampled(), Source::Ram);
+        memory
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// TP-15. Each surface parses its own echo of the call, and the replayed
+    /// bytes must survive into the rendered prompt.
+    #[test]
+    fn sampled_bytes_reach_the_prompt_on_every_chat_surface() {
+        let cases = [
+            (WireSurface::OpenaiChat, OPENAI_BODY, CHAT_ID),
+            (WireSurface::Anthropic, ANTHROPIC_BODY, TOOLU_ID),
+            (WireSurface::Responses, RESPONSES_BODY, CHAT_ID),
+        ];
+        let sampled = sampled();
+        for (surface, template, id) in cases {
+            let mut parsed = parse_request(surface, &ParseEnv::default(), &body(template, id))
+                .unwrap_or_else(|error| panic!("{surface:?} did not parse: {error}"));
+            assert!(
+                tool_replay_disk_cache_eligible(&parsed),
+                "{surface:?} did not take the replay lane"
+            );
+            let head = dsml_head(MODEL_ID, "sys");
+            let before = render_prompt_ex(&parsed, MODEL_ID, head).unwrap();
+            assert!(
+                !contains(&before, sampled.as_bytes()),
+                "{surface:?} rendered the sampled block with no replay"
+            );
+            // The call is rendered canonically in that arm: the spaced invoke
+            // marker is what the ds41 renderer emits.
+            assert!(
+                contains(&before, crate::tools::DSML_INVOKE_START_SPACED.as_bytes()),
+                "{surface:?} did not render the call at all, so the check above is vacuous"
+            );
+
+            let mut memory = memory(ExactReplay::On, id);
+            assert_eq!(memory.attach(&mut parsed.messages), 1, "{surface:?}");
+            let after = render_prompt_ex(&parsed, MODEL_ID, head).unwrap();
+            assert!(
+                contains(&after, sampled.as_bytes()),
+                "{surface:?} did not replay the sampled block into the prompt"
+            );
+        }
+    }
+
+    /// TP-16. `--disable-exact-dsml-tool-replay` (ds4_help.c:378) leaves the
+    /// canonical render in place.
+    #[test]
+    fn the_disable_switch_leaves_the_canonical_render() {
+        let mut parsed = parse_request(
+            WireSurface::OpenaiChat,
+            &ParseEnv::default(),
+            &body(OPENAI_BODY, CHAT_ID),
+        )
+        .unwrap();
+        let head = dsml_head(MODEL_ID, "sys");
+        let mut memory = memory(ExactReplay::Off, CHAT_ID);
+        assert_eq!(memory.attach(&mut parsed.messages), 0);
+        let prompt = render_prompt_ex(&parsed, MODEL_ID, head).unwrap();
+        assert!(!contains(&prompt, sampled().as_bytes()));
+        assert!(
+            contains(&prompt, crate::tools::DSML_INVOKE_START_SPACED.as_bytes()),
+            "the call must still render canonically"
+        );
     }
 }
