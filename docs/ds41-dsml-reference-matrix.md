@@ -94,7 +94,7 @@ evidence index or in the test itself.
 | R-08 | replay survives a differently spelled client echo | B-02 | reserved as R-07 |
 | R-09 | Anthropic turn 2 reuses the sampled block | B-03 | reserved as R-07 |
 | R-10 | Responses continuation reuses the sampled call | B-04 | reserved as R-07 |
-| R-11 | a cut block is not served as assistant content | C-01 (suite) + `tests/dsml.rs::live_tool_root_block_recovers_its_calls` | parser half fixed and measured (23eb6b2); the tracker half is OPEN (unit 3.1) |
+| R-11 | a cut block is not served as assistant content | C-01 (suite) + `tests/dsml.rs::live_tool_root_block_recovers_its_calls` (parser) + `tests/dsml.rs::tracker_enters_tool_mode_on_the_quoted_tool_root` and `tests/generate.rs::v41_live_tool_root_turn_streams_calls_without_markup` (tracker) | host pass: the parser half landed at 23eb6b2, the tracker half at d5ad35a, where the recorded turn streams its calls with no markup in the body (A/B: with the new scan off the wrapper close reaches the client as content); the served verdict is the C-01 suite re-run at the gate |
 | R-12 | replay and trace diagnostics are available | `--help` check (Annex B, `flags-baseline-20261018.txt`) | OPEN: 2 of 3 at HEAD (`--disable-exact-dsml-tool-replay`, `--tool-memory-max-ids`, `crates/ds4-server/src/bin/ds4-server-rs.rs:225-231`, advertised at :1327); `--trace` is unit 3.2 |
 | R-13 | plain-text KV reuse intact (protection) | TP-13 / D-01 | measured pass at the baseline; re-run every phase |
 | R-14 | determinism witness reproducible (protection) | TP-14 / D-02, witness sha16 `adf7157c8a5bbb4b` | measured pass at the baseline; re-run every phase |
@@ -129,12 +129,11 @@ evidence index or in the test itself.
 ## 6. What blocks an "all covered" claim
 
 The OPEN rows, in the order the plan would close them: R-12 and R-15's served
-leg (`--trace`, unit 3.2), R-11's tracker half (unit 3.1), R-17 and R-18 (the
-gate, unit 3.3), G8 and G9's repair-side scan (P3, unit 3.4), G6 (P4), G5
-(needs the Anthropic live path to be probed), O-01..O-03 (decisions above),
-and R-07..R-10 together with G1's remainder and G3/G4, which are reserved to a
-unit that may alter KV state.
+leg (`--trace`, unit 3.2), R-17 and R-18 (the gate, unit 3.3), G8 and G9's
+repair-side scan (P3, unit 3.4), G6 (P4), G5 (needs the Anthropic live path to
+be probed), O-01..O-03 (decisions above), and R-07..R-10 together with G1's
+remainder and G3/G4, which are reserved to a unit that may alter KV state.
 
 Covered today, measured in this session or quoted from the CTR's evidence
-index: R-01..R-06, R-13, R-14, R-15's host leg, R-16's host leg, and every
-part A case marked pass.
+index: R-01..R-06, R-11 at host level, R-13, R-14, R-15's host leg, R-16's
+host leg, and every part A case marked pass.
