@@ -182,7 +182,7 @@ fn thinking_max_effort_matches_official_encoding() {
 /// references.  The case stays here so the row is re-measured when the effort
 /// surface is decided.
 #[test]
-#[ignore = "OPEN O-01: the oracle's low=50 prefix has no counterpart in the reference's DS4_THINK_LOW arm"]
+#[ignore = "OPEN O-01: the requested effort never reaches the head prefix (engine_think_mode collapses low into high on the ds41 route) and a numeric reasoning_effort is refused at the parse (format.rs:96-102)"]
 fn thinking_low_effort_matches_official_encoding() {
     let msgs = [
         msg("system", "You are a helpful assistant."),
