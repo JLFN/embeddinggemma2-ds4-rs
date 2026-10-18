@@ -2336,6 +2336,14 @@ mod native {
             self
         }
 
+        /// The boot exact-replay switches, the same map the serial engine gets
+        /// (`NativeDecode::with_tool_memory`). The reference has one server
+        /// struct, so a flag that reached only one lane would be a half port.
+        pub fn with_tool_memory(mut self, config: crate::tool_memory::ToolMemoryConfig) -> Self {
+            self.host.tool_memory = crate::tool_memory::ToolMemory::from_config(config);
+            self
+        }
+
         pub fn new(
             batch: BatchCtx<'m>,
             vocab: &'m Vocab,

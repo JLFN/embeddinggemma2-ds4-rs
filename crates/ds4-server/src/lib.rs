@@ -37,6 +37,8 @@ pub mod serve_static;
 pub mod stream;
 #[cfg(any(feature = "native", test))]
 mod tool_memory;
+#[cfg(any(feature = "native", test))]
+pub use tool_memory::{ExactReplay, ToolMemoryConfig};
 pub mod tool_stream;
 pub mod tools;
 #[cfg(any(feature = "native", test))]

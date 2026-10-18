@@ -4008,6 +4008,16 @@ impl<'a> NativeDecode<'a> {
         self
     }
 
+    /// The two exact-replay switches (`--disable-exact-dsml-tool-replay`,
+    /// `--tool-memory-max-ids`) and the forced-off state a test uses. The
+    /// reference keeps both on the server struct and checks them inside each
+    /// entry point (ds4_server.c:10635, :10654, :10666, :10682, :10976, :11041,
+    /// :11095), so the map is built once here at boot.
+    pub fn with_tool_memory(mut self, config: crate::tool_memory::ToolMemoryConfig) -> Self {
+        self.tool_memory = ToolMemory::from_config(config);
+        self
+    }
+
     pub fn with_vocab(mut self, vocab: &'a ds4_core::Vocab) -> Self {
         self.vocab = Some(vocab);
         self
