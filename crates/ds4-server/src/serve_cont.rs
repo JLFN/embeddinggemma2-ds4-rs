@@ -129,13 +129,16 @@ impl ContStepper {
         if room >= 0 && max_tokens > room {
             max_tokens = room;
         }
-        let acc = SemAccum::init(
+        let mut acc = SemAccum::init(
             parsed.kind == ReqKind::Chat,
             parsed.has_tools,
             think_mode_enabled(parsed.think_mode),
             req.chat_format,
             &prompt,
         );
+        // The request's tools, for the start scan that recognises the
+        // artifact's quoted root (find_tool_start).
+        acc.set_tool_orders(&parsed.tool_orders);
         let mut w = Writer::new(created);
         let mut oa = None;
         let mut anth = None;

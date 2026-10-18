@@ -2724,3 +2724,89 @@ fn v41_empty_prompt_is_refused_before_the_engine() {
     assert!(error.to_string().contains("empty prompt"), "{error}");
     assert!(engine.runs.borrow().is_empty());
 }
+
+/// The tracker half of P1.6, measured on a served turn: the recorded artifact
+/// turn (open-grok session 01a14f5d, the fixtures beside `tests/dsml.rs`)
+/// roots its calls on the bare tool name with the stray quote, so the start
+/// scan found no marker and the whole block reached the client as content.
+/// Here the turn is scripted in three pieces -- prose, block, prose -- and the
+/// streamed body must carry the calls while carrying no markup at all.
+#[test]
+fn v41_live_tool_root_turn_streams_calls_without_markup() {
+    let text = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ds41-dsml/live-01a14f5d-turn1.txt"),
+    )
+    .unwrap();
+
+    // The request declares the three tools the turn calls; the start scan only
+    // takes a root tag some tool declares.
+    let body = r#"{"model":"t","stream":true,"messages":[{"role":"user","content":"open solidcraft"}],
+      "tools":[
+        {"type":"function","function":{"name":"memory_search","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+        {"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"target_file":{"type":"string"}},"required":["target_file"]}}},
+        {"type":"function","function":{"name":"list_dir","parameters":{"type":"object","properties":{"target_directory":{"type":"string"}},"required":["target_directory"]}}}
+      ],"max_tokens":512,"temperature":0}"#;
+    let mut parsed = parse_request(WireSurface::OpenaiChat, &env(), body).unwrap();
+    parsed.think_mode = ThinkMode::None;
+    parsed.temperature = 0.0;
+
+    // Split at the fixture's own boundaries -- the root tag and the wrapper
+    // close -- without asking the scan under test, so the arm that turns the
+    // scan off still feeds the writer the same three pieces.
+    let root: &[u8] = b"<memory_search\">";
+    let at = text
+        .windows(root.len())
+        .position(|w| w == root)
+        .expect("the recorded turn keeps its quoted tool root");
+    let close = DSML_TOOL_CALLS_END_SPACED.as_bytes();
+    let end = at
+        + text[at..]
+            .windows(close.len())
+            .position(|w| w == close)
+            .expect("the recorded turn keeps its wrapper close")
+        + close.len();
+
+    let pieces: Vec<Vec<u8>> = vec![
+        text[..at].to_vec(),
+        text[at..end].to_vec(),
+        text[end..].to_vec(),
+    ];
+    let script: Vec<(i32, String)> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as i32 + 1, String::from_utf8_lossy(p).into_owned()))
+        .chain(std::iter::once((99, String::new())))
+        .collect();
+
+    let mut engine = ScriptedV41::new(&script.iter().map(|(i, s)| (*i, s.as_str())).collect::<Vec<_>>(), 1 << 20);
+    let mut out = Vec::new();
+    generate_and_write(&mut engine, &parsed, "v41-live-root", CREATED_TEST, true, 512, &mut out)
+        .unwrap();
+    let sse = String::from_utf8(out).unwrap();
+
+    assert!(
+        sse.contains("\"tool_calls\""),
+        "the turn's calls must reach the client: {sse}"
+    );
+    assert!(
+        sse.contains("memory_search") && sse.contains("read_file"),
+        "the sampled calls must be named on the wire: {sse}"
+    );
+    for marker in [
+        DSML_TOOL_CALLS_START_SPACED,
+        DSML_TOOL_CALLS_END_SPACED,
+        DSML_INVOKE_START_SPACED,
+        DSML_INVOKE_END_SPACED,
+        "<memory_search",
+        "<read_file",
+    ] {
+        assert!(
+            !sse.contains(marker),
+            "the block's markup reached the client as content: {marker}"
+        );
+    }
+    assert!(
+        sse.contains("finish_reason\":\"tool_calls\""),
+        "a served call must finish as tool_calls: {sse}"
+    );
+}

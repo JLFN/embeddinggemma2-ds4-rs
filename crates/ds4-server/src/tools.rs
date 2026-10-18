@@ -2053,7 +2053,50 @@ fn intern_finish(finish: &str) -> &'static str {
     }
 }
 
-pub fn find_tool_start(s: &[u8], format: ChatFormat) -> Option<usize> {
+/// The artifact's quoted tool root: the bare tool name with the residue of the
+/// `name="` attribute the reference's own prompt teaches (`<read_file">`,
+/// ds4_server.c:2580-2589), which the finish-level parse recovers in
+/// dsml_tolerant_tool_root_scan.  The predicate is that function's, on
+/// purpose: the tracker must recognise exactly the blocks the parse serves,
+/// because a tag the parse ignores would leave the client without both the
+/// markup and the calls.  A tag naming no declared tool is model text.
+fn dsml_find_declared_tool_root(s: &[u8], orders: &[ToolSchemaOrder]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for o in orders {
+        for n in [o.name.as_str(), o.wire_name.as_str()] {
+            if n.is_empty() {
+                continue;
+            }
+
+            let mut open = Vec::with_capacity(n.len() + 1);
+            open.push(b'<');
+            open.extend_from_slice(n.as_bytes());
+
+            let mut from = 0;
+            while let Some(rel) = find_substr(&s[from..], &open) {
+                let body_start = from + rel + open.len();
+                let Some(gt) = s[body_start..].iter().position(|&c| c == b'>') else {
+                    break;
+                };
+
+                // Empty body or the one stray quote; any other body is not
+                // this rule's shape (dsml_tolerant_tool_root_scan, tools.rs).
+                let body = &s[body_start..body_start + gt];
+                if body.is_empty() || body == b"\"" {
+                    let at = from + rel;
+                    if best.map_or(true, |b| at < b) {
+                        best = Some(at);
+                    }
+                    break;
+                }
+                from = body_start;
+            }
+        }
+    }
+    best
+}
+
+pub fn find_tool_start(s: &[u8], format: ChatFormat, orders: &[ToolSchemaOrder]) -> Option<usize> {
     match format {
         ChatFormat::IQuestQ1 => find_substr(s, crate::render::IQUEST_TOOL_CALL_START.as_bytes()),
         ChatFormat::SolarOpen2 => find_substr(s, SOLAR_TOOL_CALLS.as_bytes()),
@@ -2086,7 +2129,14 @@ pub fn find_tool_start(s: &[u8], format: ChatFormat) -> Option<usize> {
                 b"<DSML\xef\xbd\x9ccalls>",
                 b"<calls>",
             ];
-            cands.iter().filter_map(|p| find_substr(s, p)).min()
+            // The earliest occurrence wins across both families: a quoted
+            // root and a decorated wrapper can appear in one turn, and the
+            // block starts where the first of them does.
+            let marker = cands.iter().filter_map(|p| find_substr(s, p)).min();
+            [marker, dsml_find_declared_tool_root(s, orders)]
+                .into_iter()
+                .flatten()
+                .min()
         }
     }
 }
@@ -2125,9 +2175,10 @@ pub fn observe_tool_markers(
     saw_start: &mut bool,
     saw_end: &mut bool,
     format: ChatFormat,
+    orders: &[ToolSchemaOrder],
 ) -> (bool, bool) {
     let had_start = *saw_start;
-    let start = find_tool_start(scan, format);
+    let start = find_tool_start(scan, format, orders);
     if start.is_some() {
         *saw_start = true;
     }
@@ -2343,6 +2394,11 @@ pub struct SemAccum {
     cut_tool_syntax: bool,
     think_gates: bool,
     chat_format: ChatFormat,
+    /// The request's declared tools: the start scan recognises the artifact's
+    /// quoted root (`<read_file">`) only for a name some tool declares, the
+    /// same predicate the finish-level tolerant parse applies
+    /// (dsml_find_declared_tool_root).  Empty for a request with no tools.
+    tool_orders: Vec<ToolSchemaOrder>,
     thinking_inside: bool,
     think_tail: Vec<u8>,
     stop_scan_from: usize,
@@ -2382,6 +2438,7 @@ impl SemAccum {
             cut_tool_syntax: kind_chat && !has_tools && format != ChatFormat::IQuestQ1,
             think_gates: think_enabled || format == ChatFormat::Inkling,
             chat_format: format,
+            tool_orders: Vec::new(),
             thinking_inside: false,
             think_tail: Vec::new(),
             stop_scan_from: 0,
@@ -2404,6 +2461,14 @@ impl SemAccum {
         }
         a.tool_scan_waiting = a.think_gates && a.thinking_inside;
         a
+    }
+
+    /// Declare the request's tools after `init`, so the start scan can take
+    /// the artifact's quoted root into tool mode.  Separate from `init` so the
+    /// callers with no parse at hand (and the tapes) keep their signature.
+    pub fn set_tool_orders(&mut self, orders: &[ToolSchemaOrder]) {
+        self.tool_orders.clear();
+        self.tool_orders.extend_from_slice(orders);
     }
 
     fn feed_thinking(&mut self, piece: &[u8]) {
@@ -2519,7 +2584,7 @@ impl SemAccum {
                 let scan = &self.text[self.tool_scan_from..];
                 let old_start = self.saw_tool_start;
                 let old_end = self.saw_tool_end;
-                let start = find_tool_start(scan, self.chat_format);
+                let start = find_tool_start(scan, self.chat_format, &self.tool_orders);
                 if start.is_some() {
                     self.saw_tool_start = true;
                 }
@@ -2533,7 +2598,7 @@ impl SemAccum {
                 f.entered_tool_block = self.saw_tool_start && !old_start;
                 f.tool_block_closed = self.saw_tool_end && !old_end;
                 if f.entered_tool_block && self.cut_tool_syntax {
-                    if let Some(m) = find_tool_start(scan, self.chat_format) {
+                    if let Some(m) = find_tool_start(scan, self.chat_format, &self.tool_orders) {
                         cut_pos = Some(self.tool_scan_from + m);
                     }
                 }

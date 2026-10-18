@@ -2537,6 +2537,9 @@ pub(crate) fn generate_terminal_prepared(
             req.chat_format,
             &prompt,
         );
+        // The request's tools, for the start scan that recognises the
+        // artifact's quoted root (find_tool_start).
+        acc.set_tool_orders(&parsed.tool_orders);
         finish = "length";
         token_ids.clear();
 
@@ -3160,6 +3163,16 @@ fn generate_terminal_v41(
 
     let t0 = Instant::now();
     let chat_format = req.chat_format;
+    let mut acc = SemAccum::init(
+        parsed.kind == ReqKind::Chat,
+        parsed.has_tools,
+        think_mode_enabled(parsed.think_mode),
+        chat_format,
+        prompt,
+    );
+    // The request's tools, for the start scan that recognises the artifact's
+    // quoted root (find_tool_start).
+    acc.set_tool_orders(&parsed.tool_orders);
     let state = RefCell::new(V41EmitState {
         engine,
         parsed,
@@ -3167,13 +3180,7 @@ fn generate_terminal_v41(
         job_id,
         stop_requested,
         max_tokens,
-        acc: SemAccum::init(
-            parsed.kind == ReqKind::Chat,
-            parsed.has_tools,
-            think_mode_enabled(parsed.think_mode),
-            chat_format,
-            prompt,
-        ),
+        acc,
         w: &mut w,
         out,
         oa,

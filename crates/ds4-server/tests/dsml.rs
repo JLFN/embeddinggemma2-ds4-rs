@@ -7,6 +7,7 @@ use ds4_server::tools::{
     DSML_INVOKE_END_SPACED, DSML_INVOKE_START_SPACED, DSML_PARAM_END_SPACED,
     DSML_PARAM_START_SPACED, DSML_TOOL_CALLS_END_SPACED, DSML_TOOL_CALLS_START_SPACED,
 };
+use ds4_server::tools::find_tool_start;
 use ds4_server::{dsml_decode_state_for_text, ChatFormat, DsmlDecodeState, SemAccum};
 use std::path::PathBuf;
 use std::process::Command;
@@ -197,12 +198,16 @@ fn live_orders() -> Vec<ToolSchemaOrder> {
     out
 }
 
-fn live_turn(file: &str) -> Vec<ds4_server::parse::ToolCall> {
+fn live_text(file: &str) -> Vec<u8> {
     let path = format!(
         "{}/tests/fixtures/ds41-dsml/{file}",
         env!("CARGO_MANIFEST_DIR")
     );
-    let text = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+}
+
+fn live_turn(file: &str) -> Vec<ds4_server::parse::ToolCall> {
+    let text = live_text(file);
     let parsed = parse_dsml_tolerant(&text, &live_orders(), false)
         .unwrap_or_else(|| panic!("{file}: the finished turn recovered no call at all"));
     parsed.calls
@@ -235,4 +240,34 @@ fn live_tool_root_block_recovers_its_calls() {
         t2[2].arguments
     );
     assert!(t2[3].arguments.contains("/data/3D"));
+}
+
+/// The tracker half of the same defect.  The parser now serves the calls, but
+/// the live stream still drew the block as assistant content, because the
+/// start scan listed the wrapper and invoke opens only and the artifact's root
+/// is the bare tool name.  A block the scan does not recognise is a block the
+/// tracker cannot hold back.
+#[test]
+fn tracker_enters_tool_mode_on_the_quoted_tool_root() {
+    let text = live_text("live-01a14f5d-turn1.txt");
+
+    let at = find_tool_start(&text, ChatFormat::DeepSeek, &live_orders())
+        .expect("the artifact's root tag must start a tool block");
+    assert_eq!(
+        &text[at..at + b"<memory_search\">".len()],
+        b"<memory_search\">",
+        "the scan must stop at the root tag, not at some later marker"
+    );
+
+    let mut acc = SemAccum::init(true, true, false, ChatFormat::DeepSeek, b"");
+    acc.set_tool_orders(&live_orders());
+    acc.feed(&text, &[]);
+    assert!(
+        acc.saw_tool_start,
+        "the quoted tool root must take the live tracker into tool mode"
+    );
+    assert!(
+        acc.saw_tool_end,
+        "the decorated wrapper close must close the block"
+    );
 }
