@@ -109,8 +109,11 @@ decided by the oracle. The clauses that state the requirements assessed here:
 entry `deepseek-v4.1-1017-flash-ds4` in `~/.opengrok/config.toml`
 (`base_url = "http://192.168.1.91:8008/v1"`,
 `api_backend = "chat_completions"`), so this client is the party the carriage
-must satisfy. Its requirements, each read from its source, are normative for
-clauses 6.3 and 8:
+must satisfy. It is a scoping choice, not a dependency: the server ships no
+client and must serve any compatible caller, so a requirement below binds once
+it is OpenAI-wire behavior and is treated as this client's own preference when
+it is not (AGENTS.md, the carriage section). Its requirements, each read from
+its source, are normative for clauses 6.3 and 8:
 
 | Clause | Requirement as the client implements it | Line |
 | --- | --- | --- |
