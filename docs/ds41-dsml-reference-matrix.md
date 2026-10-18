@@ -1,0 +1,140 @@
+# DS41-DSML reference coverage matrix
+
+Status: draft for CTR revision R3 (the report folds this in whole as its
+reference section). Prepared by ds4-dfm-rs work session, 2026-10-18.
+
+This document answers one question: for every DSML requirement this project
+has written down, which case exercises it, and what did that case actually
+measure? Its rows come from the two maintained documents and nowhere else:
+
+- `docs/ds41-dsml-conformance.md` (CTR R2) — requirements R-01..R-18 (clause
+  6.3), nonconformities NC-01..NC-08 (clause 8), phases P0..P5 (clause 9);
+- `docs/ds41-dsml-port-inventory.md` — gaps G1..G9 (section 4).
+
+A row whose requirement has no case stays OPEN and blocks any "all covered"
+claim. The leg's own findings — differences the oracle leg measured that
+neither source lists yet — are rows O-01..O-04 in part D; they are findings,
+not requirements, and each names whether it is a defect, a delta between the
+two references, or a decision the operator owes.
+
+## 1. The oracle
+
+| Field | Value |
+| --- | --- |
+| File | `/data/ds4/test/encoding.py` |
+| sha256 | `13231c592e958fb39e2af6001dae69d90e7a36b265702b9b390236fb387599e2` |
+| Reference tree | `/data/ds4` at `fc80bd6`; `test/` is untracked there, so the file is cited by hash, never by a commit of that tree |
+| What it is | the official DeepSeek-V4.1 text/vision encoding implementation, operator-supplied 2026-10-18: the implementation that writes the prompt the model was trained on and asserts the completion shape it produces |
+| Driver | `tests/ds41_ref/ref_drive.py` — `encode CASE MODE` prints the prompt bytes, `parse COMPLETION MODE` prints the parsed message; a hash other than the pinned one aborts the run |
+| Inputs | `tests/ds41_ref/cases/*.json` (encode cases, the oracle's own case format), `tests/ds41_ref/decode/*.txt` (completion bytes, built from the oracle's templates by `tests/ds41_ref/mk_decode_input.py`) |
+| Fixtures | `crates/ds4-server/tests/fixtures/ds41-ref/` — `<case>.prompt.txt` (oracle prompt bytes), `<case>.calls.json` (oracle parse), `<case>.txt` (the completion the oracle parsed). Regenerate with `bash tests/ds41_ref/regen_fixtures.sh` |
+| Rust tests | `crates/ds4-server/tests/ref_encoding.rs` (encode side), `crates/ds4-server/tests/ref_decode.rs` (decode side) |
+
+The oracle is a second reference, not a replacement for the CTR's normative
+one. Where the two references disagree the disagreement is recorded as a delta
+with both citations (O-01, O-03, O-04) instead of being resolved silently.
+The C reference is `/data/ds4/ds4_server.c` (the server) and `/data/ds4/ds4.c`
+(the engine's chat encoding); the oracle decides what the *training-side*
+encoder produces, and the requirement texts in the CTR decide which of the
+two binds a row.
+
+Traps measured on this host (python 3.13.5) while building the leg, recorded
+so the next reader does not re-learn them:
+
+- a case-level `tools` key is dropped unless the case goes through
+  `load_cases`, which moves it into `messages[0]` (encoding.py:847-869);
+- `thinking_mode` accepts only `chat` or `thinking` (encoding.py:596);
+- the thinking-mode completion must not carry the opening `<think>` token:
+  the oracle asserts that no special token appears in content or reasoning
+  (encoding.py:982), so it takes the generation, not the prompt tail.
+
+## 2. Part A — the oracle leg's cases
+
+Encode side: our route renders the case, the fixture is the oracle's bytes
+(`crates/ds4-server/tests/ref_encoding.rs`).
+
+| Case | Pins | Verdict |
+| --- | --- | --- |
+| `enc-tools-chat` | the tools preamble and the per-schema line in chat mode (TOOLS_TEMPLATE, encoding.py:481-506) | pass |
+| `enc-plain-chat` | the no-tools head: BOS, system, user, assistant content, EOS, and the assistant header before the last turn | pass |
+| `enc-argtypes-chat` | the type attribute — `string="true"` for a string child, `string="false"` with the value in json.dumps shape otherwise (encode_arguments_to_dsml, encoding.py:524-556) — plus a merged tool result | pass |
+| `enc-think-tools` | thinking mode with tools: the effort header at 75 and the open `<think>` the assistant turn must carry | pass |
+| `enc-think-max` | the numeric effort header at 100 (encoding.py:443-472) | pass |
+| `enc-think-low` | the same header at the low effort | OPEN O-01 |
+| `enc-midsystem-chat` | a mid-conversation system message | OPEN O-02 |
+| `enc-toolresults-order` | tool results ordered by the assistant's call order (encoding.py:233-266) | OPEN O-03 |
+
+Decode side: the completion bytes are the oracle's own, and our parser must
+agree with the oracle's parse (`crates/ds4-server/tests/ref_decode.rs`).
+
+| Case | Pins | Verdict |
+| --- | --- | --- |
+| `dec-one-call` | one invoke, one string and one integer child, prose before the block | pass |
+| `dec-two-calls` | two invokes in one wrapper | pass |
+| `dec-complex-args` | every JSON child kind, including a nested array and object | pass (values); the argument-string shape is O-04 |
+| `dec-unicode` | a non-ASCII string child round-trips raw (the oracle's json.dumps is `ensure_ascii=False`) | pass |
+| `dec-marker-in-value` | a block marker inside a parameter value is data, never structure (inventory G9, see part C) | pass |
+| `dec-thinking` | the reasoning/prose split in thinking mode | pass |
+
+## 3. Part B — CTR requirements R-01..R-18
+
+"Case" names the artifact that exercises the requirement; "measured" means it
+was run in the session that wrote the row, with the output quoted in the CTR's
+evidence index or in the test itself.
+
+| Row | Requirement (clause 6.3) | Case | Verdict at this revision |
+| --- | --- | --- | --- |
+| R-01 | OpenAI chat serves one DSML call as `tool_calls` | TP-01 / A-01 (`tests/spark/dsml_conformance.sh`) | pass at the served baseline (`iso-baseline-20261018-113636`); the claim is per-artifact, so the gate re-runs it |
+| R-02 | typed parameters survive as JSON types | TP-02 / A-02 | pass at the baseline |
+| R-03 | two invokes in one block | TP-03 / A-03 | pass at the baseline |
+| R-04 | streaming carries the call | TP-04 / A-04 | pass at the baseline |
+| R-05 | Anthropic serves `tool_use` | TP-05 / A-05 | pass at the baseline |
+| R-06 | Responses serves `function_call` | TP-06 / A-06 | pass at the baseline |
+| R-07 | chat turn 2 reuses the sampled block, G > 0 | B-01 | reserved: no case (CTR clause 3 proves the ceiling without the excluded KV work) |
+| R-08 | replay survives a differently spelled client echo | B-02 | reserved as R-07 |
+| R-09 | Anthropic turn 2 reuses the sampled block | B-03 | reserved as R-07 |
+| R-10 | Responses continuation reuses the sampled call | B-04 | reserved as R-07 |
+| R-11 | a cut block is not served as assistant content | C-01 (suite) + `tests/dsml.rs::live_tool_root_block_recovers_its_calls` | parser half fixed and measured (23eb6b2); the tracker half is OPEN (unit 3.1) |
+| R-12 | replay and trace diagnostics are available | `--help` check (Annex B, `flags-baseline-20261018.txt`) | OPEN: 2 of 3 at HEAD (`--disable-exact-dsml-tool-replay`, `--tool-memory-max-ids`, `crates/ds4-server/src/bin/ds4-server-rs.rs:225-231`, advertised at :1327); `--trace` is unit 3.2 |
+| R-13 | plain-text KV reuse intact (protection) | TP-13 / D-01 | measured pass at the baseline; re-run every phase |
+| R-14 | determinism witness reproducible (protection) | TP-14 / D-02, witness sha16 `adf7157c8a5bbb4b` | measured pass at the baseline; re-run every phase |
+| R-15 | exact replay reaches every chat-shaped surface | host: `generate.rs::dsml_replay::sampled_bytes_reach_the_prompt_on_every_chat_surface` (:7170); served: B-01..B-04 with `--trace` | host leg pass (run this session); the served leg is OPEN until `--trace` lands (unit 3.2) and the gate serves it (unit 3.3) |
+| R-16 | the replay path has a kill switch | host: `generate.rs::dsml_replay::the_disable_switch_leaves_the_canonical_render` (:7210); served: B-01 with the flag | host leg pass (run this session); the served leg needs the same trace A/B |
+| R-17 | a cut turn keeps its truncation signal and a legal finish | C-01, C-02, C-03 (`tests/spark/dsml_conformance.sh:266-312`) | probes exist (added in 903bcf0); verdict OPEN until the gate run (unit 3.3) decides whether the loss is reachable |
+| R-18 | the client of record completes a real tool loop | `tests/spark/open_grok_leg.sh` (G1/G2/G3) | OPEN: the leg needs the IUT on 8008 (unit 3.3) |
+
+## 4. Part C — inventory gaps G1..G9
+
+| Row | Gap (inventory section 4) | Case | Verdict at this revision |
+| --- | --- | --- | --- |
+| G1 | ds41 has no session, so no replay, tool memory, continuation or canonicalization | R-15/R-16 rows carry the replay half; the rest is reserved | partially covered: the host-side replay carriage landed (8891d3e) and `tool_replay_scope` is now `kind == Chat` (`generate.rs:1367`), so a session is no longer the carrier; canonicalization and the in-turn continuation stay reserved (CTR clause 9) |
+| G2 | replay was OpenAI-chat-only, off under thinking and live ids | `generate.rs:1367-1380` + the per-surface host test (R-15) | closed for the carriage: the scope is the reference's rule and the attach is per surface; the served verdict rides R-15 |
+| G3 | no tool-checkpoint canonicalization | none | out of scope for this line (CTR clause 1.3 excludes the KV store; clause 9 reserves it) |
+| G4 | no invalid-DSML tool-error continuation | none yet | reserved in full; the repair half is P3 (unit 3.4) |
+| G5 | no `complete_tool_call_inside_thinking` equivalent | none | OPEN, unverified: an Anthropic live-path decision (NC-06), which the oracle leg does not reach |
+| G6 | no `build_responses_visible_assistant_suffix` | none yet | OPEN, P4 (unit 3.5) |
+| G7 | the two replay flags were absent | R-12's flag check | partially closed: both flags exist at HEAD; `--trace` is unit 3.2 |
+| G8 | `try_repair_dsml` deviates: (a) closes unbalanced invokes/params, (b) omits the spaced spelling, (c) picks the style by presence not by earliest occurrence | `tests/parity/retry_c_oracle.c` + `crates/ds4-server/tests/retry.rs` today; the port of `test_dsml_repair_produces_parseable_calls` is P3 | OPEN, P3 (unit 3.4): NC-05 stands as written, and the reference's own refusal comment (`ds4_server.c:6697-6700`) is what the fix must satisfy |
+| G9 | no `find_tool_structural_text` counterpart | parse side: `dec-marker-in-value` (pass); streaming side: `stream.rs::text_stream_stray`; repair side: none | partially covered: the rule that a marker inside a value is not structure is measured green on the decode side; the think-scope scan inside the repair path is OPEN with G8 |
+
+## 5. Part D — the leg's own findings
+
+| Row | Finding | Evidence | Class |
+| --- | --- | --- | --- |
+| O-01 | the oracle renders `Reasoning Effort: 50` for the low effort (encoding.py:449-451); the C reference renders no effort line for `DS4_THINK_LOW` — `ds4_think_mode_level` returns -1 outside the numeric range and only HIGH/MAX are pinned to 75/100 (ds4.c:60817-60821, :44201-44209), low being spelled as the numeric level 50 instead | `enc-think-low` (fixture 1372 bytes vs our 1311) | delta between the two references; our port follows the C reference. A decision is owed on whether the numeric-effort surface is exposed |
+| O-02 | a mid-conversation system message must write the system token again once a user or assistant token has been emitted, and the message introduces its own turn (encoding.py:621-627, :733-739; ds4.c:44431-44443 `ds41_chat_system_marker`); our renderer hoists every system message into the head (`render.rs:1395-1416`) | `enc-midsystem-chat` | carriage defect against both references; P2's encode half, unit pending |
+| O-03 | tool results are ordered by the preceding assistant's call order (encoding.py:233-266); our chat route keeps arrival order, and the C reference orders results only on the Anthropic/Responses path (`live_tool_call_order`, `ds4_server.c:10580`, CTR clause 2.3.8 "open, deferred") | `enc-toolresults-order` | decision owed: requirement 2.3.8 is already open, and the client sends `parallel_tool_calls = true` |
+| O-04 | our call arguments minify a composite child (`tool_call_json_args_add`, `tools.rs:150-166`, mirroring `ds4_server.c:5971-5982` over `json_minify_raw_value` :411) while the oracle keeps the parameter body verbatim; the values are equal and both parse | `composite_arguments_are_minified_as_the_reference_does` (pass) | recorded delta, pinned from our side; no action |
+
+## 6. What blocks an "all covered" claim
+
+The OPEN rows, in the order the plan would close them: R-12 and R-15's served
+leg (`--trace`, unit 3.2), R-11's tracker half (unit 3.1), R-17 and R-18 (the
+gate, unit 3.3), G8 and G9's repair-side scan (P3, unit 3.4), G6 (P4), G5
+(needs the Anthropic live path to be probed), O-01..O-03 (decisions above),
+and R-07..R-10 together with G1's remainder and G3/G4, which are reserved to a
+unit that may alter KV state.
+
+Covered today, measured in this session or quoted from the CTR's evidence
+index: R-01..R-06, R-13, R-14, R-15's host leg, R-16's host leg, and every
+part A case marked pass.

@@ -133,6 +133,12 @@ Requirement-to-IUT status at R2, each checked against the source:
 - `docs/ds41-dsml-port-inventory.md` — static review: the function-by-function
   comparison of the reference and the Rust host (clause 5 of this report is the
   summary of that review).
+- `docs/ds41-dsml-reference-matrix.md` — the reference leg: the coverage
+  matrix that pairs every requirement in clause 6.3 and every gap in the
+  inventory with the case that exercises it, over the operator-supplied V4.1
+  encoding oracle `/data/ds4/test/encoding.py`.  Revision R3 folds it in whole
+  as this report's reference section, so it is maintained as the third document
+  of this line.
 - `docs/deepseek41-port-plan.md` — the ds41 port's own record.
 
 ## 3 Terms and definitions
