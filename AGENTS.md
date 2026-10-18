@@ -15,19 +15,20 @@ The [v0.1.2 ledger](docs/releases/v0.1.2.md) records shared Jinja qualification.
 New families use [official input templates](docs/chat-templates.md); keep
 tokenizer/media processing and output protocol work outside input grammar.
 
-## DeepSeek V4.1 (ds41) — the port's reference is /data/YoungAi
+## DeepSeek V4.1 (ds41) — the port's reference is /data/ds4
 
-The `ds41` family is a port of the DeepSeek V4.1 Flash engine kept at
-`/data/YoungAi` (READ-ONLY reference, pinned at commit
-`7fb26cc332d740416792204a29c7d13d2986caf5`). Every ported function mirrors
-that engine with file:line citations, every deviation is named and measured
-against it, and `/data/YoungAi` is the source of truth for ds41 behavior —
-not the upstream ds4 tree, not any summary, comment, or memory note. Read
-the engine source (and its own records: `bug.md`, `fable5.md`, `speed.md`,
-`mtp*.md`, `log.md`) before changing, explaining, or planning anything the
-port covers. Never modify `/data/YoungAi`; a behavior question is answered
-by its code, and when the port and the engine disagree, the engine wins and
-the port is fixed.
+The `ds41` family is a port of the DeepSeek V4.1 Flash engine.  Read the
+reference before changing, explaining, or planning anything the port covers:
+the tree `/data/ds4` at commit `fc80bd6` (READ-ONLY), whose `ds4.c` and
+`ds4_server.c` are the normative reference for ds41 behavior, plus the
+operator-supplied V4.1 encoding oracle `/data/ds4/test/encoding.py` (pinned by
+hash in `tests/ds41_ref/ref_drive.py`).  Every ported function mirrors the
+reference with file:line citations and every deviation is named and measured
+against it, so a behavior question is answered by that code and not by a
+summary, a comment, or a memory note.  The DSML carriage line keeps its own
+documents: `docs/ds41-dsml-conformance.md` (the CTR and port checklist),
+`docs/ds41-dsml-port-inventory.md` (the static gap review) and
+`docs/ds41-dsml-reference-matrix.md` (the coverage matrix).
 
 ## New model-family serving contract
 
