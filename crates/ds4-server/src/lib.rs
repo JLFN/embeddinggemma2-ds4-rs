@@ -119,8 +119,9 @@ pub use render::{
 };
 pub use retry::dump_script as retry_dump_script;
 pub use route::{
-    compute_needs, decode_budget, parse_reasoning_effort_name, route_decide, think_mode_enabled,
-    think_mode_from_enabled, wire_surface_for, Api, NeedInput, ReqKind, RouteDecision, RouteEnv,
+    compute_needs, decode_budget, mode_budget, parse_reasoning_effort_name, route_decide,
+    think_mode_enabled, think_mode_from_enabled, wire_surface_for, Api, NeedInput, ReqKind,
+    RequestedEffort, RouteDecision, RouteEnv,
     ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_NONE, LANE_SERIAL, LANE_STATIC,
     NEED_BANK_FRONTIER, NEED_CONTINUATION_PUBLISH, NEED_CORRECTIVE_RECOVERY, NEED_DURABLE_RESPONSE,
     NEED_IMAGE, NEED_LIVE_FRONTIER, NEED_PER_ROW_SAMPLING, NEED_PREFILL_ONLY, NEED_STOP_SCAN,

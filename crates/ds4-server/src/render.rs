@@ -6,7 +6,7 @@ use crate::json::{
     json_args_parse, json_escape_bytes, json_minify_raw_value, json_raw_value, Json,
 };
 use crate::parse::{ChatMsg, ChatPart, ToolCall, ToolChoice, ToolSchemaOrder};
-use crate::route::{think_mode_enabled, Api, ThinkMode};
+use crate::route::{mode_budget, think_mode_enabled, Api, ThinkMode};
 use crate::tools::{
     DSML_PARAM_END, DSML_PARAM_END_SPACED, DSML_PARAM_START, DSML_PARAM_START_SPACED,
     DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SPACED, DSML_TOOL_CALLS_START,
@@ -37,16 +37,41 @@ pub const V41_THINK_HIGH_PREFIX: &str =
     "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
 pub const V41_THINK_MAX_PREFIX: &str = "Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
 
+/// The oracle's numeric effort line (`REASONING_EFFORT_TEMPLATE`,
+/// encoding.py:443-446): the requested budget verbatim, at index 0 and in
+/// thinking mode only.  The 75/100 constants above are its two pinned cases;
+/// every other budget in [1,100] renders through this template.
+pub const V41_EFFORT_TEMPLATE: &str = "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+
 /// The DSML prompt head a model writes. `V4` is the port's own C lineage
 /// (`THINK_*_PREFIX`, no system token). `V41` is the engine's official
-/// encoding.py head: the 75/100 effort lines (core_globals.c:14-17) and the
-/// <｜System｜> token written before the effort prefix when the effort or the
-/// system body is non-empty (server_dsml_render.c:375-383), gated on the
-/// loaded tokenizer owning it (core_bpe.c:332-333, core_engine_api.c:94-96).
+/// encoding.py head: the effort line (core_globals.c:14-17, encoding.py:443-473)
+/// and the <｜System｜> token written before it when the effort or the system
+/// body is non-empty (server_dsml_render.c:375-383), gated on the loaded
+/// tokenizer owning it (core_bpe.c:332-333, core_engine_api.c:94-96).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DsmlHead {
     V4,
-    V41 { system_token: bool },
+    /// `effort` is the budget the request asked for; `None` leaves the number to
+    /// the thinking mode (75 high, 100 max, 50 low -- encoding.py:448-453).
+    V41 {
+        system_token: bool,
+        effort: Option<u8>,
+    },
+}
+
+impl DsmlHead {
+    /// The requested effort budget this head writes.  A V4 head has no numeric
+    /// effort line, so it ignores the budget and keeps its own text.
+    pub fn with_effort(self, effort: Option<u8>) -> Self {
+        match self {
+            DsmlHead::V41 { system_token, .. } => DsmlHead::V41 {
+                system_token,
+                effort,
+            },
+            DsmlHead::V4 => DsmlHead::V4,
+        }
+    }
 }
 
 /// C `ds4_chat_system_token()` (core_engine_api.c:94-96).
@@ -58,20 +83,35 @@ pub fn dsml_head(model_id: i32, system_token: &str) -> DsmlHead {
     if model_id == ds4_core::Variant::DeepSeek41Flash as i32 {
         DsmlHead::V41 {
             system_token: !system_token.is_empty(),
+            effort: None,
         }
     } else {
         DsmlHead::V4
     }
 }
 
-fn head_effort_prefix(head: DsmlHead, mode: ThinkMode) -> &'static str {
+/// The effort line for one head.  The V4 head keeps the port's own effort text;
+/// the V4.1 head writes the oracle's number, taken from the request when it gave
+/// one and from the mode otherwise (encoding.py:448-473), and writes nothing at
+/// all without thinking mode.
+fn head_effort_prefix(head: DsmlHead, mode: ThinkMode) -> String {
     match head {
-        DsmlHead::V4 => think_effort_prefix(mode),
-        DsmlHead::V41 { .. } => match mode {
-            ThinkMode::High => V41_THINK_HIGH_PREFIX,
-            ThinkMode::Max => V41_THINK_MAX_PREFIX,
-            ThinkMode::None | ThinkMode::Low => "",
-        },
+        DsmlHead::V4 => think_effort_prefix(mode).to_string(),
+        DsmlHead::V41 { effort, .. } => v41_effort_prefix(mode, effort),
+    }
+}
+
+fn v41_effort_prefix(mode: ThinkMode, effort: Option<u8>) -> String {
+    if mode == ThinkMode::None {
+        return String::new();
+    }
+    let Some(budget) = effort.or(mode_budget(mode)) else {
+        return String::new();
+    };
+    match budget {
+        75 => V41_THINK_HIGH_PREFIX.to_string(),
+        100 => V41_THINK_MAX_PREFIX.to_string(),
+        n => V41_EFFORT_TEMPLATE.replace("{budget}", &n.to_string()),
     }
 }
 
@@ -1442,7 +1482,7 @@ pub fn render_dsml_chat_choice_ex(
     // instructions follow the system content (separated by "\n\n"), and
     // adjacent user-side blocks share one <｜User｜> -- the old generations keep
     // the schemas first and a fresh user turn per block.
-    let spaced = matches!(head, DsmlHead::V41 { system_token: true });
+    let spaced = matches!(head, DsmlHead::V41 { system_token: true, .. });
     let mut last_user_idx = -1i32;
     let mut system = Vec::new();
     if !tool_schemas.is_empty() && !spaced {
@@ -1495,11 +1535,14 @@ pub fn render_dsml_chat_choice_ex(
     // prefix.  The token is "" for the V4 head (the V4 tokenizer has none).
     let effort = head_effort_prefix(head, think_mode);
     if !effort.is_empty() || !system.is_empty() {
-        if let DsmlHead::V41 { system_token: true } = head {
+        if let DsmlHead::V41 {
+            system_token: true, ..
+        } = head
+        {
             put(&mut out, DSML_SYSTEM_TOKEN);
         }
     }
-    put(&mut out, effort);
+    put(&mut out, &effort);
     out.extend_from_slice(&system);
 
     let mut pending_assistant = false;

@@ -773,6 +773,67 @@ fn engine_defaults_think_and_sampling() {
     assert_eq!(r.dry_multiplier, 0.8);
 }
 
+/// O-01: the effort a request asked for survives the engine's collapse, so the
+/// V4.1 head can render the requested budget (encoding.py:443-473) while the
+/// engine keeps the mode it decided.  The name mapping is low 50 / high 75 /
+/// max 100, and the oracle's numeric form renders as the number itself.
+#[test]
+fn requested_effort_budget_survives_the_engine_collapse() {
+    use ds4_server::{RequestedEffort, ThinkMode};
+    let eng = ParseEnv {
+        engine_defaults: true,
+        ..env()
+    };
+    let chat = |body: &str| parse_chat_request(&eng, body).unwrap();
+    let ask = |effort: &str| {
+        chat(&format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"reasoning_effort":{effort}}}"#
+        ))
+    };
+
+    // The engine collapses low into HIGH (server_msgs.c:194-215); the head still
+    // takes the low mapping's 50.
+    let low = ask(r#""low""#);
+    assert_eq!(low.think_mode, ThinkMode::High);
+    assert_eq!(low.effort, RequestedEffort::named(ThinkMode::Low));
+    assert_eq!(low.effort.head_budget(), Some(50));
+
+    // A bare ask keeps the engine's HIGH default, 75 in the head.
+    let bare = chat(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+    assert_eq!(bare.effort, RequestedEffort::named(ThinkMode::High));
+    assert_eq!(bare.effort.head_budget(), Some(75));
+
+    assert_eq!(ask(r#""max""#).effort.head_budget(), Some(100));
+    assert_eq!(ask(r#""none""#).effort.head_budget(), None);
+
+    // The oracle's numeric form: taken as the budget, engine mode collapsed.
+    let numeric = ask("40");
+    assert_eq!(numeric.think_mode, ThinkMode::High);
+    assert_eq!(
+        numeric.effort,
+        RequestedEffort {
+            mode: ThinkMode::High,
+            budget: Some(40)
+        }
+    );
+    assert_eq!(numeric.effort.head_budget(), Some(40));
+
+    // Out of the oracle's range and its non-integers are refused, as the oracle
+    // refuses them (encoding.py:464-469).
+    for bad in ["0", "101", "50.5", "5e1"] {
+        assert!(
+            parse_chat_request(
+                &eng,
+                &format!(
+                    r#"{{"messages":[{{"role":"user","content":"hi"}}],"reasoning_effort":{bad}}}"#
+                )
+            )
+            .is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
 #[test]
 fn openai_tool_message_carries_the_image_placeholder() {
     // The real MCP loop on the Chat Completions surface: an assistant turn

@@ -108,7 +108,7 @@ fn dsml_v41_head_matches_official_encoding() {
     // (tests/server_tests_render_v41.c): the official encoding.py render of
     // four conversations, plus the V4-tokenizer fallback.  A V4.1 tokenizer
     // owns the system token; the head writes it once before the effort prefix.
-    let v41 = DsmlHead::V41 { system_token: true };
+    let v41 = DsmlHead::V41 { system_token: true, effort: None };
     let with_sys = [msg("system", "S"), msg("user", "U")];
     let only_user = [msg("user", "U")];
     let render = |msgs: &[ChatMsg], mode| {
@@ -817,7 +817,7 @@ fn dsml_v41_spaced_tools_match_official_encoding() {
     // call, json.dumps-shaped values, "<" and "&" inside a value, two adjacent
     // tool results merged into one <｜User｜>, and a schema carrying a \u escape.  A
     // byte mismatch here is a bug in the spaced template.
-    let v41 = DsmlHead::V41 { system_token: true };
+    let v41 = DsmlHead::V41 { system_token: true, effort: None };
 
     // case1: the official get_weather flow, THINK_HIGH.
     let c1 = [
@@ -984,7 +984,7 @@ fn dsml_v41_places_tool_result_images_inside_the_envelope() {
     // client's block order (parse.rs json_tool_result_content; the engine's
     // text-level render, server_parse_tools.c:330).  The user body must write
     // that content -- running the parts loop instead would drop the envelope.
-    let v41 = DsmlHead::V41 { system_token: true };
+    let v41 = DsmlHead::V41 { system_token: true, effort: None };
     let tool_result = ChatMsg {
         role: "user".into(),
         content: format!("<tool_result>shot:{DSML_IMAGE}done</tool_result>"),
@@ -1032,7 +1032,7 @@ fn dsml_v41_writes_a_tool_message_image_inside_its_envelope() {
     // V4.1 head can put the placeholder for a tool result (the engine's
     // render, server_dsml_render.c:409-414), so the image must reach the
     // prompt here or it is silently dropped.
-    let v41 = DsmlHead::V41 { system_token: true };
+    let v41 = DsmlHead::V41 { system_token: true, effort: None };
     let tool = ChatMsg {
         role: "tool".into(),
         content: format!("shot:{DSML_IMAGE}done"),

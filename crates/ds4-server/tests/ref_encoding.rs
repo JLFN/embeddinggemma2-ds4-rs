@@ -22,7 +22,7 @@ use ds4_server::{
 
 /// The head our ds41 route passes: the engine's V4.1 encoding.py head with the
 /// tokenizer's system token (render.rs `dsml_head`).
-const V41: DsmlHead = DsmlHead::V41 { system_token: true };
+const V41: DsmlHead = DsmlHead::V41 { system_token: true, effort: None };
 
 fn msg(role: &str, content: &str) -> ChatMsg {
     ChatMsg {
@@ -90,7 +90,22 @@ fn diff_report(got: &[u8], want: &[u8]) -> String {
 
 /// Render one case and compare with the oracle's fixture of the same name.
 fn check(name: &str, msgs: &[ChatMsg], schemas: &str, mode: ThinkMode) {
-    let got = render_dsml_chat_choice_ex(msgs, schemas, mode, ToolChoice::Auto, V41)
+    check_head(name, msgs, schemas, mode, V41);
+}
+
+/// The same, with the effort budget the request carried (O-01's numeric half).
+fn check_with_budget(
+    name: &str,
+    msgs: &[ChatMsg],
+    schemas: &str,
+    mode: ThinkMode,
+    budget: Option<u8>,
+) {
+    check_head(name, msgs, schemas, mode, V41.with_effort(budget));
+}
+
+fn check_head(name: &str, msgs: &[ChatMsg], schemas: &str, mode: ThinkMode, head: DsmlHead) {
+    let got = render_dsml_chat_choice_ex(msgs, schemas, mode, ToolChoice::Auto, head)
         .unwrap_or_else(|e| panic!("{name}: render refused: {}", e.0));
     let want = fixture(&format!("{name}.prompt.txt"));
 
@@ -174,21 +189,40 @@ fn thinking_max_effort_matches_official_encoding() {
     check("enc-think-max", &msgs, READ_FILE_SCHEMA_MIN, ThinkMode::Max);
 }
 
-/// OPEN (matrix row O-01): the oracle renders "Reasoning Effort: 50" for the
-/// low effort (encoding.py:449-451), while the reference's DeepSeek-41 branch
-/// renders no effort line for DS4_THINK_LOW at all -- ds4_think_mode_level
-/// returns -1 outside the numeric range and only HIGH/MAX are pinned to 75/100
-/// (ds4.c:44201-44209).  Low effort is spelled as the numeric level 50 on both
-/// references.  The case stays here so the row is re-measured when the effort
-/// surface is decided.
+/// CLOSED (matrix row O-01): the oracle renders "Reasoning Effort: 50" for the
+/// low effort (encoding.py:449-451).  Measured before the fix: low rendered no
+/// line at all (the requested effort never reached the renderer on the ds41
+/// route, where the engine collapses low into high) and the fixture was 1372
+/// bytes against our 1311.  The route now carries the requested effort beside
+/// the collapsed mode (`ParsedRequest::effort`, route.rs `RequestedEffort`) and
+/// the V4.1 head writes the low mapping's 50 (render.rs `v41_effort_prefix`).
 #[test]
-#[ignore = "OPEN O-01: the requested effort never reaches the head prefix (engine_think_mode collapses low into high on the ds41 route) and a numeric reasoning_effort is refused at the parse (format.rs:96-102)"]
 fn thinking_low_effort_matches_official_encoding() {
     let msgs = [
         msg("system", "You are a helpful assistant."),
         msg("user", "Read the file /tmp/x.txt"),
     ];
     check("enc-think-low", &msgs, READ_FILE_SCHEMA_MIN, ThinkMode::Low);
+}
+
+/// CLOSED (matrix row O-01, the numeric half): the oracle renders an integer
+/// budget in [1,100] as itself (encoding.py:456-473).  Measured before the fix:
+/// a numeric `reasoning_effort` was refused at the parse, which read a string
+/// name and nothing else.  The request now carries the number as its own budget
+/// and the head writes it verbatim; the engine keeps its collapsed mode.
+#[test]
+fn thinking_numeric_effort_matches_official_encoding() {
+    let msgs = [
+        msg("system", "You are a helpful assistant."),
+        msg("user", "Read the file /tmp/x.txt"),
+    ];
+    check_with_budget(
+        "enc-think-budget",
+        &msgs,
+        READ_FILE_SCHEMA_MIN,
+        ThinkMode::High,
+        Some(40),
+    );
 }
 
 /// A mid-conversation system message: the oracle writes the system token

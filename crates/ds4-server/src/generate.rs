@@ -201,7 +201,8 @@ pub trait DecodeIo {
         render_prompt_ex(
             parsed,
             self.model_id(),
-            crate::render::dsml_head(self.model_id(), self.chat_system_token()),
+            crate::render::dsml_head(self.model_id(), self.chat_system_token())
+                .with_effort(parsed.effort.head_budget()),
         )
     }
     fn restore_chat(&self, _parsed: &mut ParsedRequest) -> Result<(), GenerateError> {

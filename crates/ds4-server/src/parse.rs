@@ -11,7 +11,8 @@ use crate::json::{
 use crate::models::{model_alias_disables_thinking, model_alias_enables_thinking};
 use crate::render::{ModelSyntax, DSML_IMAGE};
 use crate::route::{
-    compute_needs, think_mode_from_enabled, Api, NeedInput, ReqKind, ThinkMode, WireSurface,
+    compute_needs, think_mode_from_enabled, Api, NeedInput, ReqKind, RequestedEffort, ThinkMode,
+    WireSurface,
 };
 use std::sync::Arc;
 
@@ -196,6 +197,10 @@ pub struct ParsedRequest {
     pub stream_include_usage: bool,
     pub return_token_ids: bool,
     pub think_mode: ThinkMode,
+    /// The effort the request asked for, kept beside the collapsed
+    /// `think_mode`: the V4.1 head renders this budget (encoding.py:456-473)
+    /// while the engine keeps its own mode.
+    pub effort: RequestedEffort,
     pub eos_policy: EosPolicy,
     pub has_tools: bool,
     pub has_tool_results: bool,
@@ -248,6 +253,7 @@ impl ParsedRequest {
             stream_include_usage: false,
             return_token_ids: false,
             think_mode: ThinkMode::Low,
+            effort: RequestedEffort::named(ThinkMode::Low),
             eos_policy: EosPolicy::Default,
             has_tools: false,
             has_tool_results: false,
@@ -2514,7 +2520,7 @@ fn parse_responses_content_array(p: &mut Json<'_>) -> Option<String> {
 
 fn parse_responses_reasoning(
     p: &mut Json<'_>,
-    effort: &mut ThinkMode,
+    effort: &mut RequestedEffort,
     summary_opted: &mut bool,
 ) -> Option<bool> {
     p.ws();
@@ -2875,15 +2881,16 @@ fn apply_think(
     r: &mut ParsedRequest,
     got: bool,
     mut enabled: bool,
-    effort: ThinkMode,
+    effort: RequestedEffort,
     engine_defaults: bool,
 ) {
     enabled = apply_think_aliases(r, got, enabled);
     r.think_mode = if engine_defaults {
-        engine_think_mode(enabled, effort)
+        engine_think_mode(enabled, effort.mode)
     } else {
-        think_mode_from_enabled(enabled, effort)
+        think_mode_from_enabled(enabled, effort.mode)
     };
+    r.effort = effort;
 }
 
 /// The engine's `think_mode_from_enabled` (server_msgs.c:186-189): nothing
@@ -2912,11 +2919,11 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
     // HIGH.  Only the engine's own model set takes them (unit H,
     // ParseEnv::engine_defaults); other families keep the port's defaults.
     let mut thinking_enabled = !env.engine_defaults;
-    let mut reasoning_effort = if env.engine_defaults {
+    let mut reasoning_effort = RequestedEffort::named(if env.engine_defaults {
         ThinkMode::High
     } else {
         env.default_effort
-    };
+    });
     let mut msgs = Vec::new();
     let mut images = ImageInputs::new(env);
     let mut audios = Vec::new();
@@ -3041,7 +3048,7 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
                     // effort field alone is the client asking for thinking --
                     // got_thinking set, enabled = effort != none.
                     got_thinking = true;
-                    thinking_enabled = e != ThinkMode::None;
+                    thinking_enabled = e.mode != ThinkMode::None;
                     true
                 }
                 Ok(None) => {
@@ -3049,7 +3056,7 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
                     // still counts as an explicit ask (the engine's
                     // parse_reasoning_effort_value returns true unchanged).
                     got_thinking = true;
-                    thinking_enabled = reasoning_effort != ThinkMode::None;
+                    thinking_enabled = reasoning_effort.mode != ThinkMode::None;
                     true
                 }
                 Err(_) => false,
@@ -3128,11 +3135,11 @@ pub fn parse_completion_request(env: &ParseEnv, body: &str) -> Result<ParsedRequ
     // HIGH.  Only the engine's own model set takes them (unit H,
     // ParseEnv::engine_defaults); other families keep the port's defaults.
     let mut thinking_enabled = !env.engine_defaults;
-    let mut reasoning_effort = if env.engine_defaults {
+    let mut reasoning_effort = RequestedEffort::named(if env.engine_defaults {
         ThinkMode::High
     } else {
         env.default_effort
-    };
+    });
 
     p.ws();
     if p.bump() != Some(b'{') {
@@ -3287,11 +3294,11 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     // HIGH.  Only the engine's own model set takes them (unit H,
     // ParseEnv::engine_defaults); other families keep the port's defaults.
     let mut thinking_enabled = !env.engine_defaults;
-    let mut reasoning_effort = if env.engine_defaults {
+    let mut reasoning_effort = RequestedEffort::named(if env.engine_defaults {
         ThinkMode::High
     } else {
         env.default_effort
-    };
+    });
     let mut msgs = Vec::new();
     let mut images = ImageInputs::new(env);
     let mut system = None;
@@ -3394,7 +3401,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
                         // an effort-only ask turns thinking on (high/max) or
                         // off (none); an explicit thinking field still wins.
                         if !got_thinking {
-                            thinking_enabled = reasoning_effort != ThinkMode::None;
+                            thinking_enabled = reasoning_effort.mode != ThinkMode::None;
                         }
                     }
                     true
@@ -3413,7 +3420,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
                 Ok(Some(e)) => {
                     reasoning_effort = e;
                     if !got_thinking {
-                        thinking_enabled = reasoning_effort != ThinkMode::None;
+                        thinking_enabled = reasoning_effort.mode != ThinkMode::None;
                     }
                     true
                 }
@@ -3484,11 +3491,11 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     // HIGH.  Only the engine's own model set takes them (unit H,
     // ParseEnv::engine_defaults); other families keep the port's defaults.
     let mut thinking_enabled = !env.engine_defaults;
-    let mut reasoning_effort = if env.engine_defaults {
+    let mut reasoning_effort = RequestedEffort::named(if env.engine_defaults {
         ThinkMode::High
     } else {
         env.default_effort
-    };
+    });
     let mut msgs = Vec::new();
     let mut images = ImageInputs::new(env);
     let mut loaded = String::new();
@@ -3607,7 +3614,7 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
                         // explicit effort is the client opting into thinking
                         // control -- got_thinking set, enabled = effort != none.
                         got_thinking = true;
-                        thinking_enabled = reasoning_effort != ThinkMode::None;
+                        thinking_enabled = reasoning_effort.mode != ThinkMode::None;
                     }
                     true
                 }
