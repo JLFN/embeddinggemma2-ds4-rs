@@ -45,7 +45,7 @@ parse yields the oracle's call names and argument values
 | `tool_calls_from_openai_format` (124) | a replayed assistant's `tool_calls` array into the internal call shape | `crates/ds4-server/src/parse.rs:924` `parse_tool_calls_value`, `:868` `add_tool_call_id` | `enc-argtypes-chat` | pass |
 | `decode_dsml_to_arguments` (156) | the arguments JSON string: `string="true"` wraps the body as a JSON string, `string="false"` takes the body as the value | `crates/ds4-server/src/tools.rs:375` `parse_dsml_generated`, `:1270`, `crates/ds4-server/src/json.rs:379` | `dec-one-call`, `dec-complex-args` | pass on names and values; our bytes are minified where the oracle keeps the body verbatim (matrix O-04) |
 | `merge_tool_messages` (184) | a `tool` role becomes a `tool_result` block inside a user message, merging into an adjacent merged user | `crates/ds4-server/src/parse.rs:1161` `parse_messages`, `:1235` `append_tool_result_text`; `crates/ds4-server/src/render.rs:1453` | `enc-argtypes-chat` | pass |
-| `sort_tool_results_by_call_order` (233) | tool_result blocks inside one user message are ordered by the preceding assistant's call order | not located (no call-order sort anywhere in `crates/ds4-server/src`) | `enc-toolresults-order` | OPEN O-03: arrival order is kept |
+| `sort_tool_results_by_call_order` (233) | tool_result blocks inside one user message are ordered by the preceding assistant's call order | `crates/ds4-server/src/render.rs` `tool_run_in_call_order` with `preceding_call_order` | `enc-toolresults-order` | pass (closed 2026-10-18) |
 | `parse_tagged_text` (273) | the `<image>path</image>` text form expands to image blocks, and a malformed tag raises | not located (`<image>` appears nowhere in `crates/ds4-server/src`) | none | OPEN, no case |
 | `_is_image_block` (300) | which content blocks count as images (`image`, `image_url`) | `crates/ds4-server/src/parse.rs:979` `parse_chat_image_url`, `:426` `add_image_data_uri` | none | no case: the reference harness asserts text-only |
 | `_extract_image` (305) | the url/data/source normalization, and the refusal when none is present | `crates/ds4-server/src/parse.rs:385` `add_image_base64`, `:426` | none | no case |
@@ -53,11 +53,11 @@ parse yields the oracle's call names and argument values
 | `_validate_no_image_sp_tokens` (355) | a user-supplied image placeholder in `content` or `reasoning_content` is refused | not located | none | OPEN, no case |
 | `process_image_messages` (370) | the per-message image pass, and `content` rebuilt from text blocks with `\n\n` | `crates/ds4-server/src/parse.rs:1012` `parse_openai_message_content`, `:529` `append_text_part` | none | no case |
 | `_read_until_stop` (399) | the earliest-of-stops scan the whole parser is built on | `crates/ds4-server/src/tools.rs:168` `split_reasoning_content` | every `dec-*` case | pass |
-| `find_last_user_index` (562) | the last user-like index; a mid-conversation system message counts as one; a tool-result-only user message does not start a turn | `crates/ds4-server/src/render.rs:1388`-`:1420`, `:222` `role_is_user_like` | `enc-plain-chat` | pass on the cases measured; the mid-system half is OPEN O-02 |
-| `render_reasoning_effort` (456) | the effort header: thinking mode, index 0 only, `low/high/max` mapped to 50/75/100, `None` to high | `crates/ds4-server/src/render.rs:67` `head_effort_prefix`, `:36`/`:38` the V4.1 prefixes | `enc-think-max` pass; `enc-think-low` | OPEN O-01: the oracle writes 50, we write nothing |
+| `find_last_user_index` (562) | the last user-like index; a mid-conversation system message counts as one; a tool-result-only user message does not start a turn | `crates/ds4-server/src/render.rs:1388`-`:1420`, `:222` `role_is_user_like` | `enc-plain-chat`, `enc-midsystem-chat` | pass, mid-system half included (closed 2026-10-18); the tool-result-only half has no case |
+| `render_reasoning_effort` (456) | the effort header: thinking mode, index 0 only, `low/high/max` mapped to 50/75/100, an integer in [1,100] taken as itself, `None` to high | `crates/ds4-server/src/render.rs:67` `head_effort_prefix`, `:36`/`:38` the V4.1 prefixes | `enc-think-max` pass; `enc-think-low` | OPEN O-01, two halves: the low name renders nothing because the requested effort never reaches the renderer on the ds41 route, and a numeric `reasoning_effort` is refused at the parse (`format.rs:96-102`) |
 | `render_tools` (509) | the tools preamble verbatim, with the schema list appended | `crates/ds4-server/src/render.rs:412` `append_dsml_tools_prompt_text` | `enc-tools-chat` | pass |
 | `encode_arguments_to_dsml` (524) | one parameter element per argument key, in the call's key order, `string="true"` for a string child and its raw form otherwise; a non-dict `arguments` falls back to a single `arguments` key, a JSON string is decoded twice | `crates/ds4-server/src/render.rs:349` `append_dsml_arg`, `:375` `append_dsml_arguments_from_json` | `enc-argtypes-chat` | pass for a dict; the JSON-string and double-encoded fallbacks have no case |
-| `render_message` (585) | one message's bytes, the role branches, the transition tokens, and the assistant header rule | `crates/ds4-server/src/render.rs:1374` `render_dsml_chat_choice_ex` | 5 encode cases | pass on 5 of 8; O-01, O-02, O-03 are three of its rules |
+| `render_message` (585) | one message's bytes, the role branches, the transition tokens, and the assistant header rule | `crates/ds4-server/src/render.rs:1374` `render_dsml_chat_choice_ex` | 8 encode cases | pass on 7 of 8; O-01 is the one rule still open, and O-02/O-03's rules closed 2026-10-18 |
 | `_drop_thinking_messages` (749) | before the last user, an assistant's `reasoning_content` is dropped, the message kept | `crates/ds4-server/src/render.rs:1470` (the render-time equivalent) | none | no case: no case carries a historical reasoning behind the last user |
 | `_encode_messages_text` (770) | BOS, the loop over messages, and `effective_drop_thinking` forced false when any message carries tools | `crates/ds4-server/src/render.rs:1374`-`:1426` | all encode cases | pass |
 | `encode_messages` (810) | the public entry: merge, sort, image pass, then the text render | `crates/ds4-server/src/render.rs:1374` behind the chat route | all encode cases | pass on the cases measured |
@@ -120,27 +120,32 @@ kept because a served turn needs them, not because the oracle asks for them.
 
 Ordered by what unblocks them, with the evidence each needs.
 
-1. O-01 low effort (row `render_reasoning_effort`, `enc-think-low`): the
-   oracle writes `Reasoning Effort: 50 (range 1-100, ...)`; we write nothing.
-   Needs a decision first (the oracle binds, the older C value is retired),
-   then the constant, the case, and a re-pinned fixture.
-2. O-02 mid-conversation system message (`enc-midsystem-chat`): the oracle
-   emits `<｜System｜>content` in place and counts that index as user-like for
-   the assistant header; we hoist every system message into the head
-   (`crates/ds4-server/src/render.rs:1396`-`:1422`).
-3. O-03 tool-result order (`enc-toolresults-order`): `sort_tool_results_by_call_order`
-   has no counterpart.
-4. The image surface (rows `parse_tagged_text`, `_is_image_block`,
+1. O-01 low effort (row `render_reasoning_effort`, `enc-think-low`): two halves
+   in one change. The low name renders nothing today because the requested
+   effort never reaches the renderer on the ds41 route — `engine_defaults`
+   (set on the V4.1 branch, `bin/ds4-server-rs.rs:611`) collapses low into high
+   through `engine_think_mode` (`parse.rs:2817`) — and a numeric
+   `reasoning_effort`, which the oracle also renders verbatim, is refused at the
+   parse (`format.rs:96-102`). The fix carries the requested budget to the head
+   prefix as a number and accepts a number in the parse, leaving the engine's
+   own mode collapsed so the reasoning cap and sampling switches do not move.
+2. The image surface (rows `parse_tagged_text`, `_is_image_block`,
    `_extract_image`, `_process_image_blocks`, `_validate_no_image_sp_tokens`,
    `process_image_messages`): six functions, no case.  The reference harness
-   asserts text-only, so nothing here is measured against the oracle.
-5. `response_format` rendering (row `response_format_template`): parsed on our
+   asserts text-only, so nothing here is measured against the oracle.  The
+   server's base64-only rule is a deliberate deviation from the oracle's
+   path and URL forms (AGENTS.md, the carriage section).
+3. `response_format` rendering (row `response_format_template`): parsed on our
    side, not rendered, no case.
-6. The namespace surface (rows `_split_tool_name`, `_tool_name_for_encoding`):
+4. The namespace surface (rows `_split_tool_name`, `_tool_name_for_encoding`):
    the qualified name has no case on either side.
-7. O-04 arguments bytes: ours minify, the oracle keeps the parameter body
+5. O-04 arguments bytes: ours minify, the oracle keeps the parameter body
    verbatim.  Values agree; the strings differ.  Recorded, not a defect
    against the wire, since the client echoes our string.
+
+Closed since the map was written: O-02 (a mid-conversation system message
+renders in place) and O-03 (tool results ordered by call order); both were
+measured against their fixture before the fix and after it.
 
 ## 6. Reproducing
 

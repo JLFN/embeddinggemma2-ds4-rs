@@ -1348,6 +1348,55 @@ fn append_dsml_user_content(out: &mut Vec<u8>, m: &ChatMsg, head: DsmlHead) {
     }
 }
 
+/// A tool-result message: its body renders as one `<tool_result>` block.
+fn is_tool_msg(m: &ChatMsg) -> bool {
+    m.role == "tool" || m.role == "function"
+}
+
+/// The call ids of the assistant message that precedes a tool-result run, in
+/// declared order.  `None` when there is no such assistant or it declared no
+/// ids, which is the oracle's own guard before it sorts (encoding.py:233-266
+/// sort_tool_results_by_call_order).
+fn preceding_call_order(msgs: &[ChatMsg], before: usize) -> Option<Vec<&str>> {
+    let assistant = msgs[..before]
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && !m.calls.is_empty())?;
+    let ids: Vec<&str> = assistant
+        .calls
+        .iter()
+        .map(|c| c.id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// A run of consecutive tool-result messages in the order the turn must render
+/// them.  The run is one user-side block, and the V4.1 generation orders its
+/// bodies by the preceding assistant's call order, not by arrival, so a client
+/// that sends results in completion order still produces one canonical prompt
+/// (encoding.py:233-266).  A result whose id the assistant never declared keeps
+/// the oracle's default key 0, and the sort is stable, so it stays where it
+/// arrived.
+fn tool_run_in_call_order(msgs: &[ChatMsg], start: usize) -> Vec<usize> {
+    let end = msgs[start..]
+        .iter()
+        .position(|m| !is_tool_msg(m))
+        .map_or(msgs.len(), |n| start + n);
+    let mut run: Vec<usize> = (start..end).collect();
+    if run.len() < 2 {
+        return run;
+    }
+    let Some(order) = preceding_call_order(msgs, start) else {
+        return run;
+    };
+    run.sort_by_key(|&i| {
+        let id = msgs[i].tool_call_id.as_str();
+        order.iter().position(|x| *x == id).unwrap_or(0)
+    });
+    run
+}
+
 pub fn render_dsml_chat(
     msgs: &[ChatMsg],
     tool_schemas: &str,
@@ -1395,8 +1444,15 @@ pub fn render_dsml_chat_choice_ex(
             spaced,
         );
     }
-    for m in msgs {
+    for (i, m) in msgs.iter().enumerate() {
         if !role_is_system(&m.role) {
+            continue;
+        }
+        // The head carries the leading system message.  The V4.1 generation
+        // also supports a mid-conversation system message, and that one
+        // renders in place with its own <｜System｜> instead of joining the head
+        // (encoding.py:621-627).
+        if spaced && i > 0 {
             continue;
         }
         if !system.is_empty() {
@@ -1415,8 +1471,10 @@ pub fn render_dsml_chat_choice_ex(
             spaced,
         );
     }
+    // A mid-conversation system message counts as user-like for the assistant
+    // header that follows it (encoding.py:562-582 find_last_user_index).
     for (i, m) in msgs.iter().enumerate() {
-        if role_is_user_like(&m.role) {
+        if role_is_user_like(&m.role) || (spaced && i > 0 && role_is_system(&m.role)) {
             last_user_idx = i as i32;
         }
     }
@@ -1437,13 +1495,28 @@ pub fn render_dsml_chat_choice_ex(
 
     let mut pending_assistant = false;
     let mut pending_tool_result = false;
+    // Spaced only: the previous message is a user-side block that a following
+    // user message merges into -- one shared <｜User｜> with the bodies joined by
+    // a blank line.  A mid-conversation system message is not one of those, so
+    // it clears the flag and the next user message opens its own turn
+    // (encoding.py:184-231 merge_tool_messages).
+    let mut pending_merge = false;
     for (i, m) in msgs.iter().enumerate() {
         if role_is_system(&m.role) {
+            // A mid-conversation system message introduces its own turn: its
+            // own token, at its position, and the assistant header that
+            // follows it (encoding.py:621-627, :733-739).
+            if spaced && i > 0 {
+                put(&mut out, DSML_SYSTEM_TOKEN);
+                put(&mut out, &m.content);
+                pending_assistant = true;
+                pending_merge = false;
+            }
             continue;
         } else if m.role == "user" {
             put(
                 &mut out,
-                if spaced && pending_assistant {
+                if spaced && pending_merge {
                     "\n\n"
                 } else {
                     DSML_USER
@@ -1451,17 +1524,34 @@ pub fn render_dsml_chat_choice_ex(
             );
             append_dsml_user_content(&mut out, m, head);
             pending_assistant = true;
+            pending_merge = true;
             pending_tool_result = false;
-        } else if m.role == "tool" || m.role == "function" {
-            if spaced && pending_assistant {
+        } else if is_tool_msg(m) {
+            // The run renders as one user-side block, so it is emitted here at
+            // its first message and the later ones are skipped.
+            if spaced && i > 0 && is_tool_msg(&msgs[i - 1]) {
+                continue;
+            }
+            if spaced && pending_merge {
                 put(&mut out, "\n\n");
             } else if !pending_tool_result {
                 put(&mut out, DSML_USER);
             }
-            put(&mut out, "<tool_result>");
-            append_tool_result_text(&mut out, m.content.as_bytes());
-            put(&mut out, "</tool_result>");
+            let run: Vec<usize> = if spaced {
+                tool_run_in_call_order(msgs, i)
+            } else {
+                vec![i]
+            };
+            for (n, &k) in run.iter().enumerate() {
+                if n > 0 {
+                    put(&mut out, "\n\n");
+                }
+                put(&mut out, "<tool_result>");
+                append_tool_result_text(&mut out, msgs[k].content.as_bytes());
+                put(&mut out, "</tool_result>");
+            }
             pending_assistant = true;
+            pending_merge = true;
             pending_tool_result = true;
         } else if m.role == "assistant" {
             if pending_assistant {
@@ -1482,6 +1572,7 @@ pub fn render_dsml_chat_choice_ex(
             append_dsml_tool_calls_text(&mut out, m, spaced);
             put(&mut out, DSML_EOS);
             pending_assistant = false;
+            pending_merge = false;
             pending_tool_result = false;
         }
     }

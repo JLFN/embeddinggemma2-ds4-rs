@@ -49,6 +49,20 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
     }
 }
 
+/// A `tool` role message as the chat parse builds it: the body plus the id of
+/// the call it answers (`add_tool_call_id`, parse.rs:868).  The id is what the
+/// renderer orders a run of results by, so a case that omits it cannot
+/// exercise the order rule.
+fn tool_result(id: &str, body: &str) -> ChatMsg {
+    ChatMsg {
+        role: "tool".into(),
+        content: body.into(),
+        tool_call_id: id.into(),
+        tool_call_ids: vec![id.into()],
+        ..Default::default()
+    }
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ds41-ref")
@@ -177,15 +191,13 @@ fn thinking_low_effort_matches_official_encoding() {
     check("enc-think-low", &msgs, READ_FILE_SCHEMA_MIN, ThinkMode::Low);
 }
 
-/// OPEN (matrix row O-02): a mid-conversation system message.  Both references
-/// write the system token again and let the message introduce its own turn
-/// (encoding.py:621-627, :733-739; ds4.c:44431-44443 ds41_chat_system_marker
-/// pushes the system token once a user or assistant token has been emitted).
-/// Our renderer hoists every system message into the head instead, so the
-/// prompt differs from both: measured, the case's "Answer in one line." lands
-/// before the tools preamble rather than after the user turn.
+/// A mid-conversation system message: the oracle writes the system token
+/// again and lets the message introduce its own turn (encoding.py:621-627,
+/// :733-739), and counts that index as user-like for the assistant header
+/// that follows (:562-582).  Measured before the fix: our renderer hoisted
+/// every system message into the head, so "Answer in one line." landed before
+/// the tools preamble instead of after the user turn.
 #[test]
-#[ignore = "OPEN O-02: a mid-conversation system message is hoisted into the head (render.rs:1395-1416)"]
 fn mid_conversation_system_matches_official_encoding() {
     let msgs = [
         msg("system", "You are a helpful assistant."),
@@ -195,13 +207,11 @@ fn mid_conversation_system_matches_official_encoding() {
     check("enc-midsystem-chat", &msgs, READ_FILE_SCHEMA_MIN, ThinkMode::None);
 }
 
-/// OPEN (matrix row O-03): tool results are ordered by the preceding
-/// assistant's call order, not by arrival (encoding.py:234-266
-/// sort_tool_results_by_call_order).  Our renderer keeps arrival order:
-/// measured on this case, the oracle's block carries body a then body b, ours
-/// body b then body a; every other byte of the turn matches.
+/// Tool results are ordered by the preceding assistant's call order, not by
+/// arrival (encoding.py:233-266 sort_tool_results_by_call_order).  Measured
+/// before the fix: the oracle's block carried body a then body b, ours body b
+/// then body a, every other byte of the 1767 matching.
 #[test]
-#[ignore = "OPEN O-03: tool results keep arrival order, the oracle orders them by call order"]
 fn tool_results_in_call_order_match_official_encoding() {
     let msgs = [
         msg("system", "You are a helpful assistant."),
@@ -213,8 +223,8 @@ fn tool_results_in_call_order_match_official_encoding() {
                 call("call_b", "read_file", r#"{"target_file": "/tmp/b.txt"}"#),
             ],
         ),
-        msg("tool", "body b"),
-        msg("tool", "body a"),
+        tool_result("call_b", "body b"),
+        tool_result("call_a", "body a"),
         msg("user", "Summarise both."),
     ];
     check(

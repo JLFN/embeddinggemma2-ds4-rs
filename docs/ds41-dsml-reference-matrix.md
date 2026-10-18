@@ -59,9 +59,9 @@ Encode side: our route renders the case, the fixture is the oracle's bytes
 | `enc-argtypes-chat` | the type attribute — `string="true"` for a string child, `string="false"` with the value in json.dumps shape otherwise (encode_arguments_to_dsml, encoding.py:524-556) — plus a merged tool result | pass |
 | `enc-think-tools` | thinking mode with tools: the effort header at 75 and the open `<think>` the assistant turn must carry | pass |
 | `enc-think-max` | the numeric effort header at 100 (encoding.py:443-472) | pass |
-| `enc-think-low` | the same header at the low effort | OPEN O-01 |
-| `enc-midsystem-chat` | a mid-conversation system message | OPEN O-02 |
-| `enc-toolresults-order` | tool results ordered by the assistant's call order (encoding.py:233-266) | OPEN O-03 |
+| `enc-think-low` | the same header at the low effort | OPEN O-01 (two halves, see part D) |
+| `enc-midsystem-chat` | a mid-conversation system message | pass (closed 2026-10-18, render.rs `pending_merge` + the in-place system branch) |
+| `enc-toolresults-order` | tool results ordered by the assistant's call order (encoding.py:233-266) | pass (closed 2026-10-18, render.rs `tool_run_in_call_order`) |
 
 Decode side: the completion bytes are the oracle's own, and our parser must
 agree with the oracle's parse (`crates/ds4-server/tests/ref_decode.rs`).
@@ -120,9 +120,9 @@ evidence index or in the test itself.
 
 | Row | Finding | Evidence | Class |
 | --- | --- | --- | --- |
-| O-01 | the oracle renders `Reasoning Effort: 50` for the low effort (encoding.py:449-451); the C reference renders no effort line for `DS4_THINK_LOW` — `ds4_think_mode_level` returns -1 outside the numeric range and only HIGH/MAX are pinned to 75/100 (ds4.c:60817-60821, :44201-44209), low being spelled as the numeric level 50 instead | `enc-think-low` (fixture 1372 bytes vs our 1311) | delta between the two references; our port follows the C reference. A decision is owed on whether the numeric-effort surface is exposed |
-| O-02 | a mid-conversation system message must write the system token again once a user or assistant token has been emitted, and the message introduces its own turn (encoding.py:621-627, :733-739; ds4.c:44431-44443 `ds41_chat_system_marker`); our renderer hoists every system message into the head (`render.rs:1395-1416`) | `enc-midsystem-chat` | carriage defect against both references; P2's encode half, unit pending |
-| O-03 | tool results are ordered by the preceding assistant's call order (encoding.py:233-266); our chat route keeps arrival order, and the C reference orders results only on the Anthropic/Responses path (`live_tool_call_order`, `ds4_server.c:10580`, CTR clause 2.3.8 "open, deferred") | `enc-toolresults-order` | decision owed: requirement 2.3.8 is already open, and the client sends `parallel_tool_calls = true` |
+| O-01 | the oracle renders the requested budget verbatim: a name maps to 50/75/100, an integer in [1,100] renders as itself, and either is written only in thinking mode at index 0 (encoding.py:443-473). Two halves on our side. (a) The low name renders nothing: on the ds41 route the requested effort never reaches the renderer, because `engine_defaults` (set on the V4.1 branch, `bin/ds4-server-rs.rs:611`) collapses low into high through `engine_think_mode` (`parse.rs:2817`), and `head_effort_prefix` knows only high and max (`render.rs:69-74`). (b) A numeric `reasoning_effort` is refused: the value parser reads a string name and nothing else (`format.rs:96-102`) | `enc-think-low` (fixture 1372 bytes vs our 1311) | OPEN, both halves are one designed change: carry the requested budget to the head prefix as a number (with the low name as the 50 case), accept a number in the parse, and leave the engine's own mode collapsed so the reasoning cap and sampling switches do not move |
+| O-02 | CLOSED 2026-10-18: a mid-conversation system message writes the system token again at its position, introduces its own turn, and counts as user-like for the assistant header that follows it (encoding.py:621-627, :733-739, `find_last_user_index` :562-582) | `enc-midsystem-chat` | pass; measured before the fix, "Answer in one line." landed before the tools preamble instead of after the user turn. The fix added the in-place system branch and split `pending_merge` from `pending_assistant` in `render.rs`, so a user message following a mid system opens its own `<｜User｜>` exactly as the oracle's merge rule requires (encoding.py:184-231) |
+| O-03 | CLOSED 2026-10-18: tool results are ordered by the preceding assistant's call order, not by arrival (encoding.py:233-266) | `enc-toolresults-order` | pass; measured before the fix, the oracle's block carried body a then body b and ours body b then body a, with the other 1767 bytes matching. `tool_run_in_call_order` (`render.rs`) sorts a run of tool-result messages by the ids the preceding assistant declared; a result whose id was never declared keeps the oracle's default key 0 and the sort is stable. This also makes the prompt canonical for a client that sends results in completion order, which the OpenAI wire permits (CTR clause 2.3.8) |
 | O-04 | our call arguments minify a composite child (`tool_call_json_args_add`, `tools.rs:150-166`, mirroring `ds4_server.c:5971-5982` over `json_minify_raw_value` :411) while the oracle keeps the parameter body verbatim; the values are equal and both parse | `composite_arguments_are_minified_as_the_reference_does` (pass) | recorded delta, pinned from our side; no action |
 
 ## 6. Part E — the client of record's wire contract
@@ -145,15 +145,15 @@ end.
 | E-07 | streaming is read as SSE `data:` chunks with a tool-call accumulator and a `[DONE]` terminator (`stream/chat_completions.rs:120-260`) | our SSE framing (`stream.rs:561` onward) | the client leg (G1/G2) | OPEN until the client leg runs (unit 3.3) |
 | E-08 | reasoning is read from `reasoning_content` only, and the client synthesizes a reasoning sibling only when it carried text (`types.rs:384-396`; `stream/chat_completions.rs:262-266`) | we emit `reasoning_content` on the reasoning channel (`stream.rs:816`, `:859`, `:2357`) | R-15/R-16 host legs; the client leg | partially measured: the host legs pass, the served leg is open |
 | E-09 | in thinking mode the client echoes `reasoning_content` on EVERY assistant message, empty included, and replays `function.arguments` as the raw string it holds (invalid JSON replaced by `{}`) (`conversation.rs:3727-3741`, `:3516-3527`) | our parse reads both fields and does not require reasoning; unknown keys are skipped | R-15's host leg (four surfaces parse the client's own echo) | host pass |
-| E-10 | tool results are appended in completion order with `parallel_tool_calls = true`, so the server receives them out of call order | we render them in the order received (O-03) | enc-toolresults-order | OPEN, O-03 |
+| E-10 | tool results are appended in completion order with `parallel_tool_calls = true`, so the server receives them out of call order | `tool_run_in_call_order` re-sorts a run of results by the assistant's declared call order | enc-toolresults-order | closed 2026-10-18: the oracle's order is applied, so a client that sends results in completion order still renders the canonical prompt (O-03) |
 
 ## 7. What blocks an "all covered" claim
 
 The OPEN rows, in the order the plan would close them: E-07 and E-08's served
 half and R-18, which are the same measurement (the client leg, unit 3.3), then
 R-12 and R-15's served leg (`--trace`, unit 3.2), R-17 (the gate's C-01..C-03
-probes), E-10 with O-03, G8 and G9's repair-side scan (P3, unit 3.4), G6 (P4),
-G5 (needs the Anthropic live path to be probed), O-01..O-02 (decisions above),
+probes), G8 and G9's repair-side scan (P3, unit 3.4), G6 (P4), G5 (needs the
+Anthropic live path to be probed), O-01 (the effort budget, both halves),
 and R-07..R-10 together with G1's remainder and G3/G4, which are reserved to a
 unit that may alter KV state.
 
@@ -162,7 +162,7 @@ index: R-01..R-06, R-11 at host level, R-13, R-14, R-15's host leg, R-16's
 host leg, E-01..E-06 and E-09 by construction and host test, and every part A
 case marked pass.
 
-For the operator's stated goal -- OpenAI compatibility with `/data/open-grok`
--- the shortest path is E-07 and E-08: everything the client's deserializer
-requires is emitted today, but no leg has yet driven the client itself against
-a served binary (unit 3.3).
+For the operator's stated goal -- a plain OpenAI server any compatible caller
+can drive, the way a hosted DeepSeek endpoint is driven -- the shortest path is
+E-07 and E-08: everything a client's deserializer requires is emitted today,
+but no leg has yet driven a real client against a served binary (unit 3.3).
