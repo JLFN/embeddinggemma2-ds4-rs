@@ -2184,6 +2184,15 @@ tests/test_eg2vq_vq: tests/test_eg2vq_vq.cu cuda/eg2vq_vq.cuh ds41_vq_fmt.h
 test-eg2vq-vq: tests/test_eg2vq_vq
 	./tests/test_eg2vq_vq
 
+# embeddinggemma2 PHASE 7 row P3.2: the device attention (symmetric sliding mask,
+# scale 1.0, non-causal) against the CPU reference's own arithmetic.
+tests/test_eg2vq_attn: tests/test_eg2vq_attn.cu cuda/eg2vq_attn.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
+
+.PHONY: test-eg2vq-attn
+test-eg2vq-attn: tests/test_eg2vq_attn
+	./tests/test_eg2vq_attn
+
 tests/test_glm_vq_kda: tests/test_glm_vq_kda.cu cuda/glm_vq_kda.cuh cuda/glm_vq_ops.cuh
 	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
 
