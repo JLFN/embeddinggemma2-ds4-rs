@@ -117,10 +117,25 @@ __device__ __forceinline__ uint32_t glmvq_q4p_smem(const void *p) {
     return (uint32_t)__cvta_generic_to_shared(p);
 }
 
+/* Portability deviation, named, measured with nvcc 13.3 on this tree:
+ * mbarrier.try_wait.parity is sm_90+ and ptxas refuses it below ("Feature
+ * 'mbarrier.try_wait.parity' requires .target sm_90 or higher"), while
+ * mbarrier.init/arrive/arrive.noinc in this file are sm_80+. The sm_80-era
+ * sibling test_wait.parity tests the same phase parity without suspending the
+ * warp, which is exactly what this non-blocking spin loop assumes, so the loop
+ * body is identical and only the opcode moves. sm_90+ keeps the engine's asm
+ * verbatim, the same split cuda/glm_vq_mma.cuh:84-90 already uses for its
+ * prefetch. Measured 2026-10-19: both forms compile for sm_89 and sm_121a. */
 __device__ __forceinline__ void glmvq_q4p_wait(const uint64_t *bar, uint32_t parity) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     asm volatile("{\n .reg .pred done;\n Q4P_WAIT%=:\n"
         " mbarrier.try_wait.parity.shared.b64 done, [%0], %1;\n"
         " @!done bra Q4P_WAIT%=;\n}" :: "r"(glmvq_q4p_smem(bar)), "r"(parity) : "memory");
+#else
+    asm volatile("{\n .reg .pred done;\n Q4P_WAIT%=:\n"
+        " mbarrier.test_wait.parity.shared.b64 done, [%0], %1;\n"
+        " @!done bra Q4P_WAIT%=;\n}" :: "r"(glmvq_q4p_smem(bar)), "r"(parity) : "memory");
+#endif
 }
 
 __device__ __forceinline__ void glmvq_q4p_arrive(uint64_t *bar) {

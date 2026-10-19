@@ -44,8 +44,15 @@ __global__ void __launch_bounds__(GLMVQ_DOT_WARPS * 32) glmvq_bf16_dot(
     const uint32_t row = blockIdx.x * (GLMVQ_DOT_WARPS / split) + local;
     // The row's weights head for L2 while the predecessor drains.
     if (row < rows && !lane && !part) {
+        /* sm_80-89 fallback for the sm_90+ cp.async.bulk.prefetch.L2, the
+         * same split cuda/glm_vq_mma.cuh:84-90 uses; the hint is an option,
+         * not a fetch. */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::
             "l"(weight + (uint64_t)row * cols), "r"(cols * (uint32_t)sizeof(__nv_bfloat16)) : "memory");
+#else
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(weight + (uint64_t)row * cols) : "memory");
+#endif
     }
     glmvq_pdl_wait();
     float sum[NT] = {};
@@ -122,8 +129,13 @@ __global__ void __launch_bounds__(GLMVQ_THREADS) glmvq_hc_mix(const float *resid
     glmvq_pdl_open();
     // This output's 32 KB weight row heads for L2 while the predecessor drains.
     if (!lane) {
+        /* sm_80-89 fallback for the sm_90+ cp.async.bulk.prefetch.L2, as above. */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::
             "l"(weight + (uint64_t)blockIdx.x * width), "r"(width * (uint32_t)sizeof(__nv_bfloat16)) : "memory");
+#else
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(weight + (uint64_t)blockIdx.x * width) : "memory");
+#endif
     }
     glmvq_pdl_wait();
     // MTP verify rows: blockIdx.y selects the row; per-row math is unchanged.
