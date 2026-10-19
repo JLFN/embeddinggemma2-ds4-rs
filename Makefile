@@ -176,6 +176,7 @@ help:
 	@echo "  make ds4-perf-gpu          Build optional CUDA 13.3 calibration/CUPTI helper"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
+	@echo "  make cuda CUDA_ARCH=sm_89 Build CUDA for an Ada card (RTX 4070 SUPER class)"
 	@echo "  make cpu                 Build CPU-only C oracles (ds4-*-c) + ./ds4-eval"
 	@echo "  make test                Build and run tests (reuses the last cuda-* configuration)"
 	@echo "  make rust-bridge         Compile native/bridge/ds4_bridge.o (Rust FFI skeleton)"

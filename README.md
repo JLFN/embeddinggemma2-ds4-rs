@@ -88,7 +88,7 @@ make cuda-spark
 |---|---|
 | `make cuda-spark` | DGX Spark / GB10, `sm_121a` |
 | `make cuda-generic` | Detected local NVIDIA GPU |
-| `make cuda CUDA_ARCH=sm_N` | Explicit CUDA architecture |
+| `make cuda CUDA_ARCH=sm_N` | Explicit CUDA architecture; `sm_89` is the Ada card (RTX 4070 SUPER class) |
 | `make` on macOS | Inherited Metal backend |
 | `make cpu` | CPU reference and diagnostics |
 
