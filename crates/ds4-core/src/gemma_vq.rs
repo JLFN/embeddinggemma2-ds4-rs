@@ -76,6 +76,37 @@ const F16_INF_NAN: u16 = 0x7c00;
 /// (`crates/ds4-core/src/tensors.rs:266`).
 const MAX_RANK: u32 = 4;
 
+/// Tokens in one item: the tower's ceiling. It is the device attention
+/// kernel's key plane (`cuda/eg2vq_attn.cuh:49`, `EG2VQ_ATTN_KEYS_MAX`), which
+/// the C entry point's own cap mirrors (`ds4_eg2vq.h:140`,
+/// `DS4_EG2VQ_MAX_TOKENS`, 2048) and which the kernel adapter static-asserts
+/// equal (`ds4_eg2vq_gpu.cuh:45-46`). It is deliberately NOT the checkpoint's
+/// `max_position_embeddings` (262144, the artifact's `gemma_vq.context_length`,
+/// `out/artifact-kv.txt`): the attention is windowed to the symmetric +-512
+/// (`ds4_eg2vq.h:49-52`, `src/llama-hparams.h:524-533`), and beyond the plane
+/// the kernels cannot hold the item at all. A longer item is refused by name,
+/// never truncated -- a plane that silently covered half an item would be a
+/// wrong answer rather than a slow one.
+///
+/// The three copies of this number (here, the C macro, the CUDA enum) are held
+/// together by `crates/ds4-core/tests/eg2vq_serving_caps.rs`, which reads both
+/// C sources and fails if either disagrees with this constant.
+pub const ITEM_TOKENS_MAX: u32 = 2048;
+
+/// Total tokens over one batch's items: the row budget a batched embedding call
+/// may occupy in the tower's single workspace, and therefore the device memory
+/// a batch may ask for. The layout is exactly linear in rows at 108,548 bytes
+/// each (106.0 KiB: the tower's 27,136 f32 planes per row plus the 4-byte id,
+/// `ds4_eg2vq_gpu.cuh:72-99`), so 8192 rows is four times the single-item
+/// ceiling and 848.0 MiB of workspace -- checkable against the measured
+/// 212.01 MiB at max_tokens 2048 (docs/eg2vq-device-gate7.txt:407-411,
+/// :589-590), which is four times less.
+///
+/// This is a POLICY of this port, not a file fact: nothing in the artifact
+/// states a batch width, so the number is declared here, stated in the serving
+/// caps and enforced by name where a request exceeds it.
+pub const BATCH_ROWS_MAX: u32 = 8192;
+
 type Result<T> = std::result::Result<T, TensorError>;
 
 fn fail(reason: &'static str) -> TensorError {

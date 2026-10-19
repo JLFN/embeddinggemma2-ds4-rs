@@ -181,6 +181,38 @@ pub struct ServingCaps {
     pub media_serial: bool,
 }
 
+/// The embedding-shaped capabilities: what a family whose operation is "text in,
+/// one vector out" can be asked for. `None` for a decode family, whose limits
+/// are the vocabulary above. A decode-shaped cap does not describe an embedding
+/// model -- it has no KV cache, no context to grow and no token distribution --
+/// but it does have an item ceiling and a bulk ceiling, and those are the two
+/// numbers a caller needs before sending work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbedCaps {
+    /// Tokens in one item: `crate::gemma_vq::ITEM_TOKENS_MAX`, the device
+    /// attention kernel's key plane.
+    pub item_tokens_max: u32,
+    /// Tokens over one call's items: `crate::gemma_vq::BATCH_ROWS_MAX`, the row
+    /// budget of the tower's single device workspace.
+    pub batch_rows_max: u32,
+}
+
+/// The embedding-shaped cap entry for a family, in the shape of
+/// `serving_host::family_native_limit`: a family-keyed lookup rather than a
+/// field on `ServingCaps`, because that struct's vocabulary is decode-shaped
+/// (banks, reuse, speculation, context) and this family has none of it. `Some`
+/// exactly for the families whose operation IS an embedding
+/// (`ModelFamily::GemmaVq`, phase 6 of embeddinggemma2-handoff.md).
+pub fn embed_caps(family: ModelFamily) -> Option<EmbedCaps> {
+    match family {
+        ModelFamily::GemmaVq => Some(EmbedCaps {
+            item_tokens_max: crate::gemma_vq::ITEM_TOKENS_MAX,
+            batch_rows_max: crate::gemma_vq::BATCH_ROWS_MAX,
+        }),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServingRequest {
     pub prefix_reuse: PrefixReuse,
@@ -785,9 +817,13 @@ pub fn serving_caps(family: ModelFamily, variant: Variant) -> ServingCaps {
             media_serial: false,
         },
         // An encoder, not a decode session: no KV banks, no speculation, no
-        // disk store, no snapshots, either backend hosting it. The embeddings
-        // entry point is phase 6 of embeddinggemma2-handoff.md; the caps state
-        // what exists today rather than what is planned.
+        // disk store, no snapshots, either backend hosting it. `ctx_max` is the
+        // file's own `gemma_vq.context_length` (the checkpoint's
+        // max_position_embeddings), the ceiling a session could be created with;
+        // what a caller of the EMBEDDING path must respect is not that but
+        // `embed_caps` -- an item's token ceiling and a call's row budget --
+        // which is a separate entry because this family's operation has no
+        // context, no KV cache and no token distribution to describe.
         ModelFamily::GemmaVq => ServingCaps {
             family,
             variant,
@@ -1782,6 +1818,12 @@ impl ResolvedPlan {
             }),
             "mtp": self.caps.map(|caps| caps.mtp_support.as_str()),
             "disk": self.caps.map(|caps| caps.disk.as_str()),
+            // The embedding-shaped limits, stated where every other family
+            // capability is stated. Null for a decode family.
+            "embed": self.family.and_then(embed_caps).map(|e| json!({
+                "item_tokens_max": e.item_tokens_max,
+                "batch_rows_max": e.batch_rows_max,
+            })),
         })
     }
 
@@ -2764,6 +2806,41 @@ mod tests {
         };
         let p = resolve_plan(&req, None, &EngineFacts::default());
         assert!(p.has_errors());
+    }
+
+    #[test]
+    fn the_embedding_family_reports_item_and_batch_caps() {
+        // Phase 6 row P2.3: the embedding-shaped entry. The family's decode-shaped
+        // context key keeps the file's own number, and what a caller of the
+        // embedding path must respect is reported beside it.
+        let json = plan(
+            ServingRequest::default(),
+            ModelFamily::GemmaVq,
+            Variant::GemmaVqFlash,
+        )
+        .to_json();
+        assert_eq!(
+            json["controls"]["embed"]["item_tokens_max"],
+            json!(crate::gemma_vq::ITEM_TOKENS_MAX)
+        );
+        assert_eq!(
+            json["controls"]["embed"]["batch_rows_max"],
+            json!(crate::gemma_vq::BATCH_ROWS_MAX)
+        );
+        assert_eq!(
+            caps(ModelFamily::GemmaVq, Variant::GemmaVqFlash).ctx_max,
+            Some(GEMMA_CTX_MAX)
+        );
+        // A decode family has no embedding caps to report, and says so with null
+        // rather than with a zero a caller could mistake for a limit.
+        let glm = plan(
+            ServingRequest::default(),
+            ModelFamily::Glm53,
+            Variant::Glm53Flash,
+        )
+        .to_json();
+        assert!(glm["controls"]["embed"].is_null());
+        assert_eq!(embed_caps(ModelFamily::Glm53), None);
     }
 
     #[test]

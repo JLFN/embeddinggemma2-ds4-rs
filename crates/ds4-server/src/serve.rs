@@ -107,6 +107,12 @@ pub struct ServerConfig {
     /// Phase 6: the opened model's family as `/health` reports it, from
     /// `ds4_core::ModelFamily::oracle_name` (shape.rs:63-83; "gemma_vq" here).
     pub family: String,
+    /// Phase 6 row P2.3: the family's EMBEDDING-shaped caps
+    /// (`ds4_core::embed_caps`), read once at boot beside `embedding` and
+    /// reported by `/health`, which is where a caller learns the item ceiling and
+    /// the per-call row budget before sending work. None for a decode family,
+    /// whose limits are the context/session vocabulary instead.
+    pub embed_caps: Option<ds4_core::EmbedCaps>,
     /// Phase 6: the serving backend as `/health` reports it -- "cuda", "cpu"
     /// or "metal", from `ds4_core::Backend` (lib.rs:205-209).
     pub backend: String,
@@ -224,6 +230,7 @@ impl Default for ServerConfig {
             serial_fit: None,
             embedding: false,
             family: String::new(),
+            embed_caps: None,
             backend: String::new(),
             add_bos: false,
             add_eos: false,
@@ -1217,12 +1224,23 @@ fn prepare_client(
     // gate), `family` is `ModelFamily::oracle_name` (shape.rs:63-83), and
     // `backend` is the serving `ds4_core::Backend` (lib.rs:205-209).
     if req.method == "GET" && req.path == "/health" {
+        // `embed` is the embedding-shaped caps when the served family has them
+        // (phase 6 row P2.3) and null otherwise: an absence, not a zero a caller
+        // could mistake for a limit.
+        let embed = match cfg.embed_caps {
+            Some(c) => format!(
+                "{{\"item_tokens_max\":{},\"batch_rows_max\":{}}}",
+                c.item_tokens_max, c.batch_rows_max
+            ),
+            None => "null".to_string(),
+        };
         let body = format!(
-            "{{\"status\":\"ok\",\"model\":{},\"backend\":{},\"family\":{},\"embedding\":{}}}\n",
+            "{{\"status\":\"ok\",\"model\":{},\"backend\":{},\"family\":{},\"embedding\":{},\"embed\":{}}}\n",
             crate::json::json_escape(&cfg.model_id),
             crate::json::json_escape(&cfg.backend),
             crate::json::json_escape(&cfg.family),
             cfg.embedding,
+            embed,
         );
         write_all(
             stream,
@@ -1507,7 +1525,28 @@ fn prepare_embedding(
     })
 }
 
-/// Phase 6: the owner-side embedding run.  Runs on the thread that holds the
+/// Phase 6 row P2.3: a request that steps past a cap THIS server advertises on
+/// `/health` is a client error, not an engine fault, so it is a 400 in the same
+/// OpenAI envelope with the cap named. `embed_fail` stays the 500 for a genuine
+/// engine fault (a device allocation, a tampered artifact).
+fn embed_refuse<W: TerminalSink>(out: &mut W, cfg: &ServerConfig, msg: &str) -> Settlement {
+    let ok = out
+        .write_all(&wire_http_error_bytes(
+            WireSurface::OpenaiChat,
+            400,
+            msg,
+            cfg.cors,
+            None,
+        ))
+        .is_ok();
+    if ok {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
+}
+
+/// Phase 6 row P2.3: the owner-side embedding run.  Runs on the thread that holds the
 /// engine (the same `&mut dyn DecodeIo` that generation uses), one item at a
 /// time, in request order: prefix + text -> ids (`embed_item_ids`, the
 /// artifact's BOS/EOS flags) -> the tower (`embed_gemma_vq`) -> optional
@@ -1559,6 +1598,37 @@ fn run_embed<W: TerminalSink>(
             Err(e) => return embed_fail(out, cfg, &e.to_string()),
         };
         total_tokens = total_tokens.saturating_add(ids.len());
+        // The two caps the server itself advertises (`/health`'s `embed`, phase 6
+        // row P2.3, `ds4_core::embed_caps`): one item's tokens and the tokens a
+        // call's items may add up to. Both are refused by name, with the limit
+        // quoted, because a caller can only respect a number it is told.
+        if let Some(caps) = cfg.embed_caps {
+            if ids.len() > caps.item_tokens_max as usize {
+                return embed_refuse(
+                    out,
+                    cfg,
+                    &format!(
+                        "input[{i}] is {} tokens, past this model's {}-token item ceiling \
+                         (GET /health reports embed.item_tokens_max)",
+                        ids.len(),
+                        caps.item_tokens_max
+                    ),
+                );
+            }
+            if total_tokens > caps.batch_rows_max as usize {
+                return embed_refuse(
+                    out,
+                    cfg,
+                    &format!(
+                        "the {} inputs add up to {total_tokens} tokens, past the {}-token budget \
+                         of one embedding call (GET /health reports embed.batch_rows_max); \
+                         split the request",
+                        embed.inputs.len(),
+                        caps.batch_rows_max
+                    ),
+                );
+            }
+        }
         let vector = match engine.embed_gemma_vq(&ids) {
             Ok(v) => v,
             Err(e) => return embed_fail(out, cfg, &e.to_string()),

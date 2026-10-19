@@ -73,6 +73,12 @@ pub use bind::{
     DSPARK_MARKOV_RANK, DSPARK_N_LAYER, HOST_BIND_MISS,
 };
 pub use engram::{EngramError, EngramHash, EngramRow, EngramShard, EDIO_ALIGN};
+// The gemma_vq family's two embedding-shaped caps: what an embedding call may
+// ask it for (phase 6 row P2.3). Prefixed because the crate root already carries
+// several families' constants.
+pub use gemma_vq::{
+    BATCH_ROWS_MAX as GEMMA_VQ_BATCH_ROWS_MAX, ITEM_TOKENS_MAX as GEMMA_VQ_ITEM_TOKENS_MAX,
+};
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};
 pub use iquest::{IQuestCache, IQuestPlan};
@@ -112,12 +118,13 @@ pub use payload::{
 };
 pub use progress::PrefillCheckpoint;
 pub use serving::{
-    caps_from_ident, caps_from_shape, host_reuse, native_ctx_default, open_draft_tokens,
-    parse_disk_space, resolve_plan, serving_caps, ChunkFence, Distribution, EffectiveView,
-    EngineFacts, HostNeed, IssueLevel, LaneMode, MaxSeqs, MtpMode, PlanIssue, PrefixReuse,
-    QualifiedView, RequestTrace, RequestedView, ResolvedPlan, ReuseKind, ReuseMiss, ReuseTaken,
-    ServingCaps, ServingQuote, ServingRequest, SpecLane, Support, DEFAULT_BANK_PERSIST,
-    DEFAULT_MAX_SEQS, DEFAULT_MEM_FLOOR_GB, PREFILL_CHUNK_FENCE, VERIFIED_PREFILL_CHUNKS,
+    caps_from_ident, caps_from_shape, embed_caps, host_reuse, native_ctx_default,
+    open_draft_tokens, parse_disk_space, resolve_plan, serving_caps, ChunkFence, Distribution,
+    EffectiveView, EmbedCaps, EngineFacts, HostNeed, IssueLevel, LaneMode, MaxSeqs, MtpMode,
+    PlanIssue, PrefixReuse, QualifiedView, RequestTrace, RequestedView, ResolvedPlan, ReuseKind,
+    ReuseMiss, ReuseTaken, ServingCaps, ServingQuote, ServingRequest, SpecLane, Support,
+    DEFAULT_BANK_PERSIST, DEFAULT_MAX_SEQS, DEFAULT_MEM_FLOOR_GB, PREFILL_CHUNK_FENCE,
+    VERIFIED_PREFILL_CHUNKS,
 };
 pub use serving_host::{
     attach_host_quote, fill_quote_facts, gguf_slice_span_bytes, gguf_span_bytes,
@@ -2392,6 +2399,21 @@ impl Model {
             return Err(Error {
                 code: 1,
                 message: "an empty item has no embedding".into(),
+            });
+        }
+        // The item ceiling, checked here as well as in C: the two are one number
+        // (crate::gemma_vq::ITEM_TOKENS_MAX / DS4_EG2VQ_MAX_TOKENS, held equal by
+        // crates/ds4-core/tests/eg2vq_serving_caps.rs), and refusing before the
+        // call keeps the message the same on every backend.
+        if ids.len() > crate::gemma_vq::ITEM_TOKENS_MAX as usize {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the item is {} tokens, past the {} the embedding tower's attention kernel holds \
+                     (crate::gemma_vq::ITEM_TOKENS_MAX)",
+                    ids.len(),
+                    crate::gemma_vq::ITEM_TOKENS_MAX
+                ),
             });
         }
         let mut out = vec![0.0f32; OUT];

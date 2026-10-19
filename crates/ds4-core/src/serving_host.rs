@@ -1110,10 +1110,11 @@ fn family_native_limit(caps: ServingCaps) -> u32 {
         ModelFamily::Glm53 => GLM_NATIVE_MAX,
         ModelFamily::Glm53Vq => GLMVQ_NATIVE_MAX,
         ModelFamily::Ling31Vq => LING31_NATIVE_MAX,
-        // No measured chunk optimum yet: the encoder's native path is phase 7
-        // of embeddinggemma2-handoff.md, so the family takes the generic bound
-        // and the environment variable is the only thing that moves it.
-        ModelFamily::GemmaVq => FAMILY_NATIVE_MAX,
+        // An embedding tower has no prefill chunk to size: its native path takes
+        // one item at a time and that item's ceiling is the device attention
+        // kernel's key plane (crate::gemma_vq::ITEM_TOKENS_MAX, phase 6 row
+        // P2.3). The generic 16384 would advertise a chunk the tower cannot hold.
+        ModelFamily::GemmaVq => crate::gemma_vq::ITEM_TOKENS_MAX,
         ModelFamily::ExaoneMoe => FAMILY_NATIVE_MAX,
         ModelFamily::Motif3 => MOTIF_NATIVE_MAX,
         ModelFamily::Dots3Note => DOTS3_NATIVE_MAX,
@@ -1187,9 +1188,9 @@ fn family_native_chunk(caps: ServingCaps, ctx: u32) -> u32 {
         ),
         ModelFamily::GemmaVq => env_u32(
             "DS4_GEMMAVQ_PREFILL_CHUNK",
-            FAMILY_NATIVE_MAX,
+            crate::gemma_vq::ITEM_TOKENS_MAX,
             1,
-            FAMILY_NATIVE_MAX,
+            crate::gemma_vq::ITEM_TOKENS_MAX,
         ),
         ModelFamily::ExaoneMoe => env_u32(
             EXAONE_PREFILL_CHUNK_ENV,
@@ -3051,6 +3052,33 @@ mod tests {
         assert_eq!(family_native_chunk(caps, 1 << 20), 4096);
         assert_eq!(glm_vq_quote(8192, None).native_chunk, Some(4096));
         assert_eq!(glm_vq_quote(8192, Some(4096)).native_chunk, Some(4096));
+    }
+
+    #[test]
+    fn gemma_vq_native_arm_is_the_tower_ceiling_not_a_prefill_chunk() {
+        // Phase 6 row P2.3: an embedding tower has no prefill chunk to size. Its
+        // native arm is the item ceiling the device attention kernel holds
+        // (crate::gemma_vq::ITEM_TOKENS_MAX), and the family env cannot lift it,
+        // because beyond the plane the tower cannot encode the item at all.
+        let _env = lock_test_env();
+        let _chunk = EnvGuard::unset("DS4_GEMMAVQ_PREFILL_CHUNK");
+        let caps = serving_caps(ModelFamily::GemmaVq, Variant::GemmaVqFlash);
+        assert_eq!(
+            family_native_limit(caps),
+            crate::gemma_vq::ITEM_TOKENS_MAX
+        );
+        assert_eq!(
+            family_native_chunk(caps, 1 << 20),
+            crate::gemma_vq::ITEM_TOKENS_MAX
+        );
+        let _pinned = EnvGuard::set("DS4_GEMMAVQ_PREFILL_CHUNK", "512");
+        assert_eq!(family_native_chunk(caps, 1 << 20), 512);
+        let _above = EnvGuard::set("DS4_GEMMAVQ_PREFILL_CHUNK", "65536");
+        assert_eq!(
+            family_native_chunk(caps, 1 << 20),
+            crate::gemma_vq::ITEM_TOKENS_MAX,
+            "the env must not advertise a chunk past the tower's ceiling"
+        );
     }
 
     #[test]

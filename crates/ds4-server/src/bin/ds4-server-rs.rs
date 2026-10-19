@@ -874,6 +874,10 @@ fn main() {
     if let Some(ref m) = model {
         cfg.embedding = m.embeds_text();
         cfg.family = m.family().oracle_name().to_string();
+        // Phase 6 row P2.3: the embedding-shaped caps /health reports, read from
+        // the family the same way `embedding` is (the same one-line source the
+        // CLI and the route consult, ds4_core::embed_caps).
+        cfg.embed_caps = ds4_core::embed_caps(m.family());
         cfg.backend = match m.backend() {
             Backend::Cuda => "cuda",
             Backend::Metal => "metal",
