@@ -260,3 +260,7 @@ tests/naive_banks
 /tests/test_glm_vq_kda
 /tests/test_glm_vq_verify
 /tests/test_glm_vq_res
+/tests/parity/eg2vq_embd_gpu_oracle
+/tests/test_eg2vq_vq
+/tests/test_eg2vq_attn
+/tests/test_eg2vq_ops
