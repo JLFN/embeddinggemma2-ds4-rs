@@ -534,4 +534,49 @@ impl GgufFile {
         }
         out
     }
+
+    /// The same key list with each key's VALUE, through this reader's own
+    /// getters — so a written file's metadata can be read back without trusting
+    /// the writer that produced it (gate 1b, `docs/artifact-gguf-gate1b.txt`).
+    /// An array prints its element type and length: a 262144-entry token list is
+    /// not something a dump line carries.
+    pub fn dump_kv_values(&self) -> String {
+        let mut out = format!(
+            "HEADER version={} n_tensors={} n_kv={} alignment={}\n",
+            self.version, self.n_tensors, self.n_kv, self.alignment
+        );
+        for e in &self.kv {
+            let key = String::from_utf8_lossy(self.key_bytes(e)).into_owned();
+            let value = match e.typ {
+                GGUF_VALUE_UINT32 => self.get_u32(&key).map(|v| v.to_string()),
+                GGUF_VALUE_INT32 => self.get_u32(&key).map(|v| (v as i32).to_string()),
+                GGUF_VALUE_UINT16 => self.get_u16(&key).map(|v| v.to_string()),
+                GGUF_VALUE_INT16 => self.get_u16(&key).map(|v| (v as i16).to_string()),
+                GGUF_VALUE_UINT64 | GGUF_VALUE_INT64 => self.get_u64(&key).map(|v| v.to_string()),
+                GGUF_VALUE_FLOAT32 => self.get_f32_compat(&key).map(|v| format!("{v:e}")),
+                GGUF_VALUE_BOOL => self.get_bool(&key).map(|v| v.to_string()),
+                GGUF_VALUE_STRING => self
+                    .get_string(&key)
+                    .map(|s| String::from_utf8_lossy(s).into_owned()),
+                GGUF_VALUE_ARRAY => self
+                    .get_array(&key)
+                    .map(|a| format!("array<{}> len={}", value_type_name(a.typ), a.len)),
+                _ => None,
+            };
+            match value {
+                Some(v) => out.push_str(&format!(
+                    "KV {} {} = {}\n",
+                    key,
+                    value_type_name(e.typ),
+                    v.replace('\n', "\\n")
+                )),
+                None => out.push_str(&format!(
+                    "KV {} {} = <unreadable>\n",
+                    key,
+                    value_type_name(e.typ)
+                )),
+            }
+        }
+        out
+    }
 }
