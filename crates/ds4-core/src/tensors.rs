@@ -23,6 +23,7 @@ pub enum TensorError {
     ExpectedTensors { declared: u32, got: u64 },
     GlmVq(&'static str),
     Ling31Vq(&'static str),
+    GemmaVq(&'static str),
 }
 
 impl TensorError {
@@ -39,6 +40,7 @@ impl TensorError {
             }
             TensorError::GlmVq(reason) => format!("glm-vq {reason}"),
             TensorError::Ling31Vq(reason) => format!("ling31-vq {reason}"),
+            TensorError::GemmaVq(reason) => format!("gemma-vq {reason}"),
         }
     }
 }
@@ -310,6 +312,8 @@ fn parse_one(
     }
     if crate::ling31_vq::requested(g) {
         crate::ling31_vq::validate_part(g, &mut tensors, pos, data_pos)?;
+    } else if crate::gemma_vq::requested(g) {
+        crate::gemma_vq::validate_part(g, &mut tensors, pos, data_pos)?;
     } else {
         crate::glm_vq::validate_part(g, &mut tensors, pos, data_pos)?;
     }

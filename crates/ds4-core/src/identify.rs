@@ -185,6 +185,13 @@ pub fn identify_file(g: &GgufFile) -> Result<Identified, IdentifyError> {
     {
         return Err(IdentifyError::MissingKey("glm_vq.format_version=1|2"));
     }
+    // The same shape of gate for the third VQ family: the file must say which
+    // contract it is, not merely which architecture it resembles.
+    if shape.family == crate::ModelFamily::GemmaVq
+        && g.get_u32("gemma_vq.format_version") != Some(1)
+    {
+        return Err(IdentifyError::MissingKey("gemma_vq.format_version=1"));
+    }
     Ok(Identified {
         shape,
         architecture,

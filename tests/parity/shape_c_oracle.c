@@ -25,6 +25,9 @@ typedef enum {
     DS4_MODEL_FAMILY_DOTS3_NOTE = 4,
     DS4_MODEL_FAMILY_QWEN4EXP = 5,
     DS4_MODEL_FAMILY_GLM53 = 6,
+    /* mirrors ds4.c's DS4_MODEL_FAMILY_GEMMA_VQ and the Rust
+     * ModelFamily::GemmaVq (crates/ds4-core/src/shape.rs) */
+    DS4_MODEL_FAMILY_GEMMA_VQ = 16,
 } ds4_model_family;
 
 typedef enum {
@@ -40,6 +43,9 @@ typedef enum {
     /* value 16 mirrors the Rust enum (15 is IQuestQ1 upstream); the C engine
      * spells the same table DS4_SHAPE_V41_FLASH (core_shape_select.c:81) */
     DS4_VARIANT_V41 = 16,
+    /* mirrors ds4.c's DS4_VARIANT_GEMMA_VQ and the Rust
+     * Variant::GemmaVqFlash (crates/ds4-core/src/shape.rs) */
+    DS4_VARIANT_GEMMA_VQ = 19,
 } ds4_variant;
 
 typedef struct {
@@ -218,6 +224,26 @@ static const ds4_shape DS4_SHAPE_V41_FLASH = {
     .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
     .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+};
+
+/* The same table ds4.c spells DS4_SHAPE_GEMMA_VQ; the Rust half is
+ * crates/ds4-core/src/shape.rs SHAPE_GEMMA_VQ. The parity test compares all
+ * three, which is what keeps a hand-copied shape from drifting. */
+static const ds4_shape DS4_SHAPE_GEMMA_VQ = {
+    .name = "EmbeddingGemma-2 VQ",
+    .family = DS4_MODEL_FAMILY_GEMMA_VQ,
+    .variant = DS4_VARIANT_GEMMA_VQ,
+    .n_layer = 24,
+    .n_embd = 512, .n_vocab = 262144,
+    .n_head = 4, .n_head_kv = 2,
+    .n_head_dim = 256, .n_value_dim = 256, .n_rot = 256,
+    .n_ff_dense = 2048,
+    .n_swa = 1024, .n_swa_period = 6, .n_full_attn_count = 4,
+    .use_rope = true, .use_qk_norm = true,
+    .rms_eps = 1e-6f,
+    .rope_freq_base = 1000000.0f, .rope_freq_base_swa = 10000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_orig_ctx = UINT64_C(262144),
 };
 
 static const ds4_shape DS4_SHAPE_MOTIF3 = {
@@ -615,6 +641,7 @@ static const char *arch_route(const char *arch)
     if (strcmp(arch, "qwen4exp") == 0) return DS4_SHAPE_QWEN38_FLASH_NEXT.name;
     if (strcmp(arch, "glm5-next") == 0) return DS4_SHAPE_GLM53_FLASH.name;
     if (strcmp(arch, "k2-horizon") == 0) return DS4_SHAPE_K2_HORIZON_375B.name;
+    if (strcmp(arch, "gemma_vq") == 0) return DS4_SHAPE_GEMMA_VQ.name;
     return "unsupported";
 }
 
@@ -634,6 +661,7 @@ int main(void)
     dump_shape("GLM53", &DS4_SHAPE_GLM53_FLASH);
     dump_shape("K2HORIZON", &DS4_SHAPE_K2_HORIZON_375B);
     dump_shape("V41", &DS4_SHAPE_V41_FLASH);
+    dump_shape("GEMMAVQ", &DS4_SHAPE_GEMMA_VQ);
     printf("SELECT\tflash\t%s\n", select_name(&DS4_SHAPE_FLASH));
     printf("SELECT\tpro\t%s\n", select_name(&DS4_SHAPE_PRO));
     printf("SELECT\tv41\t%s\n", select_name(&DS4_SHAPE_V41_FLASH));
@@ -651,5 +679,6 @@ int main(void)
     printf("ARCH\tglm5-next\t%s\n", arch_route("glm5-next"));
     printf("ARCH\tk2-horizon\t%s\n", arch_route("k2-horizon"));
     printf("ARCH\tglm-dsa\t%s\n", arch_route("glm-dsa"));
+    printf("ARCH\tgemma_vq\t%s\n", arch_route("gemma_vq"));
     return 0;
 }

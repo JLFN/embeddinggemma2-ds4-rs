@@ -1961,6 +1961,9 @@ pub fn validate_file(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         ModelFamily::Ling31Vq => Err(ValidateError::Token(
             "Ling-3.1 VQ requires a complete release directory",
         )),
+        // The family's own metadata contract; the payload and directory checks
+        // ran earlier, in `crate::tensors::parse_one`.
+        ModelFamily::GemmaVq => crate::gemma_vq::validate_metadata(g, shape),
         ModelFamily::Qwen4Exp => validate_qwen4exp(g, shape),
         ModelFamily::Qwen35 => validate_qwen35(g, shape),
         ModelFamily::DeepSeek4 => validate_deepseek(g, shape),
@@ -2040,6 +2043,7 @@ pub fn dump_validate(path: &std::path::Path) -> String {
                         Variant::Glm53Flash => SHAPE_GLM53_FLASH,
                         Variant::Glm53FlashVq => crate::shape::SHAPE_GLM53_VQ,
                         Variant::Ling31FlashVq => crate::shape::SHAPE_LING31_VQ,
+                        Variant::GemmaVqFlash => crate::shape::SHAPE_GEMMA_VQ,
                         Variant::K2Horizon375B => SHAPE_K2_HORIZON_375B,
                         Variant::InklingSmall => crate::shape::SHAPE_INKLING_SMALL,
                         Variant::Step37Flash => crate::shape::SHAPE_STEP37_FLASH,

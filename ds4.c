@@ -67,6 +67,9 @@
 #endif
 /* Declarations only: every build sizes Ling-3.1 banks by its latent layout. */
 #include "ds4_ling31.h"
+/* Declarations only: the payload record table the host fills and the tier the
+ * recipe pins. The family's graph is phase 4 of embeddinggemma2-handoff.md. */
+#include "ds4_eg2vq.h"
 
 /* Keep the runtime-KV selection available to CPU-only placement/accounting
  * builds too.  ds4_gpu.h owns the same ABI enum in accelerator builds. */
@@ -381,6 +384,9 @@ typedef enum {
     DS4_MODEL_FAMILY_IQUEST      = 13,
     DS4_MODEL_FAMILY_GLM53_VQ    = 14,
     DS4_MODEL_FAMILY_LING31_VQ   = 15,
+    /* EmbeddingGemma-2 in its VQ artifact form; 16 mirrors the Rust
+     * ModelFamily::GemmaVq (crates/ds4-core/src/shape.rs). */
+    DS4_MODEL_FAMILY_GEMMA_VQ    = 16,
 } ds4_model_family;
 
 typedef enum {
@@ -405,6 +411,9 @@ typedef enum {
     DS4_VARIANT_V41             = 16,
     DS4_VARIANT_GLM53_FLASH_VQ  = 17,
     DS4_VARIANT_LING31_FLASH_VQ = 18,
+    /* EmbeddingGemma-2 VQ; 19 mirrors the Rust Variant::GemmaVqFlash
+     * (crates/ds4-core/src/shape.rs). */
+    DS4_VARIANT_GEMMA_VQ        = 19,
 } ds4_variant;
 
 typedef struct {
@@ -673,6 +682,29 @@ static const ds4_shape DS4_SHAPE_LING31_VQ = {
     .rms_eps = 1e-6f, .kda_l2_eps = 1e-6f, .kda_gate_clamp_min = -5.0f,
     .expert_weight_scale = 2.5f,
     .rope_freq_base = 6000000.0f, .rope_scale_factor = 1.0f,
+    .rope_orig_ctx = UINT64_C(262144),
+};
+
+/* EmbeddingGemma-2's text tower at width 512: a dense 24-layer encoder with
+ * four attention heads, two KV heads while sliding and one on the four
+ * full-attention layers, and no experts. Values are the artifact's own
+ * gemma_vq.* metadata; the Rust half of this table is
+ * crates/ds4-core/src/shape.rs SHAPE_GEMMA_VQ, and tests/parity/shape_c_oracle.c
+ * carries the third copy the parity test compares against. */
+static const ds4_shape DS4_SHAPE_GEMMA_VQ = {
+    .name = "EmbeddingGemma-2 VQ",
+    .family = DS4_MODEL_FAMILY_GEMMA_VQ,
+    .variant = DS4_VARIANT_GEMMA_VQ,
+    .n_layer = 24,
+    .n_embd = 512, .n_vocab = 262144,
+    .n_head = 4, .n_head_kv = 2,
+    .n_head_dim = 256, .n_value_dim = 256, .n_rot = 256,
+    .n_ff_dense = 2048,
+    .n_swa = 1024, .n_swa_period = 6, .n_full_attn_count = 4,
+    .use_rope = true, .use_qk_norm = true,
+    .rms_eps = 1e-6f,
+    .rope_freq_base = 1000000.0f, .rope_freq_base_swa = 10000.0f,
+    .rope_scale_factor = 1.0f,
     .rope_orig_ctx = UINT64_C(262144),
 };
 
@@ -2845,6 +2877,9 @@ static void model_apply_host_shape(void) {
         break;
     case DS4_VARIANT_LING31_FLASH_VQ:
         g_ds4_shape = DS4_SHAPE_LING31_VQ;
+        break;
+    case DS4_VARIANT_GEMMA_VQ:
+        g_ds4_shape = DS4_SHAPE_GEMMA_VQ;
         break;
     case DS4_VARIANT_QWEN35_27B:
         g_ds4_shape = DS4_SHAPE_QWEN35;
@@ -9738,6 +9773,7 @@ static void weights_bind_glm53(ds4_weights *w, const ds4_model *m) {
 
 #include "ds4_glmvq_bind.inc"
 #include "ds4_ling31_bind.inc"
+#include "ds4_eg2vq_bind.inc"
 
 static ds4_tensor *inkling_tensor(const ds4_model *m, const char *prefix,
                                   const char *suffix) {
@@ -10244,6 +10280,11 @@ static void weights_bind(
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LING31_VQ) {
         ling31_bind(w, m);
+        return;
+    }
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+        eg2vq_bind(w, m);
         return;
     }
 

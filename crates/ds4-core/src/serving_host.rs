@@ -1110,6 +1110,10 @@ fn family_native_limit(caps: ServingCaps) -> u32 {
         ModelFamily::Glm53 => GLM_NATIVE_MAX,
         ModelFamily::Glm53Vq => GLMVQ_NATIVE_MAX,
         ModelFamily::Ling31Vq => LING31_NATIVE_MAX,
+        // No measured chunk optimum yet: the encoder's native path is phase 7
+        // of embeddinggemma2-handoff.md, so the family takes the generic bound
+        // and the environment variable is the only thing that moves it.
+        ModelFamily::GemmaVq => FAMILY_NATIVE_MAX,
         ModelFamily::ExaoneMoe => FAMILY_NATIVE_MAX,
         ModelFamily::Motif3 => MOTIF_NATIVE_MAX,
         ModelFamily::Dots3Note => DOTS3_NATIVE_MAX,
@@ -1180,6 +1184,12 @@ fn family_native_chunk(caps: ServingCaps, ctx: u32) -> u32 {
             LING31_NATIVE_DEFAULT,
             1,
             LING31_NATIVE_MAX,
+        ),
+        ModelFamily::GemmaVq => env_u32(
+            "DS4_GEMMAVQ_PREFILL_CHUNK",
+            FAMILY_NATIVE_MAX,
+            1,
+            FAMILY_NATIVE_MAX,
         ),
         ModelFamily::ExaoneMoe => env_u32(
             EXAONE_PREFILL_CHUNK_ENV,

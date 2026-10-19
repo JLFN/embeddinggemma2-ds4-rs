@@ -13,6 +13,7 @@ mod bind;
 pub mod chat_template;
 mod dots3_mtp;
 mod engram;
+mod gemma_vq;
 mod gguf;
 mod glm_mtp;
 mod glm_vq;

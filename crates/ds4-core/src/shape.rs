@@ -34,6 +34,7 @@ pub enum ModelFamily {
     IQuestQ1 = 13,
     Glm53Vq = 14,
     Ling31Vq = 15,
+    GemmaVq = 16,
 }
 
 impl ModelFamily {
@@ -48,6 +49,7 @@ impl ModelFamily {
             "glm5-next" => Some(Self::Glm53),
             "glm5-next-vq" => Some(Self::Glm53Vq),
             "ling31_vq" => Some(Self::Ling31Vq),
+            "gemma_vq" => Some(Self::GemmaVq),
             "inkling" => Some(Self::Inkling),
             "step35" => Some(Self::Step37),
             "bailingmoe3" => Some(Self::Ling3Vl),
@@ -70,6 +72,7 @@ impl ModelFamily {
             Self::Glm53 => "glm5-next",
             Self::Glm53Vq => "glm5-next-vq",
             Self::Ling31Vq => "ling31_vq",
+            Self::GemmaVq => "gemma_vq",
             Self::Inkling => "inkling",
             Self::Step37 => "step35",
             Self::Ling3Vl => "bailingmoe3",
@@ -103,6 +106,7 @@ pub enum Variant {
     DeepSeek41Flash = 16,
     Glm53FlashVq = 17,
     Ling31FlashVq = 18,
+    GemmaVqFlash = 19,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -360,6 +364,7 @@ pub fn route_architecture(arch: Option<&[u8]>) -> ArchRoute {
         Some(b"naive_n05_flash") => ArchRoute::Fixed(Variant::NaiveN05Flash),
         Some(b"iquest_q1") => ArchRoute::Fixed(Variant::IQuestQ1),
         Some(b"ling31_vq") => ArchRoute::Fixed(Variant::Ling31FlashVq),
+        Some(b"gemma_vq") => ArchRoute::Fixed(Variant::GemmaVqFlash),
         Some(_) => ArchRoute::Unsupported,
     }
 }
@@ -385,6 +390,7 @@ pub fn shape_for_variant(v: Variant) -> Shape {
         Variant::IQuestQ1 => SHAPE_IQUEST_Q1,
         Variant::DeepSeek41Flash => SHAPE_V41_FLASH,
         Variant::Ling31FlashVq => SHAPE_LING31_VQ,
+        Variant::GemmaVqFlash => SHAPE_GEMMA_VQ,
     }
 }
 
@@ -411,6 +417,7 @@ pub fn dump_oracle() -> String {
     let _ = writeln!(out, "{}", SHAPE_GLM53_FLASH.dump_line("GLM53"));
     let _ = writeln!(out, "{}", SHAPE_K2_HORIZON_375B.dump_line("K2HORIZON"));
     let _ = writeln!(out, "{}", SHAPE_V41_FLASH.dump_line("V41"));
+    let _ = writeln!(out, "{}", SHAPE_GEMMA_VQ.dump_line("GEMMAVQ"));
 
     let flash = DeepSeekDims::from_shape(&SHAPE_FLASH);
     let pro = DeepSeekDims::from_shape(&SHAPE_PRO);
@@ -458,6 +465,7 @@ pub fn dump_oracle() -> String {
         ("glm5-next", Some(&b"glm5-next"[..])),
         ("k2-horizon", Some(&b"k2-horizon"[..])),
         ("glm-dsa", Some(&b"glm-dsa"[..])),
+        ("gemma_vq", Some(&b"gemma_vq"[..])),
     ] {
         let _ = writeln!(
             out,
@@ -1336,6 +1344,73 @@ pub(crate) const SHAPE_LING31_VQ: Shape = Shape {
     n_full_attn_count: 9,
     rope_orig_ctx: 262_144,
     ..SHAPE_LING30_FLASH_VL
+};
+
+/// EmbeddingGemma-2's text tower, as the artifact's own metadata declares it
+/// (`out/artifact-kv.txt`, keys under the `gemma_vq.` prefix): 24 layers,
+/// hidden 512, vocab 262144, 4 heads, 2 KV heads, sliding head dim 256 (the
+/// four full layers widen to 512), intermediate 2048, rms 1e-6, rope 1e6 over
+/// 256 rotated dimensions. There are no experts, so the FFN width is the dense
+/// one; the FFN is gated tanh-GELU rather than SwiGLU, so no clamp applies.
+pub(crate) const SHAPE_GEMMA_VQ: Shape = Shape {
+    name: "EmbeddingGemma-2 VQ",
+    family: ModelFamily::GemmaVq,
+    variant: Variant::GemmaVqFlash,
+    n_layer: 24,
+    n_embd: 512,
+    n_vocab: 262_144,
+    n_head: 4,
+    n_head_kv: 2,
+    n_noise_head: 0,
+    n_head_dim: 256,
+    n_value_dim: 256,
+    n_rot: 256,
+    n_out_group: 0,
+    n_lora_q: 0,
+    n_lora_o: 0,
+    n_expert: 0,
+    n_expert_used: 0,
+    n_expert_shared: 0,
+    n_ff_exp: 0,
+    n_ff_dense: 2048,
+    n_ff_shexp: 0,
+    n_hash_layer: 0,
+    // The file's own sliding window (the converter doubles the checkpoint's
+    // one-sided 512, conversion/gemma.py:824-825), and the checkpoint's
+    // 5-sliding/1-full `layer_types` pattern: a full layer every sixth one.
+    n_swa: 1024,
+    n_swa_period: 6,
+    n_indexer_head: 0,
+    n_indexer_head_dim: 0,
+    n_indexer_top_k: 0,
+    n_hc: 0,
+    n_hc_sinkhorn_iter: 0,
+    n_nextn_predict: 0,
+    n_leading_dense: 0,
+    n_kv_lora: 0,
+    n_key_mla: 0,
+    n_value_mla: 0,
+    n_swa_head: 0,
+    n_swa_kv_lora: 0,
+    n_swa_key_mla: 0,
+    n_full_attn_count: 4,
+    n_kda_head_dim: 0,
+    n_ssm_conv: 0,
+    use_rope: true,
+    use_qk_norm: true,
+    rms_eps: 1.0e-6,
+    kda_l2_eps: 0.0,
+    kda_gate_clamp_min: 0.0,
+    hc_eps: 0.0,
+    expert_weight_scale: 0.0,
+    swiglu_clamp_exp: 0.0,
+    rope_freq_base: 1.0e6,
+    rope_freq_base_swa: 1.0e4,
+    rope_scale_factor: 1.0,
+    rope_yarn_beta_fast: 0.0,
+    rope_yarn_beta_slow: 0.0,
+    compress_rope_freq_base: 0.0,
+    rope_orig_ctx: 262_144,
 };
 
 // Naive shares GQA dimensions, but replaces all nine global layers with DSA.

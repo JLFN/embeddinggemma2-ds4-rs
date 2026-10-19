@@ -360,6 +360,9 @@ fn write_family(family: ModelFamily) -> PathBuf {
         | ModelFamily::Glm53Vq => {
             panic!("this family uses a dedicated upstream tokenizer oracle")
         }
+        // No tokenizer port, so no oracle to compare against either
+        // (embeddinggemma2-handoff.md PHASE 4 owns it).
+        ModelFamily::GemmaVq => panic!("gemma_vq has no tokenizer yet"),
         ModelFamily::Glm53 => {
             let mut b = Builder::with_bytes().with_he();
             let bos = b.push_str("[gMASK]", 3);
@@ -606,6 +609,9 @@ fn family_cases(family: ModelFamily) {
         | ModelFamily::Glm53Vq => {
             panic!("this family uses a dedicated upstream tokenizer oracle")
         }
+        // No tokenizer port, so no oracle to compare against either
+        // (embeddinggemma2-handoff.md PHASE 4 owns it).
+        ModelFamily::GemmaVq => panic!("gemma_vq has no tokenizer yet"),
         ModelFamily::Glm53 => {
             encodes.extend(["12345", "HelloWorld", "안녕하세요"]);
             renders.push("[gMASK]<sop><|user|>hello<|assistant|>".into());
@@ -722,6 +728,9 @@ fn family_cases(family: ModelFamily) {
         | ModelFamily::Glm53Vq => {
             panic!("this family uses a dedicated upstream tokenizer oracle")
         }
+        // No tokenizer port, so no oracle to compare against either
+        // (embeddinggemma2-handoff.md PHASE 4 owns it).
+        ModelFamily::GemmaVq => panic!("gemma_vq has no tokenizer yet"),
         ModelFamily::SolarOpen2 => {
             let mut missing = vocab.clone();
             missing.tool_response_start_id = -1;

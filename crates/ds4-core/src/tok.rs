@@ -362,6 +362,17 @@ impl Vocab {
 
     fn load_specials(&mut self, g: &GgufFile) -> Result<(), TokError> {
         match self.family {
+            // The artifacts load and validate without a tokenizer (phase 3 of
+            // embeddinggemma2-handoff.md); the port itself is PHASE 4's named
+            // deliverable, patterned on tok/ling31.rs, and is measured there
+            // against the anchor's per-item token counts. Until it lands this
+            // family refuses by name, so nothing tokenizes Gemma text with
+            // another model's rules.
+            ModelFamily::GemmaVq => {
+                return Err(TokError::InvalidTokenizer(
+                    "gemma_vq tokenizer is not ported yet (handoff PHASE 4)",
+                ))
+            }
             ModelFamily::Inkling => inkling::specials(self)?,
             ModelFamily::Step37 => step37::specials(self, g)?,
             ModelFamily::Ling3Vl => ling3vl::specials(self, g)?,
@@ -2315,6 +2326,11 @@ fn bpe_tokenize_text(vocab: &Vocab, text: &[u8], out: &mut Vec<i32>) {
             let normalized: String = text.nfc().collect();
             bpe_tokenize_text_solar(vocab, normalized.as_bytes(), out);
         }
+        // Unreachable: no `Vocab` of this family can be built while
+        // `load_specials` refuses it (handoff PHASE 4 owns the pre-tokenizer,
+        // which the reference pins to "gemma4": newline split over raw UTF-8
+        // with escaped spaces, llama-vocab.cpp:528-536 and :2275).
+        ModelFamily::GemmaVq => debug_assert!(false, "gemma_vq has no tokenizer yet"),
         ModelFamily::Mimo2 | ModelFamily::NaiveN05 => mimo2::encode(vocab, text, out),
         ModelFamily::Glm53 | ModelFamily::Glm53Vq => bpe_tokenize_text_glm4(vocab, text, out),
         ModelFamily::Motif3 => bpe_tokenize_text_motif3(vocab, text, out),

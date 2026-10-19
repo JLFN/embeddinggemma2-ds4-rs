@@ -992,6 +992,7 @@ pub fn bind_names(shape: &Shape) -> Vec<BindName> {
     match shape.family {
         ModelFamily::Glm53Vq => return layout_names(crate::glm_vq::layouts()),
         ModelFamily::Ling31Vq => return layout_names(crate::ling31_vq::layouts()),
+        ModelFamily::GemmaVq => return layout_names(crate::gemma_vq::layouts()),
         ModelFamily::Glm53 => {
             req(&mut out, "token_embd.weight");
             req(&mut out, "output_norm.weight");
@@ -1505,6 +1506,7 @@ pub fn variant_from_bind_name(s: &str) -> Option<Variant> {
         "qwen35" => Some(Variant::Qwen35_27B),
         "naive-n05-flash" => Some(Variant::NaiveN05Flash),
         "iquest-q1" => Some(Variant::IQuestQ1),
+        "gemma_vq" => Some(Variant::GemmaVqFlash),
         _ => None,
     }
 }

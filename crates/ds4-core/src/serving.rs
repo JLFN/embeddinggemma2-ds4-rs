@@ -22,6 +22,9 @@ pub const PREFILL_CHUNK_FENCE: u32 = 8192;
 /// 0 is the C one-shot / interleave-off sentinel, not a member of this set.
 pub const VERIFIED_PREFILL_CHUNKS: [u32; 6] = [256, 512, 1024, 2048, 4096, 8192];
 const GLM_CTX_MAX: u32 = 1_048_576;
+/// EmbeddingGemma-2's `max_position_embeddings`, the artifact's own
+/// `gemma_vq.context_length` (`out/artifact-kv.txt`).
+const GEMMA_CTX_MAX: u32 = 262_144;
 /// Ling-3.1's max_position_embeddings (rope_scaling null).
 const LING31_CTX_MAX: u32 = 262_144;
 const GLM_QUALIFIED_CTX: u32 = 2048;
@@ -781,6 +784,30 @@ pub fn serving_caps(family: ModelFamily, variant: Variant) -> ServingCaps {
             qualified_prompt: None,
             media_serial: false,
         },
+        // An encoder, not a decode session: no KV banks, no speculation, no
+        // disk store, no snapshots, either backend hosting it. The embeddings
+        // entry point is phase 6 of embeddinggemma2-handoff.md; the caps state
+        // what exists today rather than what is planned.
+        ModelFamily::GemmaVq => ServingCaps {
+            family,
+            variant,
+            banks: BankLane::Serial,
+            bank_support: Support::None,
+            reuse: ReuseKind::Partial,
+            reuse_support: Support::Present,
+            disk: Support::None,
+            snapshot: Support::None,
+            mtp: MtpKind::None,
+            mtp_support: Support::None,
+            spec_lane: SpecLane::None,
+            spec_draft_min: 1,
+            host: HostNeed::Any,
+            ctx_max: Some(GEMMA_CTX_MAX),
+            qualified_ctx: None,
+            qualified_banks: None,
+            qualified_prompt: None,
+            media_serial: false,
+        },
         ModelFamily::NaiveN05 => ServingCaps {
             family,
             variant,
@@ -1511,6 +1538,7 @@ impl ServingCaps {
             Variant::Glm53Flash => "glm5-next",
             Variant::Glm53FlashVq => "GLM-5.3-Flash-VQ",
             Variant::Ling31FlashVq => "ling31_vq",
+            Variant::GemmaVqFlash => "gemma_vq",
             Variant::K2Horizon375B => "k2-horizon",
             Variant::InklingSmall => "inkling",
             Variant::Step37Flash => "step35",
