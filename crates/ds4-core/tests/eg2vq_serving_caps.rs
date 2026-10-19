@@ -75,8 +75,10 @@ fn batch_row_budget_costs_what_the_layout_charges() {
     // The workspace layout (`ds4_eg2vq_gpu.cuh:72-99`) is linear in rows: 27,136
     // f32 planes per row plus that row's 4-byte id. The measured cross-check is
     // docs/eg2vq-device-gate7.txt:407-411, where max_tokens 2048 reads 212.01 MiB
-    // (2048 x 108,548 B = 212.0086 MiB). The constant is a policy, so what is
-    // asserted here is the arithmetic a reader relies on, not the policy.
+    // (2048 x 108,548 B = 222,306,304 B = 212.0078 MiB; the QA pass for unit 20
+    // corrected the 212.0086 this comment first carried). The constant is a
+    // policy, so what is asserted here is the arithmetic a reader relies on, not
+    // the policy.
     const PER_ROW: u64 = 4 + 27_136 * 4;
     assert_eq!(PER_ROW, 108_548, "the per-row workspace charge changed");
     let rows = u64::from(ds4_core::GEMMA_VQ_BATCH_ROWS_MAX);

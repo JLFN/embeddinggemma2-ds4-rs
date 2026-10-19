@@ -1616,15 +1616,21 @@ fn run_embed<W: TerminalSink>(
                 );
             }
             if total_tokens > caps.batch_rows_max as usize {
+                // The wording matters and was corrected after the unit-20 QA pass:
+                // the total is what the request has TOKENIZED so far, and the item
+                // that crossed the budget is the last one counted -- the earlier
+                // text said "the N inputs add up to X" with N the request's whole
+                // input count and X the partial sum, which reads as arithmetic
+                // that does not hold.
                 return embed_refuse(
                     out,
                     cfg,
                     &format!(
-                        "the {} inputs add up to {total_tokens} tokens, past the {}-token budget \
-                         of one embedding call (GET /health reports embed.batch_rows_max); \
-                         split the request",
-                        embed.inputs.len(),
-                        caps.batch_rows_max
+                        "input[{i}] crosses this model's {}-token budget for one embedding \
+                         call: the request's first {} inputs already add up to {total_tokens} \
+                         tokens (GET /health reports embed.batch_rows_max); split the request",
+                        caps.batch_rows_max,
+                        i + 1
                     ),
                 );
             }
