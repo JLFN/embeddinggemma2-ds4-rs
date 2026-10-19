@@ -2174,6 +2174,16 @@ tests/test_glm_vq_q4p: tests/test_glm_vq_q4p.cu cuda/glm_vq_q4p.cuh cuda/glm_vq_
 test-glm-vq-q4p: tests/test_glm_vq_q4p
 	./tests/test_glm_vq_q4p
 
+# embeddinggemma2 PHASE 7 row P3.1: the dim-4 DQVQ device GEMM against the
+# vendored decoder and FP64.  Its own target so the gemma_vq device path can be
+# gated without building the tree's other CUDA tests.
+tests/test_eg2vq_vq: tests/test_eg2vq_vq.cu cuda/eg2vq_vq.cuh ds41_vq_fmt.h
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
+
+.PHONY: test-eg2vq-vq
+test-eg2vq-vq: tests/test_eg2vq_vq
+	./tests/test_eg2vq_vq
+
 tests/test_glm_vq_kda: tests/test_glm_vq_kda.cu cuda/glm_vq_kda.cuh cuda/glm_vq_ops.cuh
 	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
 
