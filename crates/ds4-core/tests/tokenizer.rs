@@ -360,9 +360,11 @@ fn write_family(family: ModelFamily) -> PathBuf {
         | ModelFamily::Glm53Vq => {
             panic!("this family uses a dedicated upstream tokenizer oracle")
         }
-        // No tokenizer port, so no oracle to compare against either
-        // (embeddinggemma2-handoff.md PHASE 4 owns it).
-        ModelFamily::GemmaVq => panic!("gemma_vq has no tokenizer yet"),
+        // The gemma4 pre-tokenizer is host-side only: it has no C counterpart in
+        // this tree, by design (ds4.c has no gemma splitter and the Rust host is
+        // the only tokenizer for this family). Its oracle is llama.cpp's own
+        // dump, measured over the frozen item set by tools/eg2_tok_check.sh.
+        ModelFamily::GemmaVq => panic!("gemma_vq tokenizes on the host; the C oracle has no gemma4 splitter"),
         ModelFamily::Glm53 => {
             let mut b = Builder::with_bytes().with_he();
             let bos = b.push_str("[gMASK]", 3);
@@ -609,9 +611,11 @@ fn family_cases(family: ModelFamily) {
         | ModelFamily::Glm53Vq => {
             panic!("this family uses a dedicated upstream tokenizer oracle")
         }
-        // No tokenizer port, so no oracle to compare against either
-        // (embeddinggemma2-handoff.md PHASE 4 owns it).
-        ModelFamily::GemmaVq => panic!("gemma_vq has no tokenizer yet"),
+        // The gemma4 pre-tokenizer is host-side only: it has no C counterpart in
+        // this tree, by design (ds4.c has no gemma splitter and the Rust host is
+        // the only tokenizer for this family). Its oracle is llama.cpp's own
+        // dump, measured over the frozen item set by tools/eg2_tok_check.sh.
+        ModelFamily::GemmaVq => panic!("gemma_vq tokenizes on the host; the C oracle has no gemma4 splitter"),
         ModelFamily::Glm53 => {
             encodes.extend(["12345", "HelloWorld", "안녕하세요"]);
             renders.push("[gMASK]<sop><|user|>hello<|assistant|>".into());
@@ -728,9 +732,11 @@ fn family_cases(family: ModelFamily) {
         | ModelFamily::Glm53Vq => {
             panic!("this family uses a dedicated upstream tokenizer oracle")
         }
-        // No tokenizer port, so no oracle to compare against either
-        // (embeddinggemma2-handoff.md PHASE 4 owns it).
-        ModelFamily::GemmaVq => panic!("gemma_vq has no tokenizer yet"),
+        // The gemma4 pre-tokenizer is host-side only: it has no C counterpart in
+        // this tree, by design (ds4.c has no gemma splitter and the Rust host is
+        // the only tokenizer for this family). Its oracle is llama.cpp's own
+        // dump, measured over the frozen item set by tools/eg2_tok_check.sh.
+        ModelFamily::GemmaVq => panic!("gemma_vq tokenizes on the host; the C oracle has no gemma4 splitter"),
         ModelFamily::SolarOpen2 => {
             let mut missing = vocab.clone();
             missing.tool_response_start_id = -1;

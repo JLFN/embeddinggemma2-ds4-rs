@@ -12,6 +12,7 @@ use crate::gguf::{GgufError, GgufFile, GGUF_VALUE_INT32, GGUF_VALUE_STRING, GGUF
 use crate::shape::ModelFamily;
 use crate::TokenBuffer;
 
+mod gemma_vq;
 mod glm_vq;
 mod inkling;
 mod ling31;
@@ -91,6 +92,13 @@ pub struct Vocab {
     user_defined_max_len: u32,
     user_defined_first: [bool; 256],
     motif3_added_first: [bool; 256],
+    /// The `gemma4` special-token cache: every token llama.cpp gives the
+    /// CONTROL attribute, plus the EOG-by-text overrides that land on this
+    /// vocabulary (`llama-vocab.cpp:3026-3054` then `:3168-3191`), sorted by
+    /// descending text length exactly as `cache_special_tokens` is. The
+    /// pre-tokenizer partitions raw text on this list before any BPE
+    /// (`:3401-3500`). Empty for every other family.
+    gemma_specials: Vec<(Vec<u8>, i32)>,
     pub bos_id: i32,
     pub eos_id: i32,
     pub system_id: i32,
@@ -316,6 +324,7 @@ impl Vocab {
             user_defined_max_len,
             user_defined_first,
             motif3_added_first,
+            gemma_specials: Vec::new(),
             /* C vocab_load: memset 0, then the same -1 defaults. Solar /
              * EXAONE leave end_of_turn_id at 0; do not "fix" it to -1. */
             bos_id: 0,
@@ -363,16 +372,10 @@ impl Vocab {
     fn load_specials(&mut self, g: &GgufFile) -> Result<(), TokError> {
         match self.family {
             // The artifacts load and validate without a tokenizer (phase 3 of
-            // embeddinggemma2-handoff.md); the port itself is PHASE 4's named
-            // deliverable, patterned on tok/ling31.rs, and is measured there
-            // against the anchor's per-item token counts. Until it lands this
-            // family refuses by name, so nothing tokenizes Gemma text with
-            // another model's rules.
-            ModelFamily::GemmaVq => {
-                return Err(TokError::InvalidTokenizer(
-                    "gemma_vq tokenizer is not ported yet (handoff PHASE 4)",
-                ))
-            }
+            // embeddinggemma2-handoff.md); phase 4 landed the port itself,
+            // patterned on tok/ling31.rs: the `gemma4` pre-tokenizer and the
+            // family's BPE, measured against the anchor's own token ids.
+            ModelFamily::GemmaVq => gemma_vq::specials(self, g)?,
             ModelFamily::Inkling => inkling::specials(self)?,
             ModelFamily::Step37 => step37::specials(self, g)?,
             ModelFamily::Ling3Vl => ling3vl::specials(self, g)?,
@@ -734,6 +737,13 @@ impl Vocab {
             )),
             ModelFamily::Ling31Vq => Some(TokError::InvalidTokenizer(
                 "Ling-3.1-flash VQ chat requires official Jinja",
+            )),
+            // The embeddings family: its route is text in, one vector out, and
+            // its GGUF chat template is the multimodal one this port does not
+            // render. Refusing by name keeps the legacy builder from emitting a
+            // plausible-looking conversation for a model that has no chat pair.
+            ModelFamily::GemmaVq => Some(TokError::InvalidTokenizer(
+                "gemma_vq has no chat template port (an embeddings family)",
             )),
             _ => None,
         }
@@ -2326,11 +2336,10 @@ fn bpe_tokenize_text(vocab: &Vocab, text: &[u8], out: &mut Vec<i32>) {
             let normalized: String = text.nfc().collect();
             bpe_tokenize_text_solar(vocab, normalized.as_bytes(), out);
         }
-        // Unreachable: no `Vocab` of this family can be built while
-        // `load_specials` refuses it (handoff PHASE 4 owns the pre-tokenizer,
-        // which the reference pins to "gemma4": newline split over raw UTF-8
-        // with escaped spaces, llama-vocab.cpp:528-536 and :2275).
-        ModelFamily::GemmaVq => debug_assert!(false, "gemma_vq has no tokenizer yet"),
+        // The `gemma4` pre-tokenizer: partition on the specials, escape spaces
+        // to U+2581, split on newline runs, then BPE over raw UTF-8 with no
+        // GPT-2 byte encoding (llama-vocab.cpp:528-536, :3652-3654).
+        ModelFamily::GemmaVq => gemma_vq::encode(vocab, text, out),
         ModelFamily::Mimo2 | ModelFamily::NaiveN05 => mimo2::encode(vocab, text, out),
         ModelFamily::Glm53 | ModelFamily::Glm53Vq => bpe_tokenize_text_glm4(vocab, text, out),
         ModelFamily::Motif3 => bpe_tokenize_text_motif3(vocab, text, out),

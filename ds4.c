@@ -2594,7 +2594,7 @@ struct ds4_tensor {
     ds4_tensor *source_scale; /* Original FP8's multiplicative F32 blocks. */
 };
 
-typedef struct {
+typedef struct ds4_model {
     int fd;
     const uint8_t *map;
     uint64_t size;
@@ -5505,7 +5505,7 @@ typedef struct {
     ds4_tensor *down[LING31_EXPERTS];
 } ds4_ling31_experts;
 
-typedef struct {
+typedef struct ds4_weights {
     ds4_tensor *token_embd;
     ds4_tensor *output_hc_base;
     ds4_tensor *output_hc_fn;
@@ -5515,6 +5515,7 @@ typedef struct {
     ds4_layer_weights layer[DS4_MAX_LAYER];
     ds4_glmvq_experts *glmvq; /* Allocated only for the named GVQ1 family. */
     ds4_ling31_experts *ling31; /* Ling-3.1 VQ layers 4-72; glmvq_gpu is its plan. */
+    ds4_eg2vq_weights *eg2vq;  /* EmbeddingGemma-2 text tower (gemma_vq, phase 4). */
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__)
     ds4_gvq_model *glmvq_gpu;
 #endif
@@ -70125,6 +70126,11 @@ static void ds4_ref_rope(float *x, uint32_t n_rot, const uint32_t *p3) {
 static float ds4_ref_softplus(float x) {
     return x > 20.0f ? x : log1pf(expf(x));
 }
+
+/* The EmbeddingGemma-2 text tower, beside its bind adapter.  Placed here so it
+ * can call ds4_ref_row (ds4.c:69949), ref_row_dot (:69940) and
+ * ds4_parallel_for (:2291), the reference path's own idioms. */
+#include "ds4_eg2vq_graph.inc"
 
 /* =========================================================================
  * Bonsai (qwen35) CPU reference

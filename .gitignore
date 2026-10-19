@@ -58,6 +58,7 @@
 /tests/parity/load_c_oracle
 /tests/parity/validate_c_oracle
 /tests/parity/vocab_c_oracle
+/tests/parity/eg2vq_embd_c_oracle
 /tests/parity/agent_c_oracle
 /scratch/
 /naive-n05-flash-spark-handoff/

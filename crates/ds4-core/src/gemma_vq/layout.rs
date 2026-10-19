@@ -97,9 +97,11 @@ fn index_bits(nc: u64) -> u64 {
 /// size allocator share (`/data/YoungAi/gguf-tools/quantize/vq_qc_bytes.h:15`
 /// and `:20`):
 ///
-///     16 + nc*dim*2 + rows*2 + idx_bytes
-///     idx_bytes = nidx when the index width is exactly 8 bits,
-///                 (nidx*bits + 7)/8 + 1 otherwise
+/// ```text
+/// 16 + nc*dim*2 + rows*2 + idx_bytes
+/// idx_bytes = nidx when the index width is exactly 8 bits,
+///             (nidx*bits + 7)/8 + 1 otherwise
+/// ```
 ///
 /// The `+ 1` is the guard byte the decoder's 3-byte window read needs at the
 /// tail (`ds41_vq_fmt.h:97`).
