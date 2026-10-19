@@ -311,3 +311,86 @@ static void eg2vq_bind_artifact(ds4_weights *w, const ds4_model *m) {
         cursor += (uint64_t)mx->rows * (uint64_t)mx->cols;
     }
 }
+
+/* ---------------------------------------------------------------------- *
+ * The device plan's two tables (embeddinggemma2-handoff.md PHASE 7, P3.3 step 2).
+ *
+ * The device path consumes the artifact's own payload bytes (ds4_eg2vq_gpu.cuh),
+ * so this leg exists for the VQ artifact: a file whose tower bound through the
+ * phase-1a baseline leg -- plain bf16 matrices, and a bf16 token table the device
+ * gather does not read -- has no device plan, and 0 says exactly that rather than
+ * handing the adapter a table it would have to refuse slot by slot.
+ *
+ * `records` receives DS4_EG2VQ_REC_N payload spans in DS4_EG2VQ_REC_* order and
+ * `aux` DS4_EG2VQ_AUX_N vectors in DS4_EG2VQ_AUX_* order; both arrays are the
+ * caller's, sized by those two constants.  A payload's byte span is its rank-1
+ * dim[0] -- the length the binder itself checks against the payload account
+ * (ds4_eg2vq_bind.inc:82) -- and a plain vector's is the tensor's byte count.
+ * ---------------------------------------------------------------------- */
+static int eg2vq_device_tables(const ds4_model *m, const ds4_weights *w,
+                               ds4_eg2vq_record *records, ds4_eg2vq_aux *aux) {
+    const ds4_eg2vq_weights *g = w ? w->eg2vq : NULL;
+    if (!g || !g->dense || !records || !aux) { return 0; }
+    if (!model_find_tensor(m, "language_model.embed_tokens.weight")) { return 0; }
+    memset(records, 0, sizeof(*records) * (size_t)DS4_EG2VQ_REC_N);
+    memset(aux, 0, sizeof(*aux) * (size_t)DS4_EG2VQ_AUX_N);
+
+    uint32_t n = 0;
+#define EG2VQ_REC(field) do { \
+        const ds4_eg2vq_matrix *mx = &(field); \
+        records[n].offset = mx->tensor->abs_offset; \
+        records[n].bytes = mx->tensor->dim[0]; \
+        records[n].type = mx->tensor->type; \
+        records[n].rows = mx->rows; \
+        records[n].cols = mx->cols; \
+        n++; \
+    } while (0)
+    EG2VQ_REC(g->per_layer_model_proj);
+    for (uint32_t il = 0; il < DS4_EG2VQ_N_LAYER; il++) {
+        const ds4_eg2vq_layer *l = &g->layer[il];
+        EG2VQ_REC(l->q);
+        EG2VQ_REC(l->k);
+        EG2VQ_REC(l->v);
+        EG2VQ_REC(l->o);
+        EG2VQ_REC(l->ffn_gate);
+        EG2VQ_REC(l->ffn_up);
+        EG2VQ_REC(l->ffn_down);
+        EG2VQ_REC(l->ple_gate);
+        EG2VQ_REC(l->ple_proj);
+    }
+#undef EG2VQ_REC
+    if (n != (uint32_t)DS4_EG2VQ_REC_N) { return 0; }
+
+#define EG2VQ_AUX(slot, field, rows_, cols_) do { \
+        const ds4_tensor *t = (field); \
+        aux[slot].host = tensor_data(m, t); \
+        aux[slot].bytes = t->bytes; \
+        aux[slot].row_type = t->type; \
+        aux[slot].rows = (rows_); \
+        aux[slot].cols = (cols_); \
+    } while (0)
+#define EG2VQ_AUX_IL(il, sub, field, cols_) \
+    EG2VQ_AUX((uint32_t)DS4_EG2VQ_AUX_LAYER_BASE + (il) * (uint32_t)DS4_EG2VQ_AUX_LAYER_STRIDE + (sub), \
+              field, 1u, cols_)
+
+    EG2VQ_AUX(DS4_EG2VQ_AUX_OUTPUT_NORM, g->output_norm, 1u, DS4_EG2VQ_N_EMBD);
+    EG2VQ_AUX(DS4_EG2VQ_AUX_PLE_NORM, g->per_layer_proj_norm, 1u, DS4_EG2VQ_PER_LAYER);
+    EG2VQ_AUX(DS4_EG2VQ_AUX_OUTPUT, g->output, DS4_EG2VQ_N_OUT, DS4_EG2VQ_N_EMBD);
+    EG2VQ_AUX(DS4_EG2VQ_AUX_TOKEN_EMBD, g->token_embd,
+              (uint32_t)g->token_embd->dim[1], (uint32_t)g->token_embd->dim[0]);
+    for (uint32_t il = 0; il < DS4_EG2VQ_N_LAYER; il++) {
+        const ds4_eg2vq_layer *l = &g->layer[il];
+        const uint32_t hd = ds4_eg2vq_head_dim(il);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_INPUT_NORM, l->input_norm, DS4_EG2VQ_N_EMBD);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_ATTN_POST, l->attn_post_norm, DS4_EG2VQ_N_EMBD);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_FFN_NORM, l->ffn_norm, DS4_EG2VQ_N_EMBD);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_FFN_POST, l->ffn_post_norm, DS4_EG2VQ_N_EMBD);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_PLE_POST, l->ple_post_norm, DS4_EG2VQ_N_EMBD);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_Q_NORM, l->q_norm, hd);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_K_NORM, l->k_norm, hd);
+        EG2VQ_AUX_IL(il, DS4_EG2VQ_AUX_L_SCALAR, l->layer_scalar, 1u);
+    }
+#undef EG2VQ_AUX_IL
+#undef EG2VQ_AUX
+    return 1;
+}

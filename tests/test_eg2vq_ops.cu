@@ -326,6 +326,112 @@ int main(void) {
         cudaFree(dh); cudaFree(dnw); cudaFree(dy); cudaFree(dw);
     }
 
+    /* ---- the IEEE half widening (P3.3 step 2) ------------------------------- */
+    // Every one of the 65,536 patterns against the format's definition: a
+    // subnormal is m * 2^-24, a normal 2^(e-15) * (1 + m/1024).  Both the
+    // adapter's host-side widening and the device's __half2float are checked:
+    // the two must agree with the format and with each other, because the CPU
+    // path's vendored decoder halves subnormals (ds41_vq_fmt.h:38-43) and the
+    // device deliberately follows the file instead.
+    {
+        uint32_t bad_host = 0, bad_dev = 0, nan_inf = 0;
+        double worst = 0.0;
+        for (uint32_t u = 0; u < 65536u; u++) {
+            const uint32_t e = (u >> 10) & 31u, m = u & 1023u;
+            if (e == 31u) { nan_inf++; continue; }
+            const double mag = (e == 0u)
+                ? (double)m * pow(2.0, -24.0)
+                : pow(2.0, (double)e - 15.0) * (1.0 + (double)m / 1024.0);
+            const double want = (u & 0x8000u) ? -mag : mag;
+            const float host = eg2vq_ops_half_to_f32((uint16_t)u);
+            const float dev = __half2float(__ushort_as_half((unsigned short)u));
+            // Both values are exactly representable in f32, so this is bit
+            // equality -- and bit equality is also what catches -0.0.
+            const float wf = (float)want;
+            uint32_t hb, db, wb;
+            memcpy(&hb, &host, 4); memcpy(&db, &dev, 4); memcpy(&wb, &wf, 4);
+            if (hb != wb) { bad_host++; const double d = fabs((double)host - want); if (d > worst) { worst = d; } }
+            if (db != wb) { bad_dev++; }
+        }
+        printf("%-40s %u/65536 exact host, %u exact device (%u nan/inf skipped), worst |diff| %.3e   %s\n",
+               "half -> f32 (IEEE, all patterns)", 65536u - nan_inf - bad_host, 65536u - nan_inf - bad_dev,
+               nan_inf, worst, (bad_host || bad_dev) ? "OUT OF BOUND" : "ok");
+        if (bad_host || bad_dev) { fails++; }
+    }
+
+    /* ---- whole-row scale and add (P3.3 step 2) ------------------------------ */
+    {
+        const uint64_t sizes[3] = {(uint64_t)184 * 512u, (uint64_t)1414 * 512u, (uint64_t)768};
+        for (uint64_t n : sizes) {
+            std::vector<float> x((size_t)n), want((size_t)n);
+            for (float &v : x) { v = nd(rng); }
+            want = x;
+            const float s = 0.013f;                         // graph:335, a layer scalar's magnitude
+            for (float &v : want) { v *= s; }
+            float *dx = NULL;
+            CK(cudaMalloc(&dx, x.size() * 4));
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            if (!eg2vq_ops_scale(dx, s, n)) { printf("FAIL: the scale launcher refused n=%llu\n", (unsigned long long)n); fails++; }
+            CK(cudaDeviceSynchronize());
+            std::vector<float> got(x.size());
+            CK(cudaMemcpy(got.data(), dx, got.size() * 4, cudaMemcpyDeviceToHost));
+            char tag[64];
+            snprintf(tag, sizeof(tag), "scale x*%.3f, n=%llu", (double)s, (unsigned long long)n);
+            double ma; const double r = rel_rms(got, want, &ma); fails += report(tag, r, ma, 1e-7);
+            // and the add of the same shape
+            std::vector<float> dst = x;
+            for (float &v : dst) { v = nd(rng); }
+            std::vector<float> want2 = dst;
+            for (size_t i = 0; i < want2.size(); i++) { want2[i] += x[i]; }
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            float *dd = NULL;
+            CK(cudaMalloc(&dd, dst.size() * 4));
+            CK(cudaMemcpy(dd, dst.data(), dst.size() * 4, cudaMemcpyHostToDevice));
+            if (!eg2vq_ops_add(dd, dx, n)) { printf("FAIL: the add launcher refused n=%llu\n", (unsigned long long)n); fails++; }
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(got.data(), dd, got.size() * 4, cudaMemcpyDeviceToHost));
+            snprintf(tag, sizeof(tag), "add dst+=src, n=%llu", (unsigned long long)n);
+            const double r2 = rel_rms(got, want2, &ma); fails += report(tag, r2, ma, 1e-7);
+            cudaFree(dd);
+            cudaFree(dx);
+        }
+    }
+
+    /* ---- the PLE gate: gelu(gate) * a 512-slice of the per-layer input ------ */
+    {
+        const uint32_t n_tok = 184, pl = 512, n_layer = 24, il = 7;
+        std::vector<float> g((size_t)n_tok * pl), ple((size_t)n_tok * pl * n_layer), want;
+        for (float &v : g) { v = nd(rng); }
+        for (float &v : ple) { v = nd(rng); }
+        want.resize(g.size());
+        for (uint32_t t = 0; t < n_tok; t++) {
+            for (uint32_t j = 0; j < pl; j++) {
+                const float x = g[(size_t)t * pl + j];
+                const float gl = 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
+                want[(size_t)t * pl + j] = gl * ple[((size_t)t * n_layer + il) * pl + j];
+            }
+        }
+        float *dg = NULL, *dp = NULL;
+        CK(cudaMalloc(&dg, g.size() * 4)); CK(cudaMalloc(&dp, ple.size() * 4));
+        CK(cudaMemcpy(dg, g.data(), g.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dp, ple.data(), ple.size() * 4, cudaMemcpyHostToDevice));
+        if (!eg2vq_ops_gelu_mul_strided(dg, dp, n_tok, pl, (uint64_t)pl * n_layer, (uint64_t)il * pl)) {
+            printf("FAIL: the strided gelu-mul launcher refused the shape\n");
+            fails++;
+        }
+        CK(cudaDeviceSynchronize());
+        std::vector<float> got(g.size());
+        CK(cudaMemcpy(got.data(), dg, got.size() * 4, cudaMemcpyDeviceToHost));
+        double ma; const double r = rel_rms(got, want, &ma);
+        fails += report("gelu(gate) * ple[il] (strided 512 of 12288)", r, ma, 1e-5);
+        // a wrong stride must be refused rather than read out of bounds
+        if (eg2vq_ops_gelu_mul_strided(dg, dp, n_tok, pl, (uint64_t)pl, (uint64_t)pl)) {
+            printf("FAIL: the strided gelu-mul accepted a stride its offset cannot fit\n");
+            fails++;
+        }
+        cudaFree(dg); cudaFree(dp);
+    }
+
     printf(fails ? "EG2VQ_OPS_FAIL (%d)\n" : "EG2VQ_OPS_PASS\n", fails);
     return fails ? 1 : 0;
 }

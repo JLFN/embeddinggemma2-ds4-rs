@@ -132,6 +132,120 @@ typedef struct {
 void ds4_eg2vq_ref_embed(const struct ds4_model *m, const struct ds4_weights *w,
                          const int32_t *ids, uint32_t n_ids, float *out768);
 
+/* ------------------------------------------------------------------------- *
+ * The device path (embeddinggemma2-handoff.md PHASE 7, phase-doc rows
+ * P3.1-P3.3).
+ *
+ * The same tower, run on the GPU by the kernels of ds4-rs/cuda/eg2vq_{vq,attn,
+ * ops}.cuh composed in the CPU reference forward's own op order.  The payloads
+ * are consumed in the kernel (never expanded to the dense f32 decode the CPU
+ * path re-reads once per token), so the device plan holds the tower's 217
+ * payloads -- 55.9 MiB, out/artifact-manifest.tsv -- next to the q8_0 token
+ * table, the norms and the RoPE tables.  The adapter is
+ * ds4-rs/ds4_eg2vq_gpu.cuh (included once by ds4_cuda.cu, the
+ * ds4_glmvq_gpu.cuh pattern); the host side of the contract is the table shape
+ * below, which ds4_eg2vq_bind.inc fills from the bound weights.
+ * ------------------------------------------------------------------------- */
+
+/* The storage form of one plain (non-payload) vector, as the file carries it.
+ * The numbers are ds4.c's own tensor type ids, kept here for the same reason
+ * DS4_EG2VQ_VQBLOB is: the family header is the device path's whole contract. */
+typedef enum {
+    DS4_EG2VQ_ROW_F32  = 0,
+    DS4_EG2VQ_ROW_F16  = 1,
+    DS4_EG2VQ_ROW_Q8_0 = 8,
+    DS4_EG2VQ_ROW_BF16 = 30,
+} ds4_eg2vq_row;
+
+/* One plain vector for the device plan.  `host` points into the artifact's
+ * mapping (or into a caller-owned buffer) and must stay valid until
+ * ds4_gpu_eg2vq_bind returns; the source is TYPE-tagged and the adapter widens
+ * a bf16/f16 source where the slot's device form is f32. */
+typedef struct {
+    const void *host;
+    uint64_t    bytes;
+    uint32_t    row_type;   /* ds4_eg2vq_row */
+    uint32_t    rows, cols;
+} ds4_eg2vq_aux;
+
+/* The aux slots, in the order ds4_eg2vq_device_tables fills them.  Each slot's
+ * device form is fixed: OUTPUT_NORM, PLE_NORM and the eight per-layer slots
+ * become f32 (the ops kernels take f32 weights; the artifact stores them bf16
+ * and the baseline f32); OUTPUT keeps its bf16 words (the 768 projection kernel
+ * reads bf16 rows exactly as the CPU binder does); TOKEN_EMBD keeps the q8_0
+ * block stream the gather kernel reads. */
+enum {
+    DS4_EG2VQ_AUX_OUTPUT_NORM = 0,   /* f32 [512] */
+    DS4_EG2VQ_AUX_PLE_NORM    = 1,   /* f32 [512] */
+    DS4_EG2VQ_AUX_OUTPUT      = 2,   /* bf16 [768][512]  (embedding_projection) */
+    DS4_EG2VQ_AUX_TOKEN_EMBD  = 3,   /* q8_0 [512][262144] */
+    DS4_EG2VQ_AUX_LAYER_BASE  = 4,   /* + il * 8 */
+    DS4_EG2VQ_AUX_LAYER_STRIDE = 8,
+    DS4_EG2VQ_AUX_L_INPUT_NORM = 0,  /* f32 [512] */
+    DS4_EG2VQ_AUX_L_ATTN_POST  = 1,  /* f32 [512] */
+    DS4_EG2VQ_AUX_L_FFN_NORM   = 2,  /* f32 [512] */
+    DS4_EG2VQ_AUX_L_FFN_POST   = 3,  /* f32 [512] */
+    DS4_EG2VQ_AUX_L_PLE_POST   = 4,  /* f32 [512] */
+    DS4_EG2VQ_AUX_L_Q_NORM     = 5,  /* f32 [head_dim] */
+    DS4_EG2VQ_AUX_L_K_NORM     = 6,  /* f32 [head_dim] */
+    DS4_EG2VQ_AUX_L_SCALAR     = 7,  /* f32 [1] */
+    DS4_EG2VQ_AUX_N = 4 + DS4_EG2VQ_N_LAYER * 8,
+};
+
+/* The tower's KV width is 512 on every layer (2 x 256 sliding, 1 x 512 full),
+ * which the device sequence relies on: k and v are one packed buffer of that
+ * width for both layer kinds. */
+typedef char ds4_eg2vq_kv_width_is_shared
+    [(DS4_EG2VQ_HEAD_KV_SWA * DS4_EG2VQ_HEAD_DIM_SWA == DS4_EG2VQ_HEAD_KV_FULL * DS4_EG2VQ_HEAD_DIM_FULL) ? 1 : -1];
+
+/* The payload records' order, which is the CPU binder's own matrix list
+ * (ds4_eg2vq_bind.inc: the per-layer projection once, then nine matrices per
+ * layer in this order).  The device sequence indexes the records by it. */
+enum {
+    DS4_EG2VQ_REC_PLE_PROJ = 0,
+    DS4_EG2VQ_REC_LAYER_BASE = 1,       /* + il * 9 */
+    DS4_EG2VQ_REC_LAYER_STRIDE = 9,
+    DS4_EG2VQ_REC_L_Q = 0,
+    DS4_EG2VQ_REC_L_K = 1,
+    DS4_EG2VQ_REC_L_V = 2,
+    DS4_EG2VQ_REC_L_O = 3,
+    DS4_EG2VQ_REC_L_FFN_GATE = 4,
+    DS4_EG2VQ_REC_L_FFN_UP = 5,
+    DS4_EG2VQ_REC_L_FFN_DOWN = 6,
+    DS4_EG2VQ_REC_L_PLE_GATE = 7,
+    DS4_EG2VQ_REC_L_PLE_PROJ = 8,
+    DS4_EG2VQ_REC_N = 1 + DS4_EG2VQ_N_LAYER * 9,
+};
+
+typedef struct ds4_eg2vq_gpu_model ds4_eg2vq_gpu_model;
+typedef struct ds4_eg2vq_gpu_ctx ds4_eg2vq_gpu_ctx;
+
+/* Bind a plan: `records` are the tower's VQ payloads (offset/bytes/type/rows/
+ * cols as ds4_eg2vq_record, mapped into `map` of `size` bytes), `aux` is the
+ * slot table above.  Every payload's own header geometry is re-checked in the
+ * kernels and every payload span is checked against `size` here, so a plan that
+ * disagrees with the artifact stops at bind by name.  NULL on any refusal. */
+ds4_eg2vq_gpu_model *ds4_gpu_eg2vq_bind(const void *map, uint64_t size,
+    const ds4_eg2vq_record *records, uint32_t count,
+    const ds4_eg2vq_aux *aux, uint32_t aux_count);
+void ds4_gpu_eg2vq_unbind(ds4_eg2vq_gpu_model *model);
+
+/* Device bytes of the per-item workspace for an item of at most `max_tokens`
+ * tokens (the handoff's PHASE 7 shape: one arena, reused by every item). */
+uint64_t ds4_gpu_eg2vq_workspace(uint32_t max_tokens);
+/* `max_tokens` <= 2048 (the attention kernel's key plane); 0 for a plan or a
+ * size outside that. */
+ds4_eg2vq_gpu_ctx *ds4_gpu_eg2vq_create(const ds4_eg2vq_gpu_model *model,
+    uint64_t scratch, uint32_t max_tokens);
+void ds4_gpu_eg2vq_free(ds4_eg2vq_gpu_ctx *ctx);
+
+/* One item on the device: `n_ids` token ids (BOS..EOS, as the host's tokenizer
+ * emits them) -> the mean-pooled, L2-normalized 768-dim vector, the same
+ * function ds4_eg2vq_ref_embed computes on the CPU.  Returns 0 (and writes
+ * nothing) for an empty item, an item longer than the context's max_tokens, or
+ * a token id the embedding table cannot address. */
+int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids, uint32_t n_ids, float *out768);
+
 #ifdef __cplusplus
 }
 #endif

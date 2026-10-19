@@ -39,6 +39,14 @@
  *  - Weight vectors (the norms, the layer scalars) arrive as f32, because that is
  *    the form the CPU path reads them into (graph:57-59, ds4_ref_row) and their
  *    count is a few hundred floats per layer.
+ *
+ * P3.3 step 2 adds the three primitives the tower sequence still needed (the
+ * adapter is ds4_eg2vq_gpu.cuh): the whole-row scale and add the graph does in
+ * place at :299-300, :313-318, :329-333 and :335, and a strided gelu-mul for the
+ * PLE block, whose second operand is a 512-wide slice of the [n_tok][12288]
+ * per-layer input at a per-layer offset (graph:321-327).  Each is one
+ * expression of the same reference, gated in tests/test_eg2vq_ops.cu beside the
+ * step-1 ops.
  */
 #pragma once
 #include <cuda_runtime.h>
@@ -48,6 +56,41 @@
 /* tanh GELU, ggml's coefficients (graph:35-41; ggml-cpu/vec.h:963-969). */
 __device__ __forceinline__ static float eg2vq_ops_gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
+}
+
+/* IEEE-754 binary16 -> f32, by the definition of the format: a subnormal is
+ * m * 2^-24, a normal is 2^(e-15) * (1 + m/1024).  This is the reading the
+ * kernels get from __half2float and the reading the file's own readers use
+ * (Rust's f16 decode, and the writer's go1b_fp16_to_fp32); it is deliberately
+ * NOT ds4vq_f16 (ds41_vq_fmt.h:38-43), whose subnormal branch shifts one step
+ * too far and returns exactly half for every subnormal input -- measured on the
+ * real artifact at 8,893 of 7,553,024 codebook entries (docs/eg2vq-device-gate7.txt
+ * section 2a), so the device path follows the file and the CPU path's own
+ * divergence is a known, measured quantity in the parity gate, not a surprise in
+ * it.  Gate: every one of the 65,536 patterns against the closed-form value in
+ * double (tests/test_eg2vq_ops.cu). */
+__host__ __device__ __forceinline__ static float eg2vq_ops_half_to_f32(uint16_t h) {
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t e = (uint32_t)(h >> 10) & 0x1Fu;
+    const uint32_t m = (uint32_t)h & 0x3FFu;
+    uint32_t f;
+    if (e == 0) {
+        if (m == 0) {
+            f = s;                                  /* +0 / -0 */
+        } else {
+            uint32_t lead = 9u;                      /* m != 0, so this stops at its highest set bit */
+            while (!((m >> lead) & 1u)) { lead--; }
+            const uint32_t frac = (m - (1u << lead)) << (23u - lead);
+            f = s | ((uint32_t)(127 + (int)lead - 24) << 23) | frac;
+        }
+    } else if (e == 31u) {
+        f = s | 0x7F800000u | (m << 13);            /* inf / NaN (payload kept) */
+    } else {
+        f = s | ((e + 112u) << 23) | (m << 13);
+    }
+    float out;
+    memcpy(&out, &f, 4);
+    return out;
 }
 
 /* ---- token embedding: one q8_0 row, scaled by sqrt(n_embd) ---------------- */
@@ -276,5 +319,53 @@ static inline int eg2vq_ops_proj768_pool(float *out768, const float *h, const ui
     eg2vq_ops_proj768_kernel<<<n_tok, 256, (size_t)n_embd * sizeof(float)>>>(
         out768, h, w, norm_w, n_embd, n_out, eps);
     eg2vq_ops_pool_l2_kernel<<<1, 256>>>(out768, n_out, n_tok);
+    return 1;
+}
+
+/* ---- whole-row scale and add, and the strided PLE gelu-mul ----------------- */
+
+/* x[i] *= s, in place: graph:335 (`h[i] *= scalar[0]`, the layer scalar) and
+ * graph:221 (`pt[r] *= inv`, the per-layer input's 1/sqrt(n_embd)). */
+__global__ void eg2vq_ops_scale_kernel(float *__restrict__ x, float s, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { x[i] *= s; }
+}
+
+static inline int eg2vq_ops_scale(float *x, float s, uint64_t n) {
+    if (!x || !n) { return 0; }
+    eg2vq_ops_scale_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(x, s, n);
+    return 1;
+}
+
+/* dst[i] += src[i]: the three residual adds that follow a norm
+ * (graph:299-300, :313-318, :329-333). */
+__global__ void eg2vq_ops_add_kernel(float *__restrict__ dst, const float *__restrict__ src, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i] += src[i]; }
+}
+
+static inline int eg2vq_ops_add(float *dst, const float *src, uint64_t n) {
+    if (!dst || !src || !n) { return 0; }
+    eg2vq_ops_add_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(dst, src, n);
+    return 1;
+}
+
+/* gate[r][j] = gelu(gate[r][j]) * up[r * up_stride + up_off + j], the PLE
+ * block's gate (graph:321-327): `up` is the per-layer input [n_tok][12288] and
+ * the layer's slice starts 512 * il floats into each token's row. */
+__global__ void eg2vq_ops_gelu_mul_strided_kernel(float *__restrict__ gate, const float *__restrict__ up,
+        uint32_t width, uint64_t up_stride, uint64_t up_off, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) { return; }
+    const uint64_t r = i / width, j = i - r * width;
+    gate[i] = eg2vq_ops_gelu(gate[i]) * up[r * up_stride + up_off + j];
+}
+
+static inline int eg2vq_ops_gelu_mul_strided(float *gate, const float *up, uint32_t rows,
+                                             uint32_t width, uint64_t up_stride, uint64_t up_off) {
+    if (!gate || !up || !rows || !width || up_stride < up_off + width) { return 0; }
+    const uint64_t n = (uint64_t)rows * width;
+    eg2vq_ops_gelu_mul_strided_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(
+        gate, up, width, up_stride, up_off, n);
     return 1;
 }

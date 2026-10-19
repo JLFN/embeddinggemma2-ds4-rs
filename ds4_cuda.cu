@@ -49525,6 +49525,9 @@ static int ds4_gpu_glm53_matmul_bf16(
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_glm53_compact_gpu.cuh"
 #include "ds4_glmvq_gpu.cuh"
+/* EmbeddingGemma-2's VQ text tower (embeddinggemma2-handoff.md PHASE 7): its
+ * own family adapter, beside the two shipping VQ families. */
+#include "ds4_eg2vq_gpu.cuh"
 #include "ds4_inkling_gpu.cuh"
 #include "ds4_ling3vl_gpu.cuh"
 #include "ds4_ling31_gpu.cuh"
