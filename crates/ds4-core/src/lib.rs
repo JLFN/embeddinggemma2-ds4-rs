@@ -2363,6 +2363,190 @@ impl Model {
     pub fn token_text(&self, token: i32) -> Result<Vec<u8>> {
         Ok(self.vocab.token_text(token))
     }
+
+    /// Phase 6: whether this model's operation is an embedding instead of a
+    /// token distribution.  Exactly one family answers true -- gemma_vq
+    /// (`ds4_bridge_eg2vq_has_embed` -> `ds4_engine_has_embed_gemma_vq`), whose
+    /// checkpoint carries no language-model head at all, so the generation
+    /// paths refuse it by name rather than falling through to a decoder arm
+    /// that does not exist.
+    pub fn embeds_text(&self) -> bool {
+        // SAFETY: [Category 8 -- FFI boundary] `raw` is the open model handle,
+        // owned by `self` for the call's duration; the C side only reads the
+        // engine's family.
+        unsafe { ds4_sys::ds4_bridge_eg2vq_has_embed(self.raw.as_ptr()) != 0 }
+    }
+
+    /// Phase 6: one item's token ids through the gemma_vq embedding tower ->
+    /// the mean-pooled, L2-normalised 768-dim vector (`DS4_EG2VQ_N_OUT`; the
+    /// artifact's own `gemma_vq.embedding_length_out`).  `ids` are this model's
+    /// tokenizer output with the sentence-transformers prompt prefix already
+    /// applied: the encoder chooses no prompt itself
+    /// (`crates/ds4-core/src/tok/gemma_vq.rs`), which is why the prefix belongs
+    /// to the caller.  The C engine binds the device plan on the first call and
+    /// keeps it for the process's life, so the tower's 55.9 MiB of payloads is
+    /// uploaded once rather than once per item.
+    pub fn embed_gemma_vq(&self, ids: &[i32]) -> Result<Vec<f32>> {
+        const OUT: usize = 768;
+        if ids.is_empty() {
+            return Err(Error {
+                code: 1,
+                message: "an empty item has no embedding".into(),
+            });
+        }
+        let mut out = vec![0.0f32; OUT];
+        let mut err = [0u8; 512];
+        let n_ids = u32::try_from(ids.len()).map_err(|_| Error {
+            code: 1,
+            message: "the item is longer than u32 tokens".into(),
+        })?;
+        // SAFETY: [Category 8 -- FFI boundary] `raw` is the open model handle;
+        // `ids` is a live slice of n_ids elements and `out` holds the OUT
+        // floats the C entry writes only on success.
+        let rc = unsafe {
+            ds4_sys::ds4_bridge_eg2vq_embed(
+                self.raw.as_ptr(),
+                ids.as_ptr(),
+                n_ids,
+                out.as_mut_ptr(),
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if rc == 0 {
+            return Err(fail(1, &err));
+        }
+        Ok(out)
+    }
+
+    /// Phase 6: one embedding item's token ids, built the way the reference
+    /// driver builds them (`examples/gemma_vq_tok.rs`): the caller's prompt
+    /// prefix, then the text through the family's own tokenizer, wrapped in the
+    /// special tokens the artifact's `tokenizer.ggml.add_bos_token` /
+    /// `add_eos_token` keys ask for (this artifact: both true,
+    /// out/artifact-kv.txt; the ids are the anchor's 2 -- BOS -- and 1 -- EOS).
+    /// The flags are the caller's because they live in the GGUF metadata, not
+    /// in the bound weights: read them with `tokenizer_special_flags`.
+    pub fn embed_item_ids(&self, prefix: &str, text: &str, add_bos: bool, add_eos: bool) -> Vec<i32> {
+        let mut ids = Vec::new();
+        if add_bos {
+            ids.push(self.vocab.bos_id);
+        }
+        ids.extend(self.vocab.encode_bytes(format!("{prefix}{text}").as_bytes()));
+        if add_eos {
+            ids.push(self.vocab.eos_id);
+        }
+        ids
+    }
+}
+
+/// Phase 6: the artifact's own `tokenizer.ggml.add_bos_token` and
+/// `add_eos_token` flags, read from the file rather than assumed -- the same two
+/// keys `examples/gemma_vq_tok.rs` reads before it encodes an item, so the
+/// route, the CLI and the phase-4 tokenizer driver all wrap ids identically.
+/// Absent keys read as false, which is the reference driver's own default.
+pub fn tokenizer_special_flags(path: &Path) -> Result<(bool, bool)> {
+    let g = GgufFile::open(path).map_err(|e| Error {
+        code: 1,
+        message: format!("{}: {e}", path.display()),
+    })?;
+    Ok((
+        g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false),
+        g.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false),
+    ))
+}
+
+/// The gemma_vq tower's output width: `DS4_EG2VQ_N_OUT` (ds4_eg2vq.h) and the
+/// artifact's own `gemma_vq.embedding_length_out` (768).
+pub const GEMMA_VQ_OUT_DIM: usize = 768;
+
+/// The checkpoint's prompt map, verbatim from the pinned
+/// `.models/EmbeddingGemma-2-914f7f8/config_sentence_transformers.json`
+/// ("prompts"), which is the same file tools/eg2_phase5_gate.sh hands the
+/// phase-4 tokenizer example.  The checkpoint sets `default_prompt_name: null`,
+/// so a caller must choose one; `Retrieval-query` is this project's default
+/// because the frozen set is a retrieval task.  Moved here from the CLI
+/// (`crates/ds4-cli/src/lib.rs`, which held it privately) so the HTTP route and
+/// the CLI cannot drift: both resolve a task through `st_prompt`.
+pub const ST_PROMPTS: &[(&str, &str)] = &[
+    ("BitextMining", "task: search result | query: "),
+    ("Classification", "task: classification | query: "),
+    ("Clustering", "task: clustering | query: "),
+    ("CodeRetrieval", "task: code retrieval | query: "),
+    ("Document", "title: none | text: "),
+    ("FactChecking", "task: fact checking | query: "),
+    ("InstructionRetrieval", "task: code retrieval | query: "),
+    ("MultilabelClassification", "task: classification | query: "),
+    ("PairClassification", "task: sentence similarity | query: "),
+    ("QuestionAnswering", "task: question answering | query: "),
+    ("Reranking", "task: search result | query: "),
+    ("Retrieval", "task: search result | query: "),
+    ("Retrieval-document", "title: none | text: "),
+    ("Retrieval-query", "task: search result | query: "),
+    ("STS", "task: sentence similarity | query: "),
+    ("SearchQuery", "task: search result | query: "),
+    ("SentenceSimilarity", "task: sentence similarity | query: "),
+    ("Summarization", "task: sentence similarity | query: "),
+    ("document", "title: none | text: "),
+    ("query", "task: search result | query: "),
+];
+
+/// A checkpoint prompt name -> its prefix, from `ST_PROMPTS`.  `Raw` is the
+/// no-prefix case, the name the anchor script gives it.  Unknown names are
+/// refused by name, listing the table's names -- the checkpoint's own
+/// `default_prompt_name` is null, so there is no silent fallback to pick.
+pub fn st_prompt(task: &str) -> Result<String> {
+    if task == "Raw" {
+        return Ok(String::new());
+    }
+    ST_PROMPTS
+        .iter()
+        .find(|(name, _)| *name == task)
+        .map(|(_, prefix)| (*prefix).to_string())
+        .ok_or_else(|| {
+            let names: Vec<&str> = ST_PROMPTS.iter().map(|(n, _)| *n).collect();
+            Error {
+                code: 1,
+                message: format!(
+                    "{task:?} is not one of the checkpoint's prompt names.  Its names are: {}.  \
+                     (`Raw` prepends nothing.)",
+                    names.join(", ")
+                ),
+            }
+        })
+}
+
+/// The Matryoshka contract the checkpoint itself states: the 768-dim vector
+/// truncates to 512, 256 or 128 and is renormalized.  Any other width is
+/// refused rather than approximated -- a truncated vector that is not
+/// renormalized compares differently, and the checkpoint says so.  Moved here
+/// from the CLI (`crates/ds4-cli/src/lib.rs`) so the HTTP route's `dimensions`
+/// and the CLI's `--dims` share one implementation.
+pub fn mrl_truncate(mut v: Vec<f32>, dims: u32) -> Result<Vec<f32>> {
+    const WIDTHS: [u32; 3] = [512, 256, 128];
+    if dims == GEMMA_VQ_OUT_DIM as u32 {
+        return Ok(v);
+    }
+    if !WIDTHS.contains(&dims) {
+        return Err(Error {
+            code: 1,
+            message: format!(
+                "{dims} is not one of the checkpoint's Matryoshka widths (768, 512, 256, 128)"
+            ),
+        });
+    }
+    v.truncate(dims as usize);
+    let norm = v
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x = (f64::from(*x) / norm) as f32;
+        }
+    }
+    Ok(v)
 }
 
 fn drop_model_native(raw: NonNull<ds4_bridge_model>) {

@@ -858,6 +858,39 @@ fn main() {
     }
     cfg.stop_requested = Some(ds4_sys::stop_requested);
 
+    // Phase 6: the facts GET /health reports and POST /v1/embeddings gates on,
+    // read once here from the opened model.  `family` is
+    // `ModelFamily::oracle_name` (shape.rs:63-83), `backend` the serving
+    // `ds4_core::Backend` (lib.rs:205-209), `embedding` the gemma_vq family
+    // gate `Model::embeds_text`, and the two special-token flags come from the
+    // artifact's own `tokenizer.ggml.add_bos_token` / `add_eos_token`
+    // (`ds4_core::tokenizer_special_flags`), as the CLI's `--embed` reads them.
+    cfg.backend = match backend {
+        Backend::Cuda => "cuda",
+        Backend::Metal => "metal",
+        Backend::Cpu => "cpu",
+    }
+    .to_string();
+    if let Some(ref m) = model {
+        cfg.embedding = m.embeds_text();
+        cfg.family = m.family().oracle_name().to_string();
+        cfg.backend = match m.backend() {
+            Backend::Cuda => "cuda",
+            Backend::Metal => "metal",
+            Backend::Cpu => "cpu",
+        }
+        .to_string();
+        if let Some(path) = model_path.as_deref() {
+            match ds4_core::tokenizer_special_flags(Path::new(path)) {
+                Ok((bos, eos)) => {
+                    cfg.add_bos = bos;
+                    cfg.add_eos = eos;
+                }
+                Err(e) => eprintln!("ds4-server-rs: tokenizer special flags: {e}"),
+            }
+        }
+    }
+
     let serving = cfg.serving_plan.as_ref().unwrap_or(&plan);
     let listener = match listen_if_allowed(&cfg, serving) {
         Ok(Some(listener)) => listener,

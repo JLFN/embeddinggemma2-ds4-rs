@@ -9022,6 +9022,56 @@ static void config_validate_qwen4exp_model(const ds4_model *m) {
     }
 }
 
+/* gemma_vq (EmbeddingGemma-2 VQ): the same job the other family validators do,
+ * for the keys the C paths read straight out of the file.  The PAYLOADS are
+ * validated elsewhere and on purpose: the Rust artifact contract
+ * (crates/ds4-core/src/gemma_vq.rs) checks every DQVQ header against the byte
+ * account before the C adapter sees a pointer, and eg2vq_device_tables
+ * re-checks each payload against its record at bind, so a mistyped payload
+ * cannot reach a kernel.  Here the file's own metadata is checked against the
+ * shape (DS4_SHAPE_GEMMA_VQ, ds4.c:694), key by key, and the container version
+ * the loader and binder both assume is checked by name. */
+static void config_validate_gemma_vq_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_GEMMA_VQ;
+    config_expect_u32("format_version", required_u32(m, "gemma_vq.format_version"), 1);
+    config_expect_u32("block_count", required_u32(m, "gemma_vq.block_count"), DS4_N_LAYER);
+    config_expect_u32("embedding_length", required_u32(m, "gemma_vq.embedding_length"),
+                      DS4_N_EMBD);
+    config_expect_u32("embedding_length_out", required_u32(m, "gemma_vq.embedding_length_out"),
+                      DS4_EG2VQ_N_OUT);
+    config_expect_u32("feed_forward_length", required_u32(m, "gemma_vq.feed_forward_length"),
+                      DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", required_u32(m, "gemma_vq.attention.head_count"),
+                      DS4_N_HEAD);
+    /* The unqualified key is the FULL layer's width and the _swa key is the
+     * sliding layer's, for the key width, the value width and the rotated
+     * width alike (the artifact's own gemma_vq.attention.{key,value}_length* and
+     * gemma_vq.rope.dimension_count*; measured on the file first, which is how
+     * this arm was corrected -- the shape's own n_rot/n_head_dim carry the
+     * sliding value, 256, the same way n_head_dim does). */
+    config_expect_u32("attention.key_length", required_u32(m, "gemma_vq.attention.key_length"),
+                      DS4_EG2VQ_HEAD_DIM_FULL);
+    config_expect_u32("attention.key_length_swa",
+                      required_u32(m, "gemma_vq.attention.key_length_swa"),
+                      DS4_EG2VQ_HEAD_DIM_SWA);
+    config_expect_u32("attention.sliding_window",
+                      required_u32(m, "gemma_vq.attention.sliding_window"), DS4_N_SWA);
+    config_expect_u32("rope.dimension_count",
+                      required_u32(m, "gemma_vq.rope.dimension_count"),
+                      DS4_EG2VQ_HEAD_DIM_FULL);
+    config_expect_u32("rope.dimension_count_swa",
+                      required_u32(m, "gemma_vq.rope.dimension_count_swa"),
+                      DS4_EG2VQ_HEAD_DIM_SWA);
+    config_expect_u32("vocab_size", required_u32(m, "gemma_vq.vocab_size"), DS4_N_VOCAB);
+    config_expect_f32("attention.layer_norm_rms_epsilon",
+                      required_f32(m, "gemma_vq.attention.layer_norm_rms_epsilon"),
+                      DS4_RMS_EPS);
+    config_expect_f32("rope.freq_base", required_f32(m, "gemma_vq.rope.freq_base"),
+                      DS4_ROPE_FREQ_BASE);
+    config_expect_f32("rope.freq_base_swa", required_f32(m, "gemma_vq.rope.freq_base_swa"),
+                      DS4_ROPE_FREQ_BASE_SWA);
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -9059,6 +9109,10 @@ static void config_validate_model(const ds4_model *m) {
     }
     if (ds4_streq(arch, "qwen35")) {
         config_validate_qwen35_model(m);
+        return;
+    }
+    if (ds4_streq(arch, "gemma_vq")) {
+        config_validate_gemma_vq_model(m);
         return;
     }
     fprintf(stderr, "ds4: unsupported GGUF architecture: %.*s\n",
@@ -37521,6 +37575,15 @@ struct ds4_engine {
     bool spec_draft_disabled;
     uint64_t mtp_guard_drafts;
     uint64_t mtp_guard_hits;
+    /* Phase 6 (gemma_vq embedding): the device plan and its per-item workspace,
+     * bound once per engine and reused by every item -- this is what makes the
+     * tower's 55.9 MiB of payloads device-resident instead of re-uploaded per
+     * request.  Both stay NULL on the CPU path, where the bound dense cache is
+     * the decode.  See ds4_engine_embed_gemma_vq. */
+    ds4_eg2vq_gpu_model *eg2vq_plan;
+    ds4_eg2vq_gpu_ctx   *eg2vq_ctx;
+    uint32_t             eg2vq_max_tokens;
+    uint64_t             eg2vq_embed_calls;
 };
 
 static bool qwen4exp_ple_cache_mb_valid(uint32_t cache_mb) {
@@ -69706,6 +69769,27 @@ const char *ds4_reclaim_status_str(int status) {
     }
 }
 
+/* gemma_vq (EmbeddingGemma-2) is an embedding tower, not a decoder: the
+ * checkpoint has no language-model head at all (measured: no lm_head /
+ * output.weight tensor anywhere in the artifact's 1376 tensors, and
+ * ds4_eg2vq_graph.inc's only head is output_norm -> the 768 projection ->
+ * mean pool -> L2).  Before this guard the family fell through the generic
+ * decoder path, where prefill reaches embed_token_f16 and dereferences
+ * w->token_embd -- a slot gemma_vq binds under w->eg2vq instead
+ * (ds4_eg2vq_bind.inc:233-239) -- so `ds4 -m <artifact> -p hello -n 1` died
+ * with SIGSEGV (exit 139) on both the cuda and cpu backends.  A refusal with
+ * a reason is the correct answer: there is nothing to decode. */
+static void ds4_report_embedding_family_refusal(const char *what) {
+    fprintf(stderr,
+            "ds4: %s is not available for this checkpoint: family gemma_vq "
+            "(EmbeddingGemma-2) is an embedding tower -- it produces a "
+            "mean-pooled, L2-normalised 768-dim vector, and the artifact "
+            "carries no language-model head, so there is no next-token "
+            "distribution to decode.  Use the embedding path: "
+            "POST /v1/embeddings on the server, or --embed on the CLI.\n",
+            what ? what : "this operation");
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -69716,6 +69800,10 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+        ds4_report_embedding_family_refusal("text generation");
+        return 1;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3 ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE ||
@@ -72210,6 +72298,11 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
     if (DS4_MODEL_VARIANT == DS4_VARIANT_V41) return;
     // VQ owns its source graph scratch; generic DeepSeek prewarm is unrelated.
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM53_VQ || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LING31_VQ) { return; }
+    /* gemma_vq has neither a decoder graph nor a token distribution to warm
+     * (see ds4_report_embedding_family_refusal): its session shape is the
+     * embedding entry, so the prewarm's throwaway session sync would only be
+     * a path to the refusal below. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) { return; }
     e->boot_prewarm_done = true;
     const double warm_t0 = now_sec();
     /* memgov D0b-3 (S8): prewarm allocates by design (post-placement
@@ -73419,6 +73512,14 @@ bool ds4_engine_has_vision(ds4_engine *e) {
     return e && e->vision_ready;
 }
 
+/* Phase 6: whether this engine's model is the gemma_vq embedding family -- the
+ * one question a caller (the bridge, the CLI, the server route) must ask before
+ * it can expect an embedding instead of a token distribution. */
+bool ds4_engine_has_embed_gemma_vq(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ;
+}
+
 int ds4_engine_vision_probe(ds4_engine *e,
                             const uint8_t *encoded, size_t encoded_len,
                             ds4_vision_image_info *out,
@@ -73500,6 +73601,138 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
     out->grid_height = info.grid_height;
     return 1;
 #endif
+}
+
+/* ------------------------------------------------------------------------- *
+ * Phase 6: the gemma_vq embedding entry (ds4_engine_embed_gemma_vq).
+ *
+ * This is the glue the device path (PHASE 7) was missing: the harnesses under
+ * tests/parity/ were the tower's only callers.  The contract is the same one
+ * they use -- ds4_eg2vq_graph.inc's ds4_eg2vq_ref_embed on the CPU, the
+ * ds4_gpu_eg2vq_* adapter on the graph backend -- with the plan bound ONCE per
+ * engine so the 55.9 MiB of payloads stay on the device across items, and the
+ * CPU leg's 520.0 MiB dense decode never built on the device path.
+ *
+ * The template is ds4_engine_vision_encode_memory (an engine-level,
+ * non-generation operation with its own readiness and family checks), and the
+ * refusals are the shape's own: an empty item, an item longer than the
+ * attention kernel's 2048-token key plane, and a token id the embedding table
+ * cannot address.  Nothing here truncates: a silent partial item would be a
+ * wrong answer.
+ * ------------------------------------------------------------------------- */
+
+#ifndef DS4_NO_GPU
+/* Bind the plan and a workspace big enough for `n_tokens`, once per engine.
+ * The workspace grows and never shrinks (a longer item rebuilds it), so a
+ * process serving many items pays the allocation once per size class. */
+static int eg2vq_device_ensure(ds4_engine *e, uint32_t n_tokens,
+                               char *error, size_t error_cap) {
+    if (e->eg2vq_ctx && e->eg2vq_max_tokens >= n_tokens) { return 1; }
+    if (!e->eg2vq_plan) {
+        ds4_eg2vq_record records[DS4_EG2VQ_REC_N];
+        ds4_eg2vq_aux aux[DS4_EG2VQ_AUX_N];
+        if (!eg2vq_device_tables(&e->model, &e->weights, records, aux)) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "this file has no device plan (the device path is the VQ artifact's)");
+            return 0;
+        }
+        if (!ds4_gpu_init()) {
+            if (error && error_cap) snprintf(error, error_cap, "no CUDA device");
+            return 0;
+        }
+        e->eg2vq_plan = ds4_gpu_eg2vq_bind(e->model.map, e->model.size,
+                                          records, (uint32_t)DS4_EG2VQ_REC_N,
+                                          aux, (uint32_t)DS4_EG2VQ_AUX_N);
+        if (!e->eg2vq_plan) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the device plan did not bind (a payload span or header "
+                "disagrees with the file)");
+            return 0;
+        }
+    }
+    uint32_t want = (n_tokens + 255u) & ~255u;
+    if (want > DS4_EG2VQ_MAX_TOKENS) { want = DS4_EG2VQ_MAX_TOKENS; }
+    if (e->eg2vq_ctx) { ds4_gpu_eg2vq_free(e->eg2vq_ctx); e->eg2vq_ctx = NULL; }
+    const uint64_t scratch = ds4_gpu_eg2vq_workspace(want);
+    e->eg2vq_ctx = ds4_gpu_eg2vq_create(e->eg2vq_plan, scratch, want);
+    if (!e->eg2vq_ctx) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "no device workspace for %u tokens", want);
+        return 0;
+    }
+    e->eg2vq_max_tokens = want;
+    return 1;
+}
+#endif
+
+int ds4_engine_embed_gemma_vq(ds4_engine *e, const int32_t *ids, uint32_t n_ids,
+                              float *out768, char *error, size_t error_cap) {
+    if (error && error_cap) error[0] = '\0';
+    if (!e || !ids || !out768) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid embed arguments");
+        return 0;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GEMMA_VQ) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "this engine is not a gemma_vq embedding model");
+        return 0;
+    }
+    const ds4_eg2vq_weights *w = e->weights.eg2vq;
+    if (!w) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the gemma_vq weights are not bound");
+        return 0;
+    }
+    if (n_ids == 0) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "an empty item has no embedding");
+        return 0;
+    }
+    if (n_ids > DS4_EG2VQ_MAX_TOKENS) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the item is %u tokens, past the %u-token key plane of the "
+            "attention kernel", n_ids, DS4_EG2VQ_MAX_TOKENS);
+        return 0;
+    }
+    /* The id range is the token table's own row count: the table IS the
+     * embedding matrix, so a constant here would be a second source of truth. */
+    const uint64_t n_rows = w->token_embd ? (uint64_t)w->token_embd->dim[1] : 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] < 0 || (uint64_t)ids[i] >= n_rows) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "token id %d is outside the embedding table (%llu rows)",
+                (int)ids[i], (unsigned long long)n_rows);
+            return 0;
+        }
+    }
+    e->eg2vq_embed_calls++;
+    if (ds4_backend_uses_graph(e->backend)) {
+#ifndef DS4_NO_GPU
+        if (!e->metal_ready) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the %s backend is not ready", ds4_backend_name(e->backend));
+            return 0;
+        }
+        if (!eg2vq_device_ensure(e, n_ids, error, error_cap)) { return 0; }
+        if (!ds4_gpu_eg2vq_embed(e->eg2vq_ctx, ids, n_ids, out768)) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the device tower refused this item");
+            return 0;
+        }
+        return 1;
+#else
+        if (error && error_cap) snprintf(error, error_cap,
+            "this build has no graph backend support");
+        return 0;
+#endif
+    }
+    if (!w->dense) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the CPU decode cache is not bound for this engine");
+        return 0;
+    }
+    ds4_eg2vq_ref_embed(&e->model, &e->weights, ids, n_ids, out768);
+    return 1;
 }
 
 const char *ds4_engine_model_name(ds4_engine *e) {
@@ -73633,6 +73866,11 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
     /* The reader borrows the model and layer table until its join. */
     glm53_stream_cancel(&e->glm53_stream);
+    /* Phase 6: the gemma_vq device plan and its workspace are this engine's own
+     * device allocations (freeing them does not touch the artifact mapping, but
+     * the adapter prints their accounting here, once per process). */
+    if (e->eg2vq_ctx) { ds4_gpu_eg2vq_free(e->eg2vq_ctx); e->eg2vq_ctx = NULL; }
+    if (e->eg2vq_plan) { ds4_gpu_eg2vq_unbind(e->eg2vq_plan); e->eg2vq_plan = NULL; }
 #endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -74662,6 +74900,14 @@ int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    /* No decode session exists for this family, by construction: see
+     * ds4_report_embedding_family_refusal.  Refused here rather than allowed
+     * to reach the generic KV/logits allocation and the prefill that NULLs on
+     * w->token_embd. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+        ds4_report_embedding_family_refusal("a generation session");
+        return 1;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LING31_VQ) {
 #ifdef DS4_NO_GPU
         return 1;

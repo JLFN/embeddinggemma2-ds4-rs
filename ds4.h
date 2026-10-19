@@ -295,6 +295,9 @@ int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 bool ds4_engine_has_vision(ds4_engine *e);
+/* Phase 6: this engine's model is family gemma_vq, so the embedding entry above
+   is the operation it supports (and generation is refused by design). */
+bool ds4_engine_has_embed_gemma_vq(ds4_engine *e);
 bool ds4_engine_drafter_shared(ds4_engine *e);
 int ds4_engine_vision_probe(ds4_engine *e,
                             const uint8_t *encoded, size_t encoded_len,
@@ -305,6 +308,18 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error, size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
+/* Phase 6: the gemma_vq embedding entry.  `ids` is one item's token ids (BOS
+   through EOS, exactly as the family's tokenizer emits them -- the prompt
+   prefix belongs to the caller, and the checkpoint's prompt map lives in
+   config_sentence_transformers.json).  On success `out768` holds the
+   mean-pooled, L2-normalised 768-dim vector and the call returns 1; on any
+   refusal it returns 0 and writes the reason into `error`.  The device plan is
+   bound once and reused; on the CPU backend the bound dense decode is used
+   instead.  Refused, never truncated: an empty item, an item longer than the
+   attention kernel's 2048-token key plane (DS4_EG2VQ_MAX_TOKENS), a token id
+   outside the embedding table, and any engine that is not family gemma_vq. */
+int ds4_engine_embed_gemma_vq(ds4_engine *e, const int32_t *ids, uint32_t n_ids,
+                              float *out768, char *error, size_t error_cap);
 const char *ds4_engine_model_name(ds4_engine *e);
 ds4_chat_format ds4_engine_chat_format(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);

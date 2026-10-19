@@ -99,6 +99,22 @@ pub struct ServerConfig {
     pub serial_rightsize: bool,
     pub serving_plan: Option<ds4_core::ResolvedPlan>,
     pub(crate) serial_fit: Option<SerialFitQuote>,
+    /// Phase 6: the opened model is an embedding tower (`Model::embeds_text`,
+    /// the C `ds4_bridge_eg2vq_has_embed` family gate).  Read once at boot by
+    /// the bin so `/v1/embeddings` can refuse a generation model and `/health`
+    /// can report `embedding` without a model call in `prepare_client`.
+    pub embedding: bool,
+    /// Phase 6: the opened model's family as `/health` reports it, from
+    /// `ds4_core::ModelFamily::oracle_name` (shape.rs:63-83; "gemma_vq" here).
+    pub family: String,
+    /// Phase 6: the serving backend as `/health` reports it -- "cuda", "cpu"
+    /// or "metal", from `ds4_core::Backend` (lib.rs:205-209).
+    pub backend: String,
+    /// Phase 6: the artifact's own `tokenizer.ggml.add_bos_token` /
+    /// `add_eos_token` (`ds4_core::tokenizer_special_flags`), read once at boot
+    /// so the route's ids match the CLI's exactly (both true on this artifact).
+    pub add_bos: bool,
+    pub add_eos: bool,
 }
 
 pub(crate) fn env_i32_bound(name: &str, default: i32) -> i32 {
@@ -206,6 +222,11 @@ impl Default for ServerConfig {
             ),
             serving_plan: None,
             serial_fit: None,
+            embedding: false,
+            family: String::new(),
+            backend: String::new(),
+            add_bos: false,
+            add_eos: false,
         }
     }
 }
@@ -858,6 +879,29 @@ struct PreparedJob {
     surface: WireSurface,
     body_bytes: u64,
     arrived_at: Instant,
+    /// Phase 6: when present this job is a `/v1/embeddings` request, not a
+    /// generation one.  The owner's `run_embed` branch handles it before any
+    /// routing; `parsed` is only the lease/admission carrier then (see
+    /// `ParsedRequest::embedding_carrier`). None for every generation job.
+    embed: Option<EmbedRequest>,
+}
+
+/// Phase 6: a validated `/v1/embeddings` request that the owner must run
+/// against the model.  Everything checkable without the model (task name,
+/// dimensions width, encoding format, JSON shape) is settled in
+/// `prepare_client`; this carries only what the owner needs.
+struct EmbedRequest {
+    /// One or more input strings, verbatim.
+    inputs: Vec<String>,
+    /// The request's `model` field, echoed back (the spec says it is ignored).
+    model: String,
+    /// The resolved prefix from `ds4_core::st_prompt(&task)` (the checkpoint
+    /// prompt name is validated and collapsed to this prefix in
+    /// `prepare_embedding`); applied BEFORE tokenizing, exactly as the CLI's
+    /// `--embed` does.
+    prefix: String,
+    /// The requested Matryoshka width, already validated; None = 768.
+    dimensions: Option<u32>,
 }
 
 fn prepare_cont_prompt<'a>(
@@ -1166,6 +1210,26 @@ fn prepare_client(
         write_all(stream, &http_response_bytes(204, None, None, cfg.cors, ""));
         return None;
     }
+    // Phase 6: a pure early response.  Every field is what the bin read from
+    // the opened model at boot (`ServerConfig::embedding` / `family` /
+    // `backend`); no model call happens here.  The four facts mirror the
+    // embedding API: `embedding` is `Model::embeds_text` (the gemma_vq family
+    // gate), `family` is `ModelFamily::oracle_name` (shape.rs:63-83), and
+    // `backend` is the serving `ds4_core::Backend` (lib.rs:205-209).
+    if req.method == "GET" && req.path == "/health" {
+        let body = format!(
+            "{{\"status\":\"ok\",\"model\":{},\"backend\":{},\"family\":{},\"embedding\":{}}}\n",
+            crate::json::json_escape(&cfg.model_id),
+            crate::json::json_escape(&cfg.backend),
+            crate::json::json_escape(&cfg.family),
+            cfg.embedding,
+        );
+        write_all(
+            stream,
+            &http_response_bytes(200, Some("application/json"), None, cfg.cors, &body),
+        );
+        return None;
+    }
     if req.method == "GET" && req.path == "/v1/models" {
         let body = models_list_json(
             &cfg.model_id,
@@ -1235,6 +1299,13 @@ fn prepare_client(
         );
         return None;
     }
+    if req.method == "POST" && req.path == "/v1/embeddings" {
+        // Phase 6: an OpenAI-compatible embeddings request.  Validated here
+        // (everything checkable without the model), then carried to the owner
+        // as an `EmbedRequest` job -- the embedding runs in the owner's
+        // `run_embed`, exactly as generation runs in `run_engine`.
+        return prepare_embedding(cfg, inner, stream, &req, arrived_at);
+    }
     if req.method == "POST" {
         let inference = shed_surface_for_path(&req.path).is_some();
         let generation = inference || req.path == "/v1/batch";
@@ -1289,6 +1360,7 @@ fn prepare_client(
                         surface: surf,
                         body_bytes,
                         arrived_at,
+                        embed: None,
                     });
                 }
             }
@@ -1305,6 +1377,257 @@ fn prepare_client(
         ),
     );
     None
+}
+
+/// Phase 6: validate a `POST /v1/embeddings` body and turn it into a job.
+/// Everything that needs no model is settled here (OpenAI shape, task name via
+/// `ds4_core::st_prompt`, the Matryoshka width, `encoding_format`); the tower
+/// runs later in the owner's `run_embed`.  Errors use the port's OpenAI error
+/// envelope (`error.rs:44-50`: `{"error":{"message":..,"type":"invalid_request_error"}}`).
+fn prepare_embedding(
+    cfg: &ServerConfig,
+    inner: &Mutex<ServerInner>,
+    stream: &mut TcpStream,
+    req: &crate::http::HttpRequest,
+    arrived_at: Instant,
+) -> Option<PreparedJob> {
+    let bad = |stream: &mut TcpStream, msg: &str| -> Option<PreparedJob> {
+        write_all(
+            stream,
+            &wire_http_error_bytes(WireSurface::OpenaiChat, 400, msg, cfg.cors, None),
+        );
+        None
+    };
+    // The served model must be the embedding tower.  This is the boot-time
+    // `Model::embeds_text` fact (`ServerConfig::embedding`), not a per-request
+    // model call -- a generation model is refused here, by name, before any
+    // body is parsed.
+    if !cfg.embedding {
+        return bad(
+            stream,
+            "this server is serving a generation model; /v1/embeddings needs a gemma_vq embedding artifact",
+        );
+    }
+    // Share the inference admission gate (queue depth / bytes / clients) with
+    // the generation surfaces; see admit.rs:89-127.
+    if let Some((reason, code, retry, msg)) = {
+        let g = lock_inner(inner);
+        preparse_shed(&g.admit, true, true, req.body.len() as u64)
+    } {
+        lock_inner(inner).metrics.record_shed(reason);
+        write_all(
+            stream,
+            &wire_http_error_bytes(WireSurface::OpenaiChat, code, msg, cfg.cors, Some(retry)),
+        );
+        return None;
+    }
+    let body = std::str::from_utf8(&req.body).unwrap_or("");
+    let json: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return bad(stream, "invalid JSON request"),
+    };
+    let inputs: Vec<String> = match json.get("input") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) => {
+            let mut out = Vec::with_capacity(a.len());
+            for v in a {
+                match v {
+                    serde_json::Value::String(s) => out.push(s.clone()),
+                    _ => return bad(stream, "\"input\" must be a string or an array of strings"),
+                }
+            }
+            out
+        }
+        _ => return bad(stream, "\"input\" must be a string or an array of strings"),
+    };
+    if inputs.is_empty() {
+        return bad(stream, "\"input\" must not be an empty array");
+    }
+    // `model` is ignored but echoed back; an absent one echoes the server's id.
+    let model = match json.get("model") {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(_) => return bad(stream, "\"model\" must be a string"),
+    };
+    let task = match json.get("task") {
+        None | Some(serde_json::Value::Null) => "Retrieval-query".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(_) => return bad(stream, "\"task\" must be a string"),
+    };
+    // The checkpoint's own map, shared with the CLI (moved to ds4-core).
+    let prefix = match ds4_core::st_prompt(&task) {
+        Ok(p) => p,
+        Err(e) => return bad(stream, &e.message),
+    };
+    let dimensions = match json.get("dimensions") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(d @ (768 | 512 | 256 | 128)) => Some(d as u32),
+            Some(d) => {
+                return bad(
+                    stream,
+                    &format!(
+                        "\"dimensions\" {d} is not one of the checkpoint's Matryoshka widths (768, 512, 256, 128)"
+                    ),
+                )
+            }
+            None => return bad(stream, "\"dimensions\" must be a positive integer"),
+        },
+    };
+    match json.get("encoding_format") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) if s == "float" => {}
+        _ => return bad(stream, "\"encoding_format\" must be \"float\""),
+    }
+    // The lease/admission/owner-channel carrier.  Kind Chat / api Openai are
+    // the port's defaults; `run_embed` never reads this request.
+    let env = ParseEnv {
+        default_model: cfg.model_id.clone(),
+        default_tokens: cfg.default_tokens,
+        default_effort: default_effort(cfg),
+        default_temp: crate::parse::default_temperature(),
+        live_ids: Vec::new(),
+        engine_defaults: cfg.engine_defaults,
+    };
+    let mut parsed = crate::parse::ParsedRequest::embedding_carrier(&env);
+    parsed.eos_policy = cfg.eos_policy;
+    parsed.finish_needs();
+    Some(PreparedJob {
+        parsed,
+        cont_prompt: None,
+        surface: WireSurface::OpenaiChat,
+        body_bytes: req.body.len() as u64,
+        arrived_at,
+        embed: Some(EmbedRequest {
+            inputs,
+            model,
+            prefix,
+            dimensions,
+        }),
+    })
+}
+
+/// Phase 6: the owner-side embedding run.  Runs on the thread that holds the
+/// engine (the same `&mut dyn DecodeIo` that generation uses), one item at a
+/// time, in request order: prefix + text -> ids (`embed_item_ids`, the
+/// artifact's BOS/EOS flags) -> the tower (`embed_gemma_vq`) -> optional
+/// Matryoshka truncation (`ds4_core::mrl_truncate`).  This is exactly the CLI's
+/// `run_embed` path, so the two cannot disagree.
+fn run_embed<W: TerminalSink>(
+    cfg: &ServerConfig,
+    embed: EmbedRequest,
+    engine: Option<&mut dyn DecodeIo>,
+    out: &mut W,
+) -> Settlement {
+    let Some(engine) = engine else {
+        let ok = out
+            .write_all(&wire_http_error_bytes(
+                WireSurface::OpenaiChat,
+                503,
+                SERVER_SHUTTING_DOWN,
+                cfg.cors,
+                None,
+            ))
+            .is_ok();
+        return if ok {
+            Settlement::COMPLETED
+        } else {
+            Settlement::CANCELED
+        };
+    };
+    if !engine.embeds_text() {
+        let ok = out
+            .write_all(&wire_http_error_bytes(
+                WireSurface::OpenaiChat,
+                400,
+                "this server is serving a generation model; /v1/embeddings needs a gemma_vq embedding artifact",
+                cfg.cors,
+                None,
+            ))
+            .is_ok();
+        return if ok {
+            Settlement::COMPLETED
+        } else {
+            Settlement::CANCELED
+        };
+    }
+    let mut data = String::new();
+    let mut total_tokens: usize = 0;
+    for (i, text) in embed.inputs.iter().enumerate() {
+        let ids = match engine.embed_item_ids(&embed.prefix, text, cfg.add_bos, cfg.add_eos) {
+            Ok(ids) => ids,
+            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+        };
+        total_tokens = total_tokens.saturating_add(ids.len());
+        let vector = match engine.embed_gemma_vq(&ids) {
+            Ok(v) => v,
+            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+        };
+        let vector = match embed.dimensions {
+            Some(d) => match ds4_core::mrl_truncate(vector, d) {
+                Ok(v) => v,
+                Err(e) => return embed_fail(out, cfg, &e.message),
+            },
+            None => vector,
+        };
+        if i > 0 {
+            data.push(',');
+        }
+        data.push_str(&format!(
+            "{{\"object\":\"embedding\",\"index\":{i},\"embedding\":["
+        ));
+        for (j, x) in vector.iter().enumerate() {
+            if j > 0 {
+                data.push(',');
+            }
+            // Same 7-decimal format the CLI's `--embed` prints, so a
+            // route-vs-CLI comparison reads the same text on both sides.
+            data.push_str(&format!("{x:.7}"));
+        }
+        data.push_str("]}");
+    }
+    let model = if embed.model.is_empty() {
+        cfg.model_id.clone()
+    } else {
+        embed.model.clone()
+    };
+    let body = format!(
+        "{{\"object\":\"list\",\"data\":[{data}],\"model\":{},\"usage\":{{\"prompt_tokens\":{total_tokens},\"total_tokens\":{total_tokens}}}}}\n",
+        crate::json::json_escape(&model)
+    );
+    let ok = out
+        .write_all(&http_response_bytes(
+            200,
+            Some("application/json"),
+            None,
+            cfg.cors,
+            &body,
+        ))
+        .is_ok();
+    if ok {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
+}
+
+/// Phase 6: the owner's embedding failure response -- an engine error mid-run
+/// (the item could not be embedded) is a 500 in the OpenAI envelope.
+fn embed_fail<W: TerminalSink>(out: &mut W, cfg: &ServerConfig, msg: &str) -> Settlement {
+    let ok = out
+        .write_all(&wire_http_error_bytes(
+            WireSurface::OpenaiChat,
+            500,
+            msg,
+            cfg.cors,
+            None,
+        ))
+        .is_ok();
+    if ok {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
 }
 
 fn route_for_model(
@@ -1332,6 +1655,12 @@ fn run_prepared<W: TerminalSink>(
     out: &mut W,
     arrived_at: Option<Instant>,
 ) -> Settlement {
+    // Phase 6: an embedding job never takes a generation lane.  Handle it
+    // before any routing, on this same owner thread, and return.  `cont` is
+    // unused for it (there is no continuation state).
+    if let Some(embed) = job.embed.take() {
+        return run_embed(cfg, embed, engine, out);
+    }
     let model_id = engine.as_ref().map_or(0, |engine| engine.model_id());
     let mimo_image =
         !job.parsed.images.is_empty() && syntax_for_model_id(model_id) == ModelSyntax::Mimo2;
@@ -3694,6 +4023,7 @@ mod owner_tests {
             surface: WireSurface::Anthropic,
             body_bytes: 11,
             arrived_at: Instant::now(),
+            embed: None,
         };
         let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
@@ -3745,6 +4075,7 @@ mod owner_tests {
             surface: WireSurface::OpenaiCompletion,
             body_bytes,
             arrived_at: Instant::now(),
+            embed: None,
         }
     }
 

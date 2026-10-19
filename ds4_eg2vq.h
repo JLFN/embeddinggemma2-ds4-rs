@@ -132,6 +132,13 @@ typedef struct {
 void ds4_eg2vq_ref_embed(const struct ds4_model *m, const struct ds4_weights *w,
                          const int32_t *ids, uint32_t n_ids, float *out768);
 
+/* The longest item the device path accepts: the attention kernel's key plane
+ * (cuda/eg2vq_attn.cuh:49, EG2VQ_ATTN_KEYS_MAX; the equality is asserted in
+ * ds4_eg2vq_gpu.cuh).  A longer item is REFUSED by the entry point rather than
+ * truncated -- a plane that silently covered half an item would be a wrong
+ * answer, not a slow one. */
+#define DS4_EG2VQ_MAX_TOKENS 2048u
+
 /* ------------------------------------------------------------------------- *
  * The device path (embeddinggemma2-handoff.md PHASE 7, phase-doc rows
  * P3.1-P3.3).

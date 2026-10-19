@@ -278,6 +278,37 @@ pub trait DecodeIo {
         }
         self.sync_media_prompt(tokens, images, audios)
     }
+    /// Phase 6 (owner-executed embeddings): whether the loaded model is an
+    /// embedding tower at all -- the C `ds4_bridge_eg2vq_has_embed` family
+    /// gate, surfaced as `ds4_core::Model::embeds_text`.  False for every
+    /// engine that only distributes tokens; the default keeps them out of the
+    /// `/v1/embeddings` path in one place.
+    fn embeds_text(&self) -> bool {
+        false
+    }
+    /// Phase 6: one embedding item's token ids -- the caller's prompt prefix,
+    /// then the text through the family's own tokenizer, wrapped in the
+    /// artifact's special-token flags (`ds4_core::Model::embed_item_ids`).
+    /// Only an embedding engine answers; the default refuses by name.
+    fn embed_item_ids(
+        &self,
+        _prefix: &str,
+        _text: &str,
+        _add_bos: bool,
+        _add_eos: bool,
+    ) -> Result<Vec<i32>, GenerateError> {
+        Err(GenerateError::Unsupported(
+            "an embedding tower is not loaded on this engine",
+        ))
+    }
+    /// Phase 6: one embedding item's ids through the tower -> the mean-pooled,
+    /// L2-normalised 768-dim vector (`ds4_core::Model::embed_gemma_vq`; the C
+    /// engine binds the device plan on the first call and keeps it).
+    fn embed_gemma_vq(&self, _ids: &[i32]) -> Result<Vec<f32>, GenerateError> {
+        Err(GenerateError::Unsupported(
+            "an embedding tower is not loaded on this engine",
+        ))
+    }
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError>;
     /// Start this request's reuse trace. A corrective retry re-syncs inside
     /// the same request, so the sync itself must not erase what the first
@@ -4270,6 +4301,26 @@ impl DecodeIo for NativeDecode<'_> {
 
     fn is_v41(&self) -> bool {
         self.v41.is_some()
+    }
+
+    fn embeds_text(&self) -> bool {
+        self.model.embeds_text()
+    }
+
+    fn embed_item_ids(
+        &self,
+        prefix: &str,
+        text: &str,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Result<Vec<i32>, GenerateError> {
+        Ok(self.model.embed_item_ids(prefix, text, add_bos, add_eos))
+    }
+
+    fn embed_gemma_vq(&self, ids: &[i32]) -> Result<Vec<f32>, GenerateError> {
+        self.model
+            .embed_gemma_vq(ids)
+            .map_err(|e| GenerateError::Engine(e.to_string()))
     }
 
     fn v41_generate(

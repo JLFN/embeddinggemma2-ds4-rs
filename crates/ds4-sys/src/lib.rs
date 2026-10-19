@@ -818,6 +818,23 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    /// Phase 6, the gemma_vq embedding tower (native/bridge/ds4_bridge.h).
+    /// `m` must be a model opened on a gemma_vq artifact: has_embed is the
+    /// upfront family check (exactly one family answers 1), and embed is one
+    /// item's token ids -> 768 floats, returning 1 on success and 0 with the
+    /// reason in `err`.  `ids` carry the prompt prefix already applied by the
+    /// caller, and the engine keeps the device plan bound between calls.
+    pub fn ds4_bridge_eg2vq_has_embed(m: *mut ds4_bridge_model) -> c_int;
+
+    pub fn ds4_bridge_eg2vq_embed(
+        m: *mut ds4_bridge_model,
+        ids: *const i32,
+        n_ids: u32,
+        out: *mut f32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_mimo2_sync_media(
         s: *mut ds4_bridge_session,
         tokens: *const i32,

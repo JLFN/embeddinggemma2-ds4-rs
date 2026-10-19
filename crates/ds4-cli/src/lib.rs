@@ -105,6 +105,25 @@ pub struct ShadowArgs {
     pub validate: bool,
     pub layout: bool,
     pub layout_variant: Option<String>,
+    /// `--embed TEXT` (phase 6): the gemma_vq embedding path -- one item in,
+    /// the 768-dim vector out as JSON.  `--embed-file FILE` takes the item from
+    /// a file and `--embed-stdin` from standard input; exactly one source per
+    /// call.
+    pub embed: Option<String>,
+    pub embed_file: Option<String>,
+    pub embed_stdin: bool,
+    /// `--task NAME`: which sentence-transformers prompt prefix to prepend,
+    /// chosen from the checkpoint's own names
+    /// (`config_sentence_transformers.json`).  Default `Retrieval-query`;
+    /// `Raw` prepends nothing, the no-prefix case.
+    pub task: Option<String>,
+    /// `--prompt-map FILE`: the checkpoint's config_sentence_transformers.json,
+    /// read instead of the built-in table (same names, same strings).
+    pub prompt_map: Option<String>,
+    /// `--dims N`: Matryoshka truncation to 512, 256 or 128 before
+    /// renormalization (the checkpoint's own MRL contract); 768 is the full
+    /// vector and the default.
+    pub dims: Option<u32>,
     ssd_options: Vec<ds4_core::ModelOpenOption>,
     pub dist: ds4_dist::Options,
     pub help: bool,
@@ -146,6 +165,12 @@ impl Default for ShadowArgs {
             dump_logprobs: None,
             dump_logits: None,
             dump_tokens: false,
+            embed: None,
+            embed_file: None,
+            embed_stdin: false,
+            task: None,
+            prompt_map: None,
+            dims: None,
             logprobs_top_k: 20,
             temp: 1.0,
             top_p: 1.0,
@@ -332,6 +357,18 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
                 parsed.prompt_file = Some(require_value(&arg, iter.next())?);
             }
             "--dump-tokens" => parsed.dump_tokens = true,
+            "--embed" => parsed.embed = Some(require_value(&arg, iter.next())?),
+            "--embed-file" => parsed.embed_file = Some(require_value(&arg, iter.next())?),
+            "--embed-stdin" => parsed.embed_stdin = true,
+            "--task" => parsed.task = Some(require_value(&arg, iter.next())?),
+            "--prompt-map" => parsed.prompt_map = Some(require_value(&arg, iter.next())?),
+            "--dims" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.dims = Some(
+                    v.parse()
+                        .map_err(|_| format!("--dims: invalid integer {v}"))?,
+                );
+            }
             "--dump-logits" => {
                 parsed.dump_logits = Some(
                     iter.next()
@@ -1309,6 +1346,16 @@ Usage:
   {name} --cuda -m MODEL [--nothink] --dump-logits F \\
       (-p PROMPT | --prompt-file FILE)
   {name} -m MODEL --dump-tokens (-p PROMPT | --prompt-file FILE)
+  {name} -m MODEL --embed TEXT [--task NAME] [--dims N]
+      Embed one item with the gemma_vq tower (EmbeddingGemma-2: an embedding
+      model with no language-model head) and print the vector as JSON.
+      --embed-file FILE or --embed-stdin take the item from elsewhere;
+      --embed needs exactly one source.  --task picks the prompt prefix from
+      the checkpoint's own names (default Retrieval-query, Raw for none);
+      --prompt-map FILE reads another config_sentence_transformers.json;
+      --dims truncates to a Matryoshka width (512, 256 or 128) and
+      renormalizes.  The C engine's device plan is bound on the first item and
+      reused, so a batch pays for one upload.
 
 C-compatible flags (same names as `ds4 --help`):
   -m, --model FILE        GGUF model path. Default: ds4flash.gguf
@@ -1561,6 +1608,27 @@ pub fn run(name: &str, mut args: ShadowArgs) -> Result<i32, String> {
     .map_err(|e| e.to_string())?;
     args.ctx = session_ctx(&args, ds4_core::caps_from_shape(model.shape()));
 
+    /* Phase 6: the embedding path.  A gemma_vq checkpoint has no
+     * language-model head (measured: no lm_head/output.weight among the
+     * artifact's 1376 tensors), so this is the operation it supports, and the
+     * --embed verb is how a person reaches it. */
+    if args.embed.is_some() || args.embed_file.is_some() || args.embed_stdin {
+        return run_embed(&model, &args, model_path);
+    }
+    /* And the reverse: a generation flag on an embedding checkpoint is refused
+     * by NAME here, at the command line, instead of falling through to a
+     * decoder arm this family does not have.  The C engine refuses it too
+     * (ds4_session_create guards family gemma_vq), which is what a caller that
+     * skips this check meets: before that guard existed, this exact command
+     * died with SIGSEGV on both backends. */
+    if model.embeds_text() {
+        return Err("ds4-rs: this checkpoint is an embedding model (family gemma_vq, \
+                    EmbeddingGemma-2): the artifact carries no language-model head, so \
+                    there are no tokens to generate -- only a 768-dim vector.  Use \
+                    --embed TEXT (ds4-rs --help), or POST /v1/embeddings on the server."
+            .into());
+    }
+
     /* The engine's --vision-golden gate (cli_main.c:193-195): a run mode of
      * its own, before any generate; exactly one --image names the picture. */
     if let Some(golden) = args.vision_golden.as_deref() {
@@ -1800,6 +1868,143 @@ fn parse_tokens(value: &str) -> Result<Vec<i32>, String> {
                 .map_err(|_| format!("invalid token id: {part}"))
         })
         .collect()
+}
+
+/// `--task NAME` -> the prefix, from the checkpoint's own table unless
+/// `--prompt-map` names the JSON to read instead (same names, same strings).
+/// `Raw` is the no-prefix case, the name the anchor script gives it.  The
+/// table itself now lives in `ds4_core::ST_PROMPTS` (moved out of this file so
+/// the HTTP route's `task` field and this flag cannot drift); `Raw` and unknown
+/// names are handled by `ds4_core::st_prompt`, and this function only adds the
+/// `--prompt-map` override.
+fn prompt_prefix(args: &ShadowArgs) -> Result<String, String> {
+    let task = args.task.as_deref().unwrap_or("Retrieval-query");
+    if let Some(path) = args.prompt_map.as_deref() {
+        let text = std::fs::read(path).map_err(|e| format!("--prompt-map {path}: {e}"))?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&text).map_err(|e| format!("--prompt-map {path}: {e}"))?;
+        let prompts = json
+            .get("prompts")
+            .and_then(|p| p.as_object())
+            .ok_or_else(|| format!("--prompt-map {path}: no prompts object"))?;
+        return prompts
+            .get(task)
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("--prompt-map {path}: no prompt named {task:?}"));
+    }
+    ds4_core::st_prompt(task).map_err(|e| {
+        format!(
+            "--task {}  (--prompt-map FILE reads another map; --task Raw prepends nothing.)",
+            e.message
+        )
+    })
+}
+
+/// The Matryoshka contract the checkpoint itself states: the 768-dim vector
+/// truncates to 512, 256 or 128 and is renormalized.  Any other width is
+/// refused rather than approximated.  The implementation now lives in
+/// `ds4_core::mrl_truncate` (moved so the HTTP route's `dimensions` field and
+/// `--dims` share one path); this wrapper only names the flag in the error.
+fn mrl_truncate(v: Vec<f32>, dims: u32) -> Result<Vec<f32>, String> {
+    ds4_core::mrl_truncate(v, dims).map_err(|e| format!("--dims {}", e.message))
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `--embed`/`--embed-file`/`--embed-stdin`: exactly one source, and the text is
+/// taken verbatim -- no trimming, because a trailing newline from a file or a
+/// pipe is the caller's business and the frozen set's items carry none.
+fn embed_text(args: &ShadowArgs) -> Result<String, String> {
+    let sources = usize::from(args.embed.is_some())
+        + usize::from(args.embed_file.is_some())
+        + usize::from(args.embed_stdin);
+    if sources != 1 {
+        return Err(
+            "--embed needs exactly one item source: --embed TEXT, --embed-file FILE or \
+             --embed-stdin"
+                .into(),
+        );
+    }
+    if let Some(text) = args.embed.as_deref() {
+        return Ok(text.to_string());
+    }
+    if let Some(path) = args.embed_file.as_deref() {
+        let raw = std::fs::read(path).map_err(|e| format!("--embed-file {path}: {e}"))?;
+        return String::from_utf8(raw).map_err(|e| format!("--embed-file {path}: not UTF-8 ({e})"));
+    }
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+        .map_err(|e| format!("--embed-stdin: {e}"))?;
+    Ok(buf)
+}
+
+/// `--embed`: one item through the gemma_vq tower, JSON on stdout.  The item is
+/// the caller's prompt prefix + text, tokenized by the family's own encoder with
+/// the artifact's special-token flags, then run through the C engine's
+/// embedding entry (device tower on a graph backend, the same reference forward
+/// on CPU) -- the route and this verb reach the same function.
+fn run_embed(model: &ds4_core::Model, args: &ShadowArgs, model_path: &str) -> Result<i32, String> {
+    if !model.embeds_text() {
+        return Err("ds4-rs: --embed needs a gemma_vq artifact: this model's family is not \
+                    the embedding tower"
+            .into());
+    }
+    let text = embed_text(args)?;
+    if text.is_empty() {
+        return Err("--embed: the item is empty".into());
+    }
+    let prefix = prompt_prefix(args)?;
+    let task = args
+        .task
+        .clone()
+        .unwrap_or_else(|| "Retrieval-query".to_string());
+    // The artifact's own flags, read from the file exactly as the phase-4
+    // tokenizer driver reads them (this artifact: BOS 2 and EOS 1, both on).
+    let (add_bos, add_eos) = ds4_core::tokenizer_special_flags(std::path::Path::new(model_path))
+        .map_err(|e| e.to_string())?;
+    let ids = model.embed_item_ids(&prefix, &text, add_bos, add_eos);
+    let t0 = std::time::Instant::now();
+    let vector = model.embed_gemma_vq(&ids).map_err(|e| e.to_string())?;
+    let secs = t0.elapsed().as_secs_f64();
+    let vector = match args.dims {
+        Some(d) => mrl_truncate(vector, d)?,
+        None => vector,
+    };
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  \"family\": \"gemma_vq\",\n");
+    out.push_str(&format!("  \"task\": \"{}\",\n", json_escape(&task)));
+    out.push_str(&format!("  \"prompt\": \"{}\",\n", json_escape(&prefix)));
+    out.push_str(&format!("  \"n_tokens\": {},\n", ids.len()));
+    out.push_str(&format!("  \"add_bos\": {add_bos},\n"));
+    out.push_str(&format!("  \"add_eos\": {add_eos},\n"));
+    out.push_str(&format!("  \"dims\": {},\n", vector.len()));
+    out.push_str(&format!("  \"secs\": {secs:.6},\n"));
+    out.push_str("  \"embedding\": [");
+    for (i, x) in vector.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{x:.7}"));
+    }
+    out.push_str("]\n}\n");
+    print!("{out}");
+    Ok(0)
 }
 
 #[cfg(test)]

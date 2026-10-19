@@ -38,6 +38,13 @@
  */
 enum { EG2VQ_GPU_ALIGN = 16 };
 
+/* The public entry point's item limit and the attention kernel's key plane are
+ * one number (ds4_eg2vq.h, DS4_EG2VQ_MAX_TOKENS): if they diverged, the entry
+ * point would admit an item the kernel then refuses, which is exactly the
+ * silent-truncation class of bug the launcher's refusal exists to prevent. */
+static_assert((uint32_t)DS4_EG2VQ_MAX_TOKENS == (uint32_t)EG2VQ_ATTN_KEYS_MAX,
+              "DS4_EG2VQ_MAX_TOKENS must equal EG2VQ_ATTN_KEYS_MAX");
+
 static inline uint64_t eg2vq_gpu_round16(uint64_t bytes) {
     return (bytes + (uint64_t)(EG2VQ_GPU_ALIGN - 1)) & ~(uint64_t)(EG2VQ_GPU_ALIGN - 1);
 }

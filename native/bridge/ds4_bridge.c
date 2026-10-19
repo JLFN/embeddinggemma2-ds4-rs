@@ -966,6 +966,23 @@ void ds4_bridge_v41_vision_rows_free(float *rows) {
     free(rows);
 }
 
+/* Phase 6: the gemma_vq embedding tower (the v41 walk above is the pattern).
+ * The engine owns the device plan; this is only the family check and the call,
+ * so the CLI verb and the HTTP route share one implementation. */
+int ds4_bridge_eg2vq_has_embed(ds4_bridge_model *m) {
+    if (!m || !m->engine) return 0;
+    return ds4_engine_has_embed_gemma_vq(m->engine) ? 1 : 0;
+}
+
+int ds4_bridge_eg2vq_embed(ds4_bridge_model *m, const int32_t *ids, uint32_t n_ids,
+                           float *out768, char *err, size_t errlen) {
+    if (!m || !m->engine) {
+        set_err(err, errlen, "no model is open");
+        return 0;
+    }
+    return ds4_engine_embed_gemma_vq(m->engine, ids, n_ids, out768, err, errlen);
+}
+
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,

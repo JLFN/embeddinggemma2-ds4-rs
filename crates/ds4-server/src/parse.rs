@@ -279,6 +279,17 @@ impl ParsedRequest {
         }
     }
 
+    /// Phase 6: the minimal `ParsedRequest` a `/v1/embeddings` job carries so
+    /// it can share the lease, admission and owner-channel plumbing with a
+    /// generation job.  The embed branch of `serve::run_prepared` never reads
+    /// it; kind Chat / api Openai are the port's defaults, so an accidental
+    /// generation-path read can only look like an ordinary default request,
+    /// never like a new wire surface.  `needs` stays 0 (an embed job takes no
+    /// generation lane).
+    pub(crate) fn embedding_carrier(env: &ParseEnv) -> Self {
+        Self::init(ReqKind::Chat, env)
+    }
+
     pub(crate) fn finish_needs(&mut self) {
         self.needs = compute_needs(&NeedInput {
             api: self.api,

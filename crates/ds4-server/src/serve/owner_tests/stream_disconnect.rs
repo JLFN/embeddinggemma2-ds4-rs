@@ -105,6 +105,7 @@ fn streamed_job(surface: WireSurface, body: &str, body_bytes: u64) -> PreparedJo
         surface,
         body_bytes,
         arrived_at: Instant::now(),
+        embed: None,
     }
 }
 

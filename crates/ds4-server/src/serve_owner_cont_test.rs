@@ -218,6 +218,7 @@ fn cont_chat_job(inner: &Arc<Mutex<ServerInner>>, tag: &str) -> (OwnerJob, JobDr
         surface: WireSurface::OpenaiChat,
         body_bytes: body.len() as u64,
         arrived_at: Instant::now(),
+        embed: None,
     };
     let mut g = lock_inner(inner);
     assert_eq!(enqueue(&mut g.admit, prepared.body_bytes), EnqVerdict::Ok);
@@ -464,6 +465,7 @@ fn anthropic_tool_job(inner: &Arc<Mutex<ServerInner>>, tag: &str) -> (OwnerJob, 
         surface: WireSurface::Anthropic,
         body_bytes: body.len() as u64,
         arrived_at: Instant::now(),
+        embed: None,
     };
     let mut g = lock_inner(inner);
     assert_eq!(enqueue(&mut g.admit, prepared.body_bytes), EnqVerdict::Ok);

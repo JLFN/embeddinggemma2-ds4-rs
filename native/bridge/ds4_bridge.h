@@ -393,6 +393,16 @@ float *ds4_bridge_v41_vision_run(ds4_bridge_model *m, const float *patches,
                                  uint32_t n_vit_h, uint32_t n_vit_w,
                                  uint32_t *n_llm_h, uint32_t *n_llm_w);
 void ds4_bridge_v41_vision_rows_free(float *rows);
+/* Phase 6: the gemma_vq embedding tower, the same shape as the v41 walk above --
+ * has_embed_gemma_vq is the caller's upfront check (exactly one family answers
+ * yes), and embed_gemma_vq is one item's token ids through ds4_engine_embed_gemma_vq
+ * (see that declaration in ds4.h for the refusals).  `ids` are the tokenizer's
+ * own output for the item, BOS through EOS, with the prompt prefix already
+ * applied by the caller; out768 takes 768 floats and is untouched on a refusal.
+ * Returns 1 on success, 0 with the reason in err. */
+int ds4_bridge_eg2vq_has_embed(ds4_bridge_model *m);
+int ds4_bridge_eg2vq_embed(ds4_bridge_model *m, const int32_t *ids, uint32_t n_ids,
+                           float *out768, char *err, size_t errlen);
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,
