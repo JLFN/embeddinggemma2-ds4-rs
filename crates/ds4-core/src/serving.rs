@@ -842,7 +842,14 @@ pub fn serving_caps(family: ModelFamily, variant: Variant) -> ServingCaps {
             qualified_ctx: None,
             qualified_banks: None,
             qualified_prompt: None,
-            media_serial: false,
+            // The image path (phase 8) runs on ONE device workspace per engine,
+            // grown to the largest image served so far (ds4.c's
+            // eg2vq_vision_device_ensure): two images at once would race for it,
+            // so media is serial for this family.  The image's own budget is not
+            // here: it is the checkpoint's size solver's (70..1120 soft tokens,
+            // 161280..2580480 pixels, align 48) and the engine refuses an image it
+            // cannot place by name.
+            media_serial: true,
         },
         ModelFamily::NaiveN05 => ServingCaps {
             family,
