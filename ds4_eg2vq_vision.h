@@ -75,8 +75,8 @@ enum {
     DS4_EG2VQ_VISION_MAX_PATCHES = 2580480 / (16 * 16),
 };
 
-#define DS4_EG2VQ_VISION_ROPE_THETA 100.0f   /* clip.cpp:1723 */
-#define DS4_EG2VQ_VISION_RMS_EPS    1e-6f    /* clip-model.h:93 */
+#define DS4_EG2VQ_VISION_ROPE_THETA 100.0f   /* clip.cpp:1725 */
+#define DS4_EG2VQ_VISION_RMS_EPS    1e-6f    /* clip-model.h:95 */
 /* The pooler scales by sqrt(n_embd) (gemma4v.cpp:96): computed, not a rounded
  * literal, so the port applies the reference's own expression. */
 

@@ -24,8 +24,8 @@
  *     -> one 16x16 stride-16 conv, NO bias                   gemma4v.cpp:12-16
  *     -> + position table[row]: x slice then y slice          gemma4v.cpp:26-43
  *     -> 16 blocks:
- *          x = RMS(inpL, ln1)                                 clip.cpp:379
- *          q,k,v = Wq/Wk/Wv x                                 clip.cpp:436-451
+ *          x = RMS(inpL, ln1)                                 clip.cpp:376
+ *          q,k,v = Wq/Wk/Wv x                                 clip.cpp:424-434
  *          per-head RMS on q,k ([64] norms => norm_per_head)  clip.cpp:440-465
  *          axial NeoX RoPE: dims [0,32) on pos_x, [32,64) on
  *            pos_y at offset 32, theta 100                     gemma4v.cpp:46-73
@@ -34,7 +34,7 @@
  *                                                             clip.cpp:787-802
  *          o proj -> attn_post_norm -> +residual               clip.cpp:486-500
  *          ln2 -> GEGLU (gelu_quick) -> ffn_post_norm          clip.cpp:519-529
- *          +residual                                           clip.cpp:534
+ *          +residual                                           clip.cpp:537
  *     -> 3x3 stride-3 average pool over the (grid_w,grid_h) grid, then
  *        scale sqrt(n_embd)                                    gemma4v.cpp:83-99
  *     -> weightless RMS (eps 1e-6) + 768->512 projection        gemma4v.cpp:104-114
@@ -302,7 +302,7 @@ static void eg2vq_vision_conv_worker(void *vctx, uint64_t r0, uint64_t r1) {
  * (ggml-cpu/ops.cpp:6455, where n_dims is the op's own 32, not the full head),
  * and each rope call rotates pairs (i, i + 16) INSIDE its own 32 dims — the
  * second call at the +32 offset the graph sets with ggml_rope_set_offset
- * (gemma4v.cpp:71, ggml.c:4547-4557). */
+ * (gemma4v.cpp:70, ggml.c:4547-4557). */
 typedef struct {
     float        *q, *k, *v;
     const float  *qn, *kn;

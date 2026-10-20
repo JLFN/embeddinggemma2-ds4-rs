@@ -4,7 +4,7 @@
  * `#ifndef DS4_NO_GPU` block that opens at ds4.c:18444, so the CPU-only
  * reference oracle could not call the resizer even though the code itself is
  * plain C with no CUDA in it.  Nothing here changed: the bodies below are the
- * bytes that were at ds4.c:26636-26779, and both callers (the Qwen4exp image
+ * bytes that were at ds4.c:26635-26778, and both callers (the Qwen4exp image
  * path and the gemma_vq vision tower) now share them.
  *
  * Authority: this IS llama.cpp mtmd's `img_tool::resize_pillow`

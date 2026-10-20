@@ -1,7 +1,7 @@
 /* ds4_eg2vq_vision_bind.inc — the vision tower's weight adapter (unit 23).
  *
  * The companion mmproj is opened as its OWN model (the family pattern:
- * ds4.c:72689 opens opt->vision_path the same way for GLM-5.3), so this file
+ * ds4.c:72566 opens opt->vision_path the same way for GLM-5.3), so this file
  * only names tensors and checks geometry.  Every name below is one the
  * reference's own loader read back from the same file
  * (out/eg2vq-vision-anchor.log, 211 tensors), and the mmproj's 19 metadata
