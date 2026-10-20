@@ -24,9 +24,10 @@
  * against the frozen dumps, its distance from the CPU leg is the same size as
  * each leg's distance from the dumps, and the tower's own amplification is
  * measured here with an input kick.  What the bound discriminates is stated in
- * tools/eg2_vision_gate24.sh: the gross mechanism flips are 5x to 100x further
- * out, and the fine ones (the gelu_quick f16 chain, f32 K/V) are inside the
- * tower's own rounding band, which is the same honesty gate 23 records about its
+ * tools/eg2_vision_gate24.sh: the three flips that are visible in this
+ * comparison are 1.66x, 3.27x and 1.08x the port's own worst relative RMS, and
+ * one (f32 K/V, 0.96x) is inside the tower's own rounding band and is recorded
+ * as NOT discriminated — the same honesty gate 23 records about its
  * fine-grained rows.
  *
  *   usage: eg2vq_vision_cuda_oracle <mmproj.gguf> <image> [<image> ...]
@@ -69,9 +70,11 @@
  * - three implementations at ~0.5-1.0% from each other can be up to their SUM
  *    apart (triangle inequality): 0.010428 + 0.008235 = 0.0187 relative RMS and
  *    0.222 + 0.103 = 0.325 maxabs, which is the order gate 23 already declares
- *    for ONE leg against the frozen dumps.  The bound below is that envelope, and
- *    the gate's meaning does not rest on it: the discrimination flips in
- *    tools/eg2_vision_gate24.sh are 5x to 100x further out.
+ *    for ONE leg against the frozen dumps.  The bound is that envelope, and the
+ *    gate's meaning does not rest on it: the three attribution flips this
+ *    comparison can see are 1.66x, 3.27x and 1.08x the port's own distance from
+ *    the CPU leg (tools/eg2_vision_gate24.sh), and the fourth is recorded as
+ *    below the tower's own rounding band.
  */
 static const double VIS_SOFT_MAXABS     = 0.30;
 static const double VIS_SOFT_RELRMS     = 0.025;
