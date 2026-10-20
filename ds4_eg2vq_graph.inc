@@ -166,8 +166,12 @@ static void eg2vq_attn_worker(void *vctx, uint64_t r0, uint64_t r1) {
     free(scores);
 }
 
-void ds4_eg2vq_ref_embed(const ds4_model *m, const ds4_weights *w,
-                         const int32_t *ids, uint32_t n_ids, float *out768) {
+/* The forward proper, with the image splice optional: `soft`/`n_soft` are the
+ * vision tower's soft rows (ds4_eg2vq.h's DS4_EG2VQ_IMAGE_TOKEN_ID carries the
+ * contract), and NULL/none is the pure-text path every earlier gate measured. */
+static void eg2vq_ref_embed_core(const ds4_model *m, const ds4_weights *w,
+                                 const int32_t *ids, uint32_t n_ids,
+                                 const float *soft, uint32_t n_soft, float *out768) {
     const ds4_eg2vq_weights *g = w->eg2vq;
     if (!g || !g->dense) { ds4_die("gemma_vq: the text tower weights are not bound"); }
     if (n_ids == 0) { ds4_die("gemma_vq: the item has no tokens"); }
@@ -195,16 +199,37 @@ void ds4_eg2vq_ref_embed(const ds4_model *m, const ds4_weights *w,
     float *ple      = xmalloc((size_t)n_ids * PL * (size_t)DS4_EG2VQ_N_LAYER * sizeof(float));
 
     /* 1. token embeddings scaled by sqrt(n_embd) (gemma-embedding2.cpp:86;
-     * f_embedding_scale stays 0 for this arch, so this is the only scale). */
+     * f_embedding_scale stays 0 for this arch, so this is the only scale), with
+     * the image span's rows taken from the soft block UNSCALED (the splice; see
+     * ds4_eg2vq_ref_embed_image and gemma-embedding2.cpp:85-86). */
     const float emb_scale = sqrtf((float)E);
     const uint64_t n_vocab = g->token_embd->dim[1];
+    uint32_t n_used = 0, span_start = 0;
     for (uint32_t t = 0; t < n_ids; t++) {
+        float *ht = h + (size_t)t * E;
+        if ((uint32_t)ids[t] == (uint32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) {
+            if (!soft || n_used >= n_soft) {
+                ds4_die("gemma_vq: the image span and the soft tokens disagree");
+            }
+            /* contiguous, in span order: the device twin addresses the block the
+             * same way (ds4_gpu_eg2vq_embed_image), so both legs refuse a span
+             * that is not one run. */
+            if (!n_used) { span_start = t; }
+            if (t != span_start + n_used) {
+                ds4_die("gemma_vq: the image span is not contiguous");
+            }
+            memcpy(ht, soft + (size_t)n_used * E, (size_t)E * sizeof(float));
+            n_used++;
+            continue;
+        }
         if ((uint32_t)ids[t] >= n_vocab) {
             ds4_die("gemma_vq: token id is outside the embedding table");
         }
-        float *ht = h + (size_t)t * E;
         ds4_ref_row(m, g->token_embd, (uint64_t)(uint32_t)ids[t], ht);
         for (uint32_t i = 0; i < E; i++) ht[i] *= emb_scale;
+    }
+    if (soft && n_used != n_soft) {
+        ds4_die("gemma_vq: the image span and the soft tokens disagree");
     }
 
     /* 2. per-layer input, once from the embedding (gemma-embedding2.cpp:215-232):
@@ -367,4 +392,16 @@ void ds4_eg2vq_ref_embed(const ds4_model *m, const ds4_weights *w,
     free(e); free(ow); free(ple); free(pp); free(pg);
     free(ffn_out); free(ffn_up); free(ffn_gate); free(attn);
     free(v); free(k); free(q); free(a); free(f); free(x); free(h);
+}
+
+void ds4_eg2vq_ref_embed(const ds4_model *m, const ds4_weights *w,
+                         const int32_t *ids, uint32_t n_ids, float *out768) {
+    eg2vq_ref_embed_core(m, w, ids, n_ids, NULL, 0, out768);
+}
+
+void ds4_eg2vq_ref_embed_image(const ds4_model *m, const ds4_weights *w,
+                               const int32_t *ids, uint32_t n_ids,
+                               const float *soft, uint32_t n_soft, float *out768) {
+    if (!soft || !n_soft) { ds4_die("gemma_vq: the image splice has no soft tokens"); }
+    eg2vq_ref_embed_core(m, w, ids, n_ids, soft, n_soft, out768);
 }

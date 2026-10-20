@@ -132,6 +132,59 @@ static inline int eg2vq_ops_embed(float *out, const int32_t *ids, const uint8_t 
     return 1;
 }
 
+/* The same gather with an IMAGE SPAN: the rows whose id is `image_id` take their
+ * value from `soft` (UNSCALED) instead of the token table (scaled), and the span
+ * must be contiguous, so the soft row for ids[t] is t - `span_start`.  The
+ * unscaled raw-embedding input is llama.cpp's own rule (build_inp_embd scales the
+ * token lookup and leaves an embedding entry alone: "important: do not normalize
+ * weights for raw embeddings input (i.e. encoded image embeddings)",
+ * src/models/gemma-embedding2.cpp:85-86), and the CPU leg's splice
+ * (ds4_eg2vq_graph.inc, eg2vq_ref_embed_core) consumes the same rows in the same
+ * order.  The launcher checks the span's shape; the kernel assumes it. */
+__global__ void eg2vq_ops_embed_image_kernel(
+        float *__restrict__ out, const int32_t *__restrict__ ids,
+        const uint8_t *__restrict__ table, const float *__restrict__ soft,
+        uint32_t n_ids, uint32_t n_embd, uint64_t n_vocab, float scale,
+        int32_t image_id, uint32_t span_start) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_ids) { return; }
+    float *row = out + (size_t)t * n_embd;
+    if ((int32_t)ids[t] == image_id) {
+        const float *src = soft + (size_t)(t - span_start) * n_embd;
+        for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) { row[i] = src[i]; }
+        return;
+    }
+    const uint32_t nb = n_embd / 32u;
+    const uint64_t id = (uint64_t)(uint32_t)ids[t];
+    if (id >= n_vocab) {                     /* out-of-range id: the graph dies; the kernel zeroes */
+        for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) { row[i] = 0.0f; }
+        return;
+    }
+    const uint8_t *src = table + id * (uint64_t)nb * 34u;
+    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+        const uint8_t *blk = src + (size_t)b * 34u;
+        uint16_t h;
+        memcpy(&h, blk, 2);
+        __half hh;
+        memcpy(&hh, &h, 2);
+        const float ds = __half2float(hh) * scale;
+        const int8_t *q = (const int8_t *)(blk + 2);
+        for (uint32_t i = 0; i < 32u; i++) { row[b * 32u + i] = ds * (float)q[i]; }
+    }
+}
+
+static inline int eg2vq_ops_embed_image(float *out, const int32_t *ids, const uint8_t *table,
+                                        const float *soft, uint32_t n_ids, uint32_t n_embd,
+                                        uint64_t n_vocab, int32_t image_id, uint32_t span_start,
+                                        uint32_t n_soft) {
+    if (!out || !ids || !table || !soft || !n_ids || !n_embd || (n_embd % 32u)) { return 0; }
+    if (span_start + n_soft > n_ids) { return 0; }
+    const float scale = sqrtf((float)n_embd);
+    eg2vq_ops_embed_image_kernel<<<n_ids, 128>>>(out, ids, table, soft, n_ids, n_embd,
+                                                 n_vocab, scale, image_id, span_start);
+    return 1;
+}
+
 /* ---- RMS, row-wise and per head ------------------------------------------ */
 
 /* out[r][i] = x[r][i] * (1/sqrt(mean_sq + eps)) * (w ? w[i] : 1); the mean over

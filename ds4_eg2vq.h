@@ -132,6 +132,35 @@ typedef struct {
 void ds4_eg2vq_ref_embed(const struct ds4_model *m, const struct ds4_weights *w,
                          const int32_t *ids, uint32_t n_ids, float *out768);
 
+/* The image span's placeholder id, from the checkpoint's own config.json
+ * (image_token_id 258880).  Its vocabulary string is "<|image|>", while the two
+ * MARKERS the reference wraps the span with are "<|image>" = 255999 and
+ * "<image|>" = 258882 (config.json's boi/eoi_token_id); the port's own tokenizer
+ * emits those two from the same strings, which is how the 92-position spliced
+ * sequence is built.  The container carries no metadata key for the placeholder
+ * (unlike the other families' vision GGUFs, which is why their adapters read one),
+ * so the id is named here once, and this is how it is checked against the
+ * artifact:
+ *
+ *   cargo run -p ds4-core --release --example gemma_vq_vocab -- <artifact.gguf> 255999,258880,258882
+ *   ->  255999  <|image>   258880  <|image|>   258882  <image|>
+ */
+#define DS4_EG2VQ_IMAGE_TOKEN_ID 258880
+
+/* THE IMAGE SPLICE: the same forward, with the image's soft tokens filling the
+ * positions the ids mark.  `ids` carries the span as DS4_EG2VQ_IMAGE_TOKEN_ID
+ * placeholders (one per soft row), and `soft` is n_soft rows of
+ * DS4_EG2VQ_N_EMBD floats in span order.  The soft rows enter the tower's input
+ * UNSCALED, while a token row is scaled by sqrt(n_embd): llama.cpp's
+ * build_inp_embd takes a scale for the token lookup and leaves a raw embedding
+ * entry alone — "important: do not normalize weights for raw embeddings input
+ * (i.e. encoded image embeddings)", src/models/gemma-embedding2.cpp:85-86.  A
+ * placeholder count that disagrees with n_soft, or a placeholder with no soft row
+ * left, is a hard stop: a silently misaligned span would be a wrong answer. */
+void ds4_eg2vq_ref_embed_image(const struct ds4_model *m, const struct ds4_weights *w,
+                               const int32_t *ids, uint32_t n_ids,
+                               const float *soft, uint32_t n_soft, float *out768);
+
 /* The longest item the device path accepts: the attention kernel's key plane
  * (cuda/eg2vq_attn.cuh:49, EG2VQ_ATTN_KEYS_MAX; the equality is asserted in
  * ds4_eg2vq_gpu.cuh).  A longer item is REFUSED by the entry point rather than
@@ -252,6 +281,13 @@ void ds4_gpu_eg2vq_free(ds4_eg2vq_gpu_ctx *ctx);
  * nothing) for an empty item, an item longer than the context's max_tokens, or
  * a token id the embedding table cannot address. */
 int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids, uint32_t n_ids, float *out768);
+
+/* The image splice on the device: the same call, with the vision tower's
+ * `n_soft` soft rows (DS4_EG2VQ_N_EMBD floats each) filling the positions the
+ * ids mark as DS4_EG2VQ_IMAGE_TOKEN_ID.  Returns 0 for the same refusals as the
+ * text call plus a placeholder count that disagrees with n_soft. */
+int ds4_gpu_eg2vq_embed_image(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids, uint32_t n_ids,
+                              const float *soft, uint32_t n_soft, float *out768);
 
 #ifdef __cplusplus
 }

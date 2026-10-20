@@ -59,6 +59,7 @@ typedef struct {
     uint64_t ids, out, h, x, f, a;
     uint64_t q_swa, q_full, kv, attn_swa, attn_full;
     uint64_t fg, fu, fd, pg, pp, ple;
+    uint64_t in_soft;                        /* the image splice's soft block */
     uint64_t total;
 } eg2vq_gpu_layout;
 
@@ -96,6 +97,9 @@ static eg2vq_gpu_layout eg2vq_gpu_layout_of(uint32_t max_tokens) {
     L.pg = c;         c += eg2vq_gpu_round16(t * PL * sizeof(float));
     L.pp = c;         c += eg2vq_gpu_round16(t * PL * sizeof(float));
     L.ple = c;        c += eg2vq_gpu_round16(t * PL * (uint64_t)DS4_EG2VQ_N_LAYER * sizeof(float));
+    /* the image splice's soft block: at most one row per token, so the item's own
+     * ceiling bounds it (ds4_gpu_eg2vq_embed_image refuses a longer block). */
+    L.in_soft = c;    c += eg2vq_gpu_round16(t * E * sizeof(float));
     L.total = c;
     return L;
 }
@@ -398,15 +402,29 @@ extern "C" ds4_eg2vq_gpu_ctx *ds4_gpu_eg2vq_create(const ds4_eg2vq_gpu_model *mo
 }
 
 /* One item, the CPU reference forward's op order (ds4_eg2vq_graph.inc:169-370).
- * The numeric comments cite that file; every constant is ds4_eg2vq.h's. */
-extern "C" int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
-        uint32_t n_ids, float *out768) {
+ * The numeric comments cite that file; every constant is ds4_eg2vq.h's.
+ *
+ * `soft`/`n_soft`/`span_start` are the IMAGE SPLICE (ds4_eg2vq_ref_embed_image's
+ * device twin): when they are given, the ids' span rows take the soft block's
+ * rows unscaled and every other row is the token table's scaled by sqrt(n_embd).
+ * The span must be contiguous — soft rows are addressed as t - span_start — and
+ * the caller (ds4_gpu_eg2vq_embed_image) has already checked that. */
+static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
+        uint32_t n_ids, const float *soft, uint32_t n_soft, uint32_t span_start,
+        float *out768) {
     if (!ctx || !ids || !out768) { return 0; }
     if (!n_ids || n_ids > ctx->max_tokens) { return 0; }
     const ds4_eg2vq_gpu_model *g = ctx->model;
     if (!g->n_vocab) { return 0; }
+    const int spliced = (soft && n_soft) ? 1 : 0;
+    if (spliced && span_start + n_soft > n_ids) { return 0; }
     for (uint32_t t = 0; t < n_ids; t++) {                       /* the graph dies here; the API refuses */
-        if (ids[t] < 0 || (uint64_t)(uint32_t)ids[t] >= g->n_vocab) { return 0; }
+        if (ids[t] < 0) { return 0; }
+        if (spliced && (uint32_t)ids[t] == (uint32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) {
+            if (t < span_start || t >= span_start + n_soft) { return 0; }   /* a hole or an outsider */
+            continue;
+        }
+        if ((uint64_t)(uint32_t)ids[t] >= g->n_vocab) { return 0; }
     }
 
     const uint32_t E = (uint32_t)DS4_EG2VQ_N_EMBD;
@@ -435,10 +453,21 @@ extern "C" int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
 
     if (!ds4_gpu_tensor_write(ctx->scratch, ctx->L.ids, ids, (size_t)n_ids * sizeof(int32_t))) { return 0; }
 
-    /* 1. token embeddings, scaled by sqrt(n_embd) (graph:196-208). */
-    if (!eg2vq_ops_embed(h, (const int32_t *)eg2vq_gpu_buf(ctx, ctx->L.ids),
-                         (const uint8_t *)g->aux->ptr + g->aux_off[DS4_EG2VQ_AUX_TOKEN_EMBD],
-                         n_ids, E, g->n_vocab)) { return 0; }
+    /* 1. token embeddings, scaled by sqrt(n_embd) (graph:196-208), with the image
+     * span's rows taken from the soft block unscaled when this is a splice
+     * (graph:199-217, the same two branches). */
+    if (spliced) {
+        if (!ds4_gpu_tensor_write(ctx->scratch, ctx->L.in_soft, soft,
+                                  (size_t)n_soft * E * sizeof(float))) { return 0; }
+        if (!eg2vq_ops_embed_image(
+                h, (const int32_t *)eg2vq_gpu_buf(ctx, ctx->L.ids),
+                (const uint8_t *)g->aux->ptr + g->aux_off[DS4_EG2VQ_AUX_TOKEN_EMBD],
+                eg2vq_gpu_frow(ctx, ctx->L.in_soft), n_ids, E, g->n_vocab,
+                (int32_t)DS4_EG2VQ_IMAGE_TOKEN_ID, span_start, n_soft)) { return 0; }
+    } else if (!eg2vq_ops_embed(
+            h, (const int32_t *)eg2vq_gpu_buf(ctx, ctx->L.ids),
+            (const uint8_t *)g->aux->ptr + g->aux_off[DS4_EG2VQ_AUX_TOKEN_EMBD],
+            n_ids, E, g->n_vocab)) { return 0; }
 
     /* 2. the per-layer input, once from the embedding (graph:210-227): the
      * projection, its 1/sqrt(n_embd), then the RMS of each layer's 512-slice. */
@@ -518,4 +547,27 @@ extern "C" int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
     ctx->calls++;
     ctx->tokens += n_ids;
     return 1;
+}
+
+extern "C" int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
+        uint32_t n_ids, float *out768) {
+    return eg2vq_gpu_embed_core(ctx, ids, n_ids, NULL, 0, 0, out768);
+}
+
+/* The image splice, and the span's own shape check: the ids must carry a
+ * contiguous run of exactly `n_soft` DS4_EG2VQ_IMAGE_TOKEN_ID placeholders, or
+ * the soft rows cannot be addressed (and a span that disagrees with the soft
+ * block is refused rather than truncated). */
+extern "C" int ds4_gpu_eg2vq_embed_image(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
+        uint32_t n_ids, const float *soft, uint32_t n_soft, float *out768) {
+    if (!ctx || !ids || !soft || !n_soft || !out768) { return 0; }
+    uint32_t span_start = 0, seen = 0;
+    for (uint32_t t = 0; t < n_ids; t++) {
+        if ((uint32_t)ids[t] != (uint32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) { continue; }
+        if (!seen) { span_start = t; }
+        seen++;
+        if (t != span_start + seen - 1u) { return 0; }   /* not contiguous */
+    }
+    if (seen != n_soft) { return 0; }
+    return eg2vq_gpu_embed_core(ctx, ids, n_ids, soft, n_soft, span_start, out768);
 }

@@ -2868,3 +2868,20 @@ tests/parity/eg2vq_vision_cuda_oracle: tests/parity/eg2vq_vision_cuda_oracle.o $
 .PHONY: test-eg2vq-vision-gpu
 test-eg2vq-vision-gpu: tests/parity/eg2vq_vision_cuda_oracle
 	@echo "run: ./tests/parity/eg2vq_vision_cuda_oracle <mmproj.gguf> <image> [--out-dir DIR]"
+
+# embeddinggemma2 PHASE 8 row P4.6 (unit 25): the IMAGE SPLICE end to end.  The
+# harness binds the TEXT tower from the artifact and the VISION tower from the
+# companion mmproj in one process, runs both legs (CPU and device), and compares
+# the pooled vector against the frozen splices in tests/vision/reference/.  It is
+# the device-oracle pattern (no DS4_NO_GPU, links the CUDA objects) because the
+# device text tower's splice ds4_gpu_eg2vq_embed_image is half of what it gates.
+tests/parity/eg2vq_splice_cuda_oracle.o: tests/parity/eg2vq_splice_cuda_oracle.c ds4.c ds4.h ds4_eg2vq.h ds4_eg2vq_bind.inc ds4_eg2vq_graph.inc ds4_eg2vq_gpu.cuh cuda/eg2vq_ops.cuh cuda/eg2vq_vq.cuh cuda/eg2vq_attn.cuh ds4_eg2vq_vision.h ds4_eg2vq_vision_bind.inc ds4_eg2vq_vision_graph.inc ds4_eg2vq_vision_gpu.cuh cuda/eg2vq_vis.cuh ds4_resize_pillow.inc native/bridge/ds4_host_load.h
+	$(CC) $(CFLAGS) -O3 -ffunction-sections -fdata-sections \
+	-Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/parity/eg2vq_splice_cuda_oracle: tests/parity/eg2vq_splice_cuda_oracle.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $^ -Xlinker --gc-sections $(CUDA_LDLIBS)
+
+.PHONY: test-eg2vq-splice
+test-eg2vq-splice: tests/parity/eg2vq_splice_cuda_oracle
+	@echo "run: ./tests/parity/eg2vq_splice_cuda_oracle <artifact.gguf> <mmproj.gguf> <image> [<image> ...]"
