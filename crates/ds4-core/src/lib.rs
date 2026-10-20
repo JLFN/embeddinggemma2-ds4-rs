@@ -2507,8 +2507,12 @@ impl Model {
             });
         }
         for i in 0..n_items {
-            let len = (item_off[i + 1] - item_off[i]) as usize;
-            if len == 0 {
+            // The span's shape is checked BEFORE the subtraction, so a table
+            // that does not rise is the documented Err in every build profile --
+            // an unchecked subtraction would underflow (a panic in a debug
+            // build, a wrapped len in a release one), and the device core checks
+            // the same thing explicitly (ds4_eg2vq_gpu.cuh's span loop).
+            if item_off[i + 1] == item_off[i] {
                 return Err(Error {
                     code: 1,
                     message: format!(
@@ -2518,6 +2522,17 @@ impl Model {
                     ),
                 });
             }
+            if item_off[i + 1] < item_off[i] {
+                return Err(Error {
+                    code: 1,
+                    message: format!(
+                        "the item spans do not rise at input[{i}]: [{}, {})",
+                        item_off[i],
+                        item_off[i + 1]
+                    ),
+                });
+            }
+            let len = (item_off[i + 1] - item_off[i]) as usize;
             if len > crate::gemma_vq::ITEM_TOKENS_MAX as usize {
                 return Err(Error {
                     code: 1,

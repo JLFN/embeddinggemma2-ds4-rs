@@ -189,10 +189,13 @@ void ds4_eg2vq_ref_embed_image(const struct ds4_model *m, const struct ds4_weigh
  * number the serving caps advertise as `embed.batch_rows_max`
  * (crates/ds4-core/src/gemma_vq.rs BATCH_ROWS_MAX, which this macro mirrors and
  * crates/ds4-core/tests/eg2vq_serving_caps.rs holds equal by reading this header
- * as text).  The workspace is linear in rows at 114,700 bytes each
- * (ds4_eg2vq_gpu.cuh's layout: the tower's per-row planes, the batch metadata and
- * the projection's own per-row planes), so the cap is 896.2 MiB of device
- * workspace.  A call past it is refused by name, never truncated. */
+ * as text).  The workspace is linear in rows at 116,748 bytes each
+ * (ds4_eg2vq_gpu.cuh's layout, which lists the planes its own way and is the
+ * authority: the tower's per-row planes, the batch metadata and the projection's
+ * own per-row planes), so the cap is 912.13 MiB of device workspace -- the figure
+ * gate 27 measures (tools/eg2_embed_batch_gate27.sh's cost model and the 8192-row
+ * call's own workspace line).  A call past it is refused by name, never
+ * truncated. */
 #define DS4_EG2VQ_MAX_ROWS 8192u
 
 /* ------------------------------------------------------------------------- *

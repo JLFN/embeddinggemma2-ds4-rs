@@ -59,11 +59,13 @@ static inline uint64_t eg2vq_gpu_elems(const ds4_eg2vq_aux *a) {
  * Every buffer is sized by the ROW BUDGET (unit 27): the block a call packs is
  * as long as its items add up to, not as long as one item.  The three batch
  * metadata planes are 8 bytes per row (pos, len) plus 4 bytes per row's worth of
- * item spans, against the 108,548 bytes a row already costs; the projection's own
- * per-row output (`acc`) and the pooled per-item result (`out`) are 3,072 bytes
- * each, which is what makes the batch's row 114,700 bytes rather than 108,548
- * (out is sized by rows even though only n_items <= rows entries are written, so
- * the layout stays linear in the budget and independent of the call). */
+ * item spans, and the projection's own per-row output (`acc`) and the pooled
+ * per-item result (`out`) are 3,072 bytes each -- so a row costs 116,748 bytes,
+ * which is the figure the serving caps' comment, the caps test and gate 27's cost
+ * model all use (the tower's own planes are 27,648 f32 a row = 110,592 bytes,
+ * `in_soft` included; `out` is sized by rows even though only n_items <= rows
+ * entries are written, so the layout stays linear in the budget and independent
+ * of the call). */
 typedef struct {
     uint64_t ids, out, h, x, f, a;
     uint64_t q_swa, q_full, kv, attn_swa, attn_full;
@@ -514,7 +516,8 @@ static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
 
     /* the batch metadata: each row's position inside its item and that item's
      * length, derived from the spans here and uploaded once per call (8 bytes a
-     * row against the 114,700 the row's own planes cost). */
+     * row against the 116,748 the row's own planes and its output cost, the
+     * layout's figure above). */
     {
         std::vector<int32_t> pos(n_ids), len(n_ids);
         for (uint32_t i = 0; i < n_items; i++) {
