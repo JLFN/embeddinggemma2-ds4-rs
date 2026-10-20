@@ -835,6 +835,41 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    /// Phase 8, unit 26: the same call with an image in the item.  `ids` carry
+    /// the image's span as one contiguous run of n_soft placeholders (the Rust
+    /// route builds them, ds4_core::gemma_vq::IMAGE_TOKEN_ID); `soft` is the
+    /// vision tower's own output for that image, n_soft rows of `width` floats,
+    /// as ds4_bridge_model_vision_encode_rows fills them.  Returns 1 on success
+    /// and 0 with the reason in `err` -- the text entry's refusals plus an
+    /// image span the splice cannot align.
+    pub fn ds4_bridge_eg2vq_embed_image(
+        m: *mut ds4_bridge_model,
+        ids: *const i32,
+        n_ids: u32,
+        soft: *const f32,
+        n_soft: u32,
+        out: *mut f32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    /// The vision tower's soft rows for one encoded image (phase 8, unit 26),
+    /// written into the caller's buffer: `out` holds `expect_rows` x `width`
+    /// floats on success, `expect_rows` being the token_count of the caller's
+    /// own probe (a geometry that moved between the two calls is refused, not
+    /// reinterpreted).  Returns 1 on success, 0 with the reason in `err`.
+    pub fn ds4_bridge_model_vision_encode_rows(
+        m: *mut ds4_bridge_model,
+        data: *const u8,
+        data_len: usize,
+        out: *mut f32,
+        out_floats: u64,
+        width: u32,
+        expect_rows: u32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_mimo2_sync_media(
         s: *mut ds4_bridge_session,
         tokens: *const i32,

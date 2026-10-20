@@ -878,6 +878,12 @@ fn main() {
         // the family the same way `embedding` is (the same one-line source the
         // CLI and the route consult, ds4_core::embed_caps).
         cfg.embed_caps = ds4_core::embed_caps(m.family());
+        // Phase 8 unit 26: whether an image item can reach the tower at all --
+        // the same fact the plan's `vision_loaded` is computed from, so the
+        // route's refusal and the plan's report cannot disagree.
+        cfg.vision = model_options
+            .iter()
+            .any(|opt| matches!(opt, ModelOpenOption::Vision(_)));
         cfg.backend = match m.backend() {
             Backend::Cuda => "cuda",
             Backend::Metal => "metal",

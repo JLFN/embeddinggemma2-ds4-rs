@@ -403,6 +403,33 @@ void ds4_bridge_v41_vision_rows_free(float *rows);
 int ds4_bridge_eg2vq_has_embed(ds4_bridge_model *m);
 int ds4_bridge_eg2vq_embed(ds4_bridge_model *m, const int32_t *ids, uint32_t n_ids,
                            float *out768, char *err, size_t errlen);
+/* Phase 8, unit 26: the same call with an image in the item, through
+ * ds4_engine_embed_gemma_vq_image (ds4.h: its refusals are the text entry's
+ * plus an image span that is not one contiguous run of n_soft placeholders).
+ * `soft` is the vision tower's own output: n_soft rows of 512 floats, obtained
+ * with ds4_bridge_model_vision_encode_rows below, which is why the two live
+ * here together -- the route probes, encodes once and splices, and no second
+ * image path exists. */
+int ds4_bridge_eg2vq_embed_image(ds4_bridge_model *m,
+                                 const int32_t *ids, uint32_t n_ids,
+                                 const float *soft, uint32_t n_soft,
+                                 float *out768, char *err, size_t errlen);
+/* The vision tower's output for one encoded image, the half of the image path
+ * the Rust host could not reach before (probe and the pooled embedding entry
+ * already had bridges).  `out` is the CALLER's buffer and `width` the caller's
+ * row width (gemma_vq: DS4_EG2VQ_N_EMBD, 512 -- the projection's output, and
+ * the number crates/ds4-core/src/gemma_vq.rs carries and
+ * crates/ds4-core/tests/eg2vq_serving_caps.rs pins against the C header);
+ * `expect_rows` is the token_count the caller's own probe reported, so a
+ * geometry that moved between the probe and the encode is a refusal, not a
+ * reinterpreted buffer.  Writes expect_rows*width floats and returns 1;
+ * out_floats is the buffer's capacity in floats.  The engine frees its own
+ * buffer, so no ownership crosses this boundary. */
+int ds4_bridge_model_vision_encode_rows(ds4_bridge_model *m,
+                                        const uint8_t *data, size_t data_len,
+                                        float *out, uint64_t out_floats,
+                                        uint32_t width, uint32_t expect_rows,
+                                        char *err, size_t errlen);
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,

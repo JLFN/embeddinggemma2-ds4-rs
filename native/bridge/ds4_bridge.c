@@ -983,6 +983,59 @@ int ds4_bridge_eg2vq_embed(ds4_bridge_model *m, const int32_t *ids, uint32_t n_i
     return ds4_engine_embed_gemma_vq(m->engine, ids, n_ids, out768, err, errlen);
 }
 
+/* Phase 8, unit 26: the image half of the entry above, and the vision tower's
+ * rows it consumes.  Both are thin: the engine owns the arithmetic, the Rust
+ * route owns the sequence. */
+int ds4_bridge_eg2vq_embed_image(ds4_bridge_model *m,
+                                 const int32_t *ids, uint32_t n_ids,
+                                 const float *soft, uint32_t n_soft,
+                                 float *out768, char *err, size_t errlen) {
+    if (!m || !m->engine) {
+        set_err(err, errlen, "no model is open");
+        return 0;
+    }
+    return ds4_engine_embed_gemma_vq_image(m->engine, ids, n_ids, soft, n_soft,
+                                           out768, err, errlen);
+}
+
+int ds4_bridge_model_vision_encode_rows(ds4_bridge_model *m,
+                                        const uint8_t *data, size_t data_len,
+                                        float *out, uint64_t out_floats,
+                                        uint32_t width, uint32_t expect_rows,
+                                        char *err, size_t errlen) {
+    ds4_vision_embedding embedding = {0};
+
+    if (!m || !m->engine || !data || !data_len || !out || !out_floats ||
+        width == 0u || expect_rows == 0u) {
+        set_err(err, errlen, "invalid vision row request");
+        return 0;
+    }
+    if (!ds4_engine_vision_encode_memory(m->engine, data, data_len, &embedding,
+                                         err, errlen)) {
+        ds4_vision_embedding_free(&embedding);
+        return 0;
+    }
+    /* The row count must be the probe's own number: a geometry that moved
+     * between the probe and the encode would silently fill the caller's buffer
+     * with a differently shaped image. */
+    if (embedding.token_count != expect_rows) {
+        set_err(err, errlen,
+                "the tower produced a different number of rows than the probe "
+                "reported for this image");
+        ds4_vision_embedding_free(&embedding);
+        return 0;
+    }
+    const uint64_t want = (uint64_t)expect_rows * (uint64_t)width;
+    if (want > out_floats || !embedding.data) {
+        set_err(err, errlen, "the caller's row buffer is too small for this image");
+        ds4_vision_embedding_free(&embedding);
+        return 0;
+    }
+    memcpy(out, embedding.data, (size_t)want * sizeof(float));
+    ds4_vision_embedding_free(&embedding);
+    return 1;
+}
+
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,

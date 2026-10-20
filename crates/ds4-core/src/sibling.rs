@@ -200,6 +200,59 @@ fn glm_vision_tensor(inventory: &crate::TensorInventory, name: &str, dims: &[u64
     Ok(())
 }
 
+/// The gemma_vq family's own vision sidecar (phase 8, unit 26): the mmproj the
+/// port's writer produced (`tools/eg2_mmproj.c`, `out/EmbeddingGemma-2-914f7f8-
+/// vision-mmproj.gguf`), read back by the port's own reader -- the same reader
+/// gate 22 uses (`tools/eg2_mmproj_check.sh`, `examples/gguf_inventory`).
+///
+/// What this checks and what it deliberately does not: it checks that the file
+/// is a vision-bearing GGUF of this family's own shape (the three tensors the
+/// binder treats as the tower's anchors, plus `clip.has_vision_encoder`), which
+/// is what catches `--vision` pointed at some other model's encoder. The 211
+/// tensors' names, dims and types against the tower's slots are the C binder's
+/// own check (`ds4_eg2vq_vision_slot_table`, and the device plan's
+/// `ds4_gpu_eg2vq_vision_bind`), which refuses by name at the first image --
+/// duplicating that table in Rust would be a second copy of the same contract,
+/// and the text-only side of the family has no mmproj to compare against.
+fn probe_gemma_vq_vision_sidecar(path: &str) -> Result<()> {
+    let file = crate::GgufFile::open(std::path::Path::new(path)).map_err(|error| Error {
+        code: 1,
+        message: format!("the vision sidecar is not a readable GGUF: {error}"),
+    })?;
+    if file.get_bool("clip.has_vision_encoder") != Some(true) {
+        return Err(Error {
+            code: 1,
+            message: "the vision sidecar carries no vision encoder \
+                      (clip.has_vision_encoder is not true)"
+                .into(),
+        });
+    }
+    let inventory = crate::TensorInventory::open(std::path::Path::new(path)).map_err(|error| {
+        Error {
+            code: 1,
+            message: format!("the vision sidecar's tensor directory did not read: {error}"),
+        }
+    })?;
+    // The binder's anchors (ds4_eg2vq_vision_bind.inc:66, :81, :88): the patch
+    // convolution, the position table and the 768-to-512 tie-in. A file without
+    // them is not this tower, whatever else it carries.
+    for name in [
+        "v.patch_embd.weight",
+        "v.position_embd.weight",
+        "mm.input_projection.weight",
+    ] {
+        if inventory.find(name).is_none() {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the vision sidecar has no {name}: it is not this family's vision tower"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn probe_vision_sidecar(
     shape: Shape,
     backend: crate::Backend,
@@ -223,6 +276,14 @@ pub fn probe_vision_sidecar(
     // block the native open requires.
     if shape.variant == crate::Variant::DeepSeek41Flash {
         return probe_v41_vision_sidecar(path);
+    }
+    // The gemma_vq family's sidecar is its own vision tower, not another
+    // family's encoder (phase 8, unit 26): the mmproj the port's own writer
+    // produced, read back by the port's own reader.  It runs on any backend --
+    // the CPU leg is the same tower -- so it is checked BEFORE the CUDA encoder
+    // rule below, which describes the external-encoder families only.
+    if shape.family == ModelFamily::GemmaVq {
+        return probe_gemma_vq_vision_sidecar(path);
     }
     let takes_encoder = matches!(
         shape.family,

@@ -475,6 +475,27 @@ fn add_image_data_uri(
     add_image_base64(images, audios, videos, mime, payload)
 }
 
+/// ONE image data URI, decoded by the chat route's own decoder -- the same
+/// `data:image/<png|jpeg>;base64,` shape, the same magic-byte check, the same
+/// 10 MiB decoded and 20 MiB request ceilings.  This exists so a surface that
+/// carries a single image OUTSIDE a chat message (`/v1/embeddings`' media item,
+/// phase 8 unit 26) reaches the engine through one image decoder rather than
+/// two: the count limit of a chat message (four media items) is deliberately not
+/// applied here, because the caller's own per-item rule is the bound that
+/// matters and it is stated in the serving caps.
+pub fn decode_image_data_uri(uri: &str) -> Result<RequestImage, String> {
+    let mut images = ImageInputs {
+        items: Vec::new(),
+        bytes: 0,
+        count_limit: None,
+    };
+    add_image_data_uri(&mut images, &[], &[], uri)?;
+    images
+        .items
+        .pop()
+        .ok_or_else(|| "the image data URI decoded to nothing".to_string())
+}
+
 fn add_video(
     videos: &mut Vec<RequestVideo>,
     images: &[RequestImage],

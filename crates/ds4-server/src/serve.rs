@@ -116,6 +116,12 @@ pub struct ServerConfig {
     /// Phase 6: the serving backend as `/health` reports it -- "cuda", "cpu"
     /// or "metal", from `ds4_core::Backend` (lib.rs:205-209).
     pub backend: String,
+    /// Phase 8 unit 26: the engine was opened with a vision sidecar
+    /// (`--vision <mmproj>`, `ModelOpenOption::Vision`), so an image item can
+    /// reach the tower.  Read once at boot by the bin; the route refuses an
+    /// image item when it is false rather than letting the engine report a
+    /// missing encoder as a model fault.
+    pub vision: bool,
     /// Phase 6: the artifact's own `tokenizer.ggml.add_bos_token` /
     /// `add_eos_token` (`ds4_core::tokenizer_special_flags`), read once at boot
     /// so the route's ids match the CLI's exactly (both true on this artifact).
@@ -232,6 +238,7 @@ impl Default for ServerConfig {
             family: String::new(),
             embed_caps: None,
             backend: String::new(),
+            vision: false,
             add_bos: false,
             add_eos: false,
         }
@@ -898,8 +905,8 @@ struct PreparedJob {
 /// dimensions width, encoding format, JSON shape) is settled in
 /// `prepare_client`; this carries only what the owner needs.
 struct EmbedRequest {
-    /// One or more input strings, verbatim.
-    inputs: Vec<String>,
+    /// One or more input items, verbatim.
+    inputs: Vec<EmbedItem>,
     /// The request's `model` field, echoed back (the spec says it is ignored).
     model: String,
     /// The resolved prefix from `ds4_core::st_prompt(&task)` (the checkpoint
@@ -909,6 +916,93 @@ struct EmbedRequest {
     prefix: String,
     /// The requested Matryoshka width, already validated; None = 768.
     dimensions: Option<u32>,
+}
+
+/// Phase 8 unit 26: one input item -- text, and optionally one image the text
+/// marks with the family's own placeholder.
+struct EmbedItem {
+    /// The item's text, verbatim (the task prefix is applied to it later).
+    text: String,
+    /// The item's image, already decoded from its `data:` URI.
+    image: Option<crate::parse::RequestImage>,
+}
+
+/// One `input` array element.  A string is text, as before.  An OBJECT is the
+/// OpenAI content-part shape this server's chat route already accepts, which is
+/// the one image grammar the port has: the parts are read in order, `text` parts
+/// concatenate, one `image_url` part is allowed, and the URI itself goes through
+/// the chat route's own decoder (`crate::parse::decode_image_data_uri`), so an
+/// image means the same thing here as it does in a chat message.  Every other
+/// part type is refused by name rather than ignored.
+///
+/// Why this shape and not the model card's `{"text": ..., "image": [...]}` dict:
+/// that dict is the checkpoint's SentenceTransformer call, not this server's
+/// wire; the wire's own convention for an image is a content part, and a second
+/// convention would be a second decoder to keep honest.
+fn embed_input_item(value: &serde_json::Value) -> Result<EmbedItem, String> {
+    let parts = match value {
+        serde_json::Value::String(text) => {
+            return Ok(EmbedItem {
+                text: text.clone(),
+                image: None,
+            })
+        }
+        serde_json::Value::Object(map) => match map.get("content") {
+            Some(serde_json::Value::Array(parts)) => parts,
+            _ => {
+                return Err(
+                    "an \"input\" object needs a \"content\" array of message parts".into(),
+                )
+            }
+        },
+        _ => return Err("\"input\" must be a string or an array of strings".into()),
+    };
+    let mut text = String::new();
+    let mut image: Option<crate::parse::RequestImage> = None;
+    for part in parts {
+        let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match kind {
+            "text" => match part.get("text").and_then(|t| t.as_str()) {
+                Some(fragment) => text.push_str(fragment),
+                None => {
+                    return Err(
+                        "a content part of type \"text\" needs a \"text\" string".into(),
+                    )
+                }
+            },
+            "image_url" => {
+                if image.is_some() {
+                    return Err(format!(
+                        "an item carries more than one image, and this port places {} image \
+                         per item (GET /health reports embed.image.per_item_max)",
+                        ds4_core::GEMMA_VQ_IMAGE_PER_ITEM_MAX
+                    ));
+                }
+                let uri = part
+                    .get("image_url")
+                    .and_then(|value| match value {
+                        serde_json::Value::String(s) => Some(s.as_str()),
+                        serde_json::Value::Object(o) => {
+                            o.get("url").and_then(|url| url.as_str())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        "a content part of type \"image_url\" needs an \"image_url\" object \
+                         with a \"url\" data URI"
+                            .to_string()
+                    })?;
+                image = Some(crate::parse::decode_image_data_uri(uri)?);
+            }
+            other => {
+                return Err(format!(
+                    "content part type {other:?} is not supported on the embedding route \
+                     (text and image_url only)"
+                ))
+            }
+        }
+    }
+    Ok(EmbedItem { text, image })
 }
 
 fn prepare_cont_prompt<'a>(
@@ -1226,21 +1320,15 @@ fn prepare_client(
     if req.method == "GET" && req.path == "/health" {
         // `embed` is the embedding-shaped caps when the served family has them
         // (phase 6 row P2.3) and null otherwise: an absence, not a zero a caller
-        // could mistake for a limit.
-        let embed = match cfg.embed_caps {
-            Some(c) => format!(
-                "{{\"item_tokens_max\":{},\"batch_rows_max\":{}}}",
-                c.item_tokens_max, c.batch_rows_max
-            ),
-            None => "null".to_string(),
-        };
-        let body = format!(
-            "{{\"status\":\"ok\",\"model\":{},\"backend\":{},\"family\":{},\"embedding\":{},\"embed\":{}}}\n",
-            crate::json::json_escape(&cfg.model_id),
-            crate::json::json_escape(&cfg.backend),
-            crate::json::json_escape(&cfg.family),
+        // could mistake for a limit.  Since phase 8 unit 26 the same object
+        // carries the image half (`embed.image`), rendered by the caps' own
+        // `to_json` so this row and the plan diagnostics print one contract.
+        let body = health_body(
+            &cfg.model_id,
+            &cfg.backend,
+            &cfg.family,
             cfg.embedding,
-            embed,
+            cfg.embed_caps,
         );
         write_all(
             stream,
@@ -1444,14 +1532,17 @@ fn prepare_embedding(
         Ok(v) => v,
         Err(_) => return bad(stream, "invalid JSON request"),
     };
-    let inputs: Vec<String> = match json.get("input") {
-        Some(serde_json::Value::String(s)) => vec![s.clone()],
+    let inputs: Vec<EmbedItem> = match json.get("input") {
+        Some(serde_json::Value::String(s)) => vec![EmbedItem {
+            text: s.clone(),
+            image: None,
+        }],
         Some(serde_json::Value::Array(a)) => {
             let mut out = Vec::with_capacity(a.len());
             for v in a {
-                match v {
-                    serde_json::Value::String(s) => out.push(s.clone()),
-                    _ => return bad(stream, "\"input\" must be a string or an array of strings"),
+                match embed_input_item(v) {
+                    Ok(item) => out.push(item),
+                    Err(message) => return bad(stream, &message),
                 }
             }
             out
@@ -1460,6 +1551,19 @@ fn prepare_embedding(
     };
     if inputs.is_empty() {
         return bad(stream, "\"input\" must not be an empty array");
+    }
+    // Phase 8 unit 26: an image on a family whose embedding path is text only is
+    // refused HERE, by name, before any model call -- the same rule the caps
+    // state on `/health` (`embed.image` absent), so a caller learns it from the
+    // same place it read the limits.
+    if inputs.iter().any(|item| item.image.is_some())
+        && cfg.embed_caps.and_then(|caps| caps.image).is_none()
+    {
+        return bad(
+            stream,
+            "this model's embedding path is text only: an image item needs a family whose \
+             /health reports embed.image",
+        );
     }
     // `model` is ignored but echoed back; an absent one echoes the server's id.
     let model = match json.get("model") {
@@ -1524,6 +1628,35 @@ fn prepare_embedding(
         }),
     })
 }
+
+/// The `/health` body: every field is what the bin read from the opened model at
+/// boot (`ServerConfig::model_id` / `backend` / `family` / `embedding` /
+/// `embed_caps`); no model call happens here.  `embed` is `null` for a decode
+/// family -- an absence, not a zero -- and the embedding contract's own
+/// `to_json` renders it, image half included, so nothing here can describe the
+/// family differently from the plan diagnostics.  Split out of the handler so a
+/// test pins the exact bytes a caller parses.
+fn health_body(
+    model_id: &str,
+    backend: &str,
+    family: &str,
+    embedding: bool,
+    embed_caps: Option<ds4_core::EmbedCaps>,
+) -> String {
+    let embed = match embed_caps {
+        Some(caps) => caps.to_json().to_string(),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"status\":\"ok\",\"model\":{},\"backend\":{},\"family\":{},\"embedding\":{},\"embed\":{}}}\n",
+        crate::json::json_escape(model_id),
+        crate::json::json_escape(backend),
+        crate::json::json_escape(family),
+        embedding,
+        embed,
+    )
+}
+
 
 /// Phase 6 row P2.3: a request that steps past a cap THIS server advertises on
 /// `/health` is a client error, not an engine fault, so it is a 400 in the same
@@ -1592,10 +1725,70 @@ fn run_embed<W: TerminalSink>(
     }
     let mut data = String::new();
     let mut total_tokens: usize = 0;
-    for (i, text) in embed.inputs.iter().enumerate() {
-        let ids = match engine.embed_item_ids(&embed.prefix, text, cfg.add_bos, cfg.add_eos) {
-            Ok(ids) => ids,
-            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+    for (i, item) in embed.inputs.iter().enumerate() {
+        // Phase 8 unit 26: an item with an image runs the engine's own order --
+        // probe (the geometry the soft rows will have), build the ids in Rust
+        // (only the vocabulary knows the reference's markers), check the caps,
+        // only then encode the rows (the expensive half) and splice.
+        let mut image_rows: u32 = 0;
+        let ids = match &item.image {
+            None => match engine.embed_item_ids(&embed.prefix, &item.text, cfg.add_bos, cfg.add_eos)
+            {
+                Ok(ids) => {
+                    // A text-only item that carries the family's image placeholder
+                    // is refused rather than embedded as a bare token: the
+                    // checkpoint's model card marks an image's position with it,
+                    // so a placeholder with no image is a malformed item, and the
+                    // tower would otherwise read it as an ordinary vocabulary
+                    // entry (258880 IS in the table) without saying so.
+                    if cfg.embed_caps.is_some_and(|caps| caps.image.is_some())
+                        && ids.contains(&ds4_core::GEMMA_VQ_IMAGE_TOKEN_ID)
+                    {
+                        return embed_refuse(
+                            out,
+                            cfg,
+                            &format!(
+                                "input[{i}] carries the image placeholder {} but no image: an \
+                                 item that marks an image must supply one",
+                                ds4_core::GEMMA_VQ_IMAGE_PLACEHOLDER
+                            ),
+                        );
+                    }
+                    ids
+                }
+                Err(e) => return embed_fail(out, cfg, &e.to_string()),
+            },
+            Some(image) => {
+                if !cfg.vision {
+                    return embed_fail(
+                        out,
+                        cfg,
+                        "this server has no vision encoder loaded: an image item needs \
+                         --vision <mmproj.gguf>",
+                    );
+                }
+                // The image bytes are the client's, so a refusal here is the
+                // client's to fix: a 400 that quotes the engine's own reason
+                // (undecodable bytes, a geometry the size solver cannot place).
+                let info = match engine.vision_probe(&image.data) {
+                    Ok(info) => info,
+                    Err(e) => return embed_refuse(out, cfg, &format!("input[{i}]: {e}")),
+                };
+                image_rows = info.token_count;
+                match engine.embed_item_media_ids(
+                    &embed.prefix,
+                    &item.text,
+                    info.token_count,
+                    cfg.add_bos,
+                    cfg.add_eos,
+                ) {
+                    Ok(ids) => ids,
+                    // The sequence's own rules (the placeholder the text must
+                    // carry, one image per item, the item ceiling) are the
+                    // caller's to satisfy.
+                    Err(e) => return embed_refuse(out, cfg, &format!("input[{i}]: {e}")),
+                }
+            }
         };
         total_tokens = total_tokens.saturating_add(ids.len());
         // The two caps the server itself advertises (`/health`'s `embed`, phase 6
@@ -1635,9 +1828,21 @@ fn run_embed<W: TerminalSink>(
                 );
             }
         }
-        let vector = match engine.embed_gemma_vq(&ids) {
-            Ok(v) => v,
-            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+        let vector = match &item.image {
+            Some(image) => {
+                let rows = match engine.vision_encode_rows(&image.data, image_rows) {
+                    Ok(rows) => rows,
+                    Err(e) => return embed_fail(out, cfg, &e.to_string()),
+                };
+                match engine.embed_gemma_vq_image(&ids, &rows) {
+                    Ok(v) => v,
+                    Err(e) => return embed_fail(out, cfg, &e.to_string()),
+                }
+            }
+            None => match engine.embed_gemma_vq(&ids) {
+                Ok(v) => v,
+                Err(e) => return embed_fail(out, cfg, &e.to_string()),
+            },
         };
         let vector = match embed.dimensions {
             Some(d) => match ds4_core::mrl_truncate(vector, d) {

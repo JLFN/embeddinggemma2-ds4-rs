@@ -39,14 +39,20 @@ fn define_in(source: &str, path: &str, name: &str) -> u64 {
     digits.parse().expect("digits")
 }
 
-/// The value of an `NAME = VALUE,` enumerator, or a panic naming the file.
+/// The value of an `NAME = VALUE,` enumerator, or a panic naming the file.  The
+/// `=` may be padded for column alignment (`NAME      = VALUE,`), which the
+/// headers do; what is matched is the name as the line's first token, then the
+/// first run of digits after its `=`.
 fn enumerator_in(source: &str, path: &str, name: &str) -> u64 {
-    let needle = format!("{name} =");
     let line = source
         .lines()
-        .find(|l| l.trim_start().starts_with(&needle))
+        .find(|l| {
+            l.trim_start()
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
         .unwrap_or_else(|| panic!("{path} has no enumerator {name}"));
-    let value = line[line.find(&needle).unwrap() + needle.len()..].trim();
+    let value = line[line.find('=').unwrap() + 1..].trim();
     let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
     assert!(
         !digits.is_empty(),
@@ -107,4 +113,84 @@ fn only_the_embedding_family_states_embedding_caps() {
     ] {
         assert_eq!(embed_caps(family), None, "{family:?} is not an embedding family");
     }
+}
+
+/// Phase 8, unit 26: the image half of the caps is the C header's own numbers,
+/// read as text (this crate builds without the C tree), so a header that moves or
+/// changes spelling fails loudly.  The comparison is the same one the item
+/// ceiling gets above, for the same reason: the Rust entry (which sizes the row
+/// buffer the C side fills) and the C tower (which fills it) must agree on every
+/// number, and neither asserts the other's.
+#[test]
+fn image_caps_are_the_c_headers_own_numbers() {
+    let c_header = include_str!("../../../ds4_eg2vq.h");
+    let vision_header = include_str!("../../../ds4_eg2vq_vision.h");
+    let caps = embed_caps(ds4_core::ModelFamily::GemmaVq).expect("gemma_vq has embedding caps");
+    let image = caps.image.expect("gemma_vq's embedding path takes an image");
+    let pairs = [
+        (
+            vision_header,
+            "ds4_eg2vq_vision.h",
+            "DS4_EG2VQ_VISION_SOFT_MAX",
+            u64::from(image.soft_tokens_max),
+            u64::from(ds4_core::GEMMA_VQ_IMAGE_SOFT_TOKENS_MAX),
+        ),
+        (
+            vision_header,
+            "ds4_eg2vq_vision.h",
+            "DS4_EG2VQ_VISION_MIN_TOKENS",
+            u64::from(image.soft_tokens_min),
+            u64::from(ds4_core::GEMMA_VQ_IMAGE_SOFT_TOKENS_MIN),
+        ),
+        (
+            vision_header,
+            "ds4_eg2vq_vision.h",
+            "DS4_EG2VQ_VISION_MAX_PIXELS",
+            u64::from(image.pixels_max),
+            u64::from(ds4_core::GEMMA_VQ_IMAGE_PIXELS_MAX),
+        ),
+        (
+            vision_header,
+            "ds4_eg2vq_vision.h",
+            "DS4_EG2VQ_VISION_MIN_PIXELS",
+            u64::from(image.pixels_min),
+            u64::from(ds4_core::GEMMA_VQ_IMAGE_PIXELS_MIN),
+        ),
+        // One soft row is as wide as the text tower's hidden state: the
+        // projection's output IS the row the splice feeds the tower
+        // (ds4_eg2vq.h:54 N_EMBD 512, the same 512 as the mmproj's
+        // mm.input_projection.weight row length).
+        (
+            c_header,
+            "ds4_eg2vq.h",
+            "DS4_EG2VQ_N_EMBD",
+            u64::from(image.embd),
+            u64::from(ds4_core::GEMMA_VQ_IMAGE_EMBD),
+        ),
+    ];
+    for (source, path, name, capped, rust) in pairs {
+        assert_eq!(capped, rust, "the caps and the Rust constant disagree on {name}");
+        assert_eq!(
+            enumerator_in(source, path, name),
+            capped,
+            "crates/ds4-core's {name} ({capped}) is not the C header's own value"
+        );
+    }
+    assert_eq!(
+        define_in(c_header, "ds4_eg2vq.h", "DS4_EG2VQ_IMAGE_TOKEN_ID"),
+        ds4_core::GEMMA_VQ_IMAGE_TOKEN_ID as u64,
+        "the Rust image token id is not the C header's own placeholder id"
+    );
+    // The one-image rule is a POLICY of this port (the splice fills one
+    // contiguous run), so it is pinned to its own declaration rather than to C.
+    assert_eq!(image.per_item_max, ds4_core::GEMMA_VQ_IMAGE_PER_ITEM_MAX);
+    assert_eq!(image.per_item_max, 1, "the splice fills exactly one span");
+    // The image's soft rows are counted by the item ceiling like any other
+    // token, so a full-budget image plus its begin/end markers must still fit an
+    // item: the two numbers have to leave room for each other.
+    assert!(
+        image.soft_tokens_max + 3 <= caps.item_tokens_max,
+        "a maximum image plus its begin/end markers must fit the item ceiling"
+    );
+    assert!(image.serial, "one device vision workspace per engine is serial");
 }

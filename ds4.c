@@ -72590,16 +72590,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * in the reference install.sh); the other families take it as their
          * external encoder (--vision).  Both arrive on the same open slot. */
         const bool v41_sidecar = DS4_MODEL_VARIANT == DS4_VARIANT_V41;
+        /* gemma_vq is the ONE family here whose tower also has a complete CPU
+         * leg (phase 8: ds4_eg2vq_vision_graph.inc, measured against the
+         * reference's own dumps by gate 23, with cuda/eg2vq_vis.cuh as the
+         * device twin), so --vision with this family runs on either backend --
+         * which is what makes the embedding wire's two legs comparable on one
+         * machine.  Every other family's sidecar is CUDA kernels only. */
+        const bool cpu_tower = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ;
         if ((!v41_sidecar &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM53 &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_STEP37 &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LING3VL &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GEMMA_VQ &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MIMO2) ||
-            e->backend != DS4_BACKEND_CUDA ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice) {
             fprintf(stderr,
-                    "ds4: --vision/--vision-gguf requires one full V4.1, GLM-5.3, Step, Ling, gemma_vq or MiMo CUDA model\n");
+                    "ds4: --vision/--vision-gguf requires one full V4.1, GLM-5.3, Step, Ling, gemma_vq or MiMo model\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (!cpu_tower && e->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr,
+                    "ds4: --vision needs the CUDA backend on this family (only gemma_vq's tower has a CPU leg)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -73786,6 +73799,124 @@ int ds4_engine_embed_gemma_vq(ds4_engine *e, const int32_t *ids, uint32_t n_ids,
         return 0;
     }
     ds4_eg2vq_ref_embed(&e->model, &e->weights, ids, n_ids, out768);
+    return 1;
+}
+
+/* Phase 8, unit 26: the same entry with an image in the item.
+ *
+ * `soft` is the vision tower's own output for that image -- n_soft rows of
+ * DS4_EG2VQ_N_EMBD floats, exactly what ds4_engine_vision_encode_memory
+ * returns -- and `ids` carries the span as n_soft DS4_EG2VQ_IMAGE_TOKEN_ID
+ * placeholders.  The placeholder run is checked HERE, by name, before any
+ * arithmetic: the splice itself (ds4_eg2vq_graph.inc) stops the process on a
+ * misaligned span, which is the right response to a corrupted artifact and the
+ * wrong one to a caller's error, so the engine turns that class of input into a
+ * refusal first.  Everything else -- the family, the weights, the item ceiling,
+ * the token table's row range -- is the text entry's own check, unchanged.
+ *
+ * Reference: the checkpoint's model card marks an image's position in the text
+ * with the `<|image|>` placeholder (.models/EmbeddingGemma-2-914f7f8/README.md
+ * section 5), and the reference processor expands that one position into the
+ * model's begin marker, its image tokens and its end marker
+ * (tools/mtmd/mtmd.cpp:955-958 at the pin; the anchor harness's own comment at
+ * tests/parity/eg2vq_vision_anchor.cpp:106-113 records the same expansion).
+ * Building those ids is the CALLER's job (Rust-side, where the vocabulary
+ * lives); this entry only fills the span. */
+int ds4_engine_embed_gemma_vq_image(ds4_engine *e,
+                                    const int32_t *ids, uint32_t n_ids,
+                                    const float *soft, uint32_t n_soft,
+                                    float *out768, char *error, size_t error_cap) {
+    if (error && error_cap) error[0] = '\0';
+    if (!e || !ids || !soft || !out768) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid embed arguments");
+        return 0;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GEMMA_VQ) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "this engine is not a gemma_vq embedding model");
+        return 0;
+    }
+    const ds4_eg2vq_weights *w = e->weights.eg2vq;
+    if (!w) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the gemma_vq weights are not bound");
+        return 0;
+    }
+    if (n_ids == 0) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "an empty item has no embedding");
+        return 0;
+    }
+    if (n_ids > DS4_EG2VQ_MAX_TOKENS) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the item is %u tokens, past the %u-token key plane of the "
+            "attention kernel", n_ids, DS4_EG2VQ_MAX_TOKENS);
+        return 0;
+    }
+    if (n_soft == 0) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the image carries no soft tokens");
+        return 0;
+    }
+    if (n_soft > DS4_EG2VQ_VISION_SOFT_MAX) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the image is %u soft tokens, past the %u the vision tower's size "
+            "solver will place", n_soft, (unsigned)DS4_EG2VQ_VISION_SOFT_MAX);
+        return 0;
+    }
+    uint32_t n_marked = 0;
+    uint32_t first = 0, last = 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] == (int32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) {
+            if (n_marked == 0) { first = i; }
+            last = i;
+            n_marked++;
+        }
+    }
+    if (n_marked != n_soft || last - first + 1u != n_soft) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the ids mark %u contiguous positions as the image placeholder in "
+            "[%u, %u], the image has %u soft tokens: the span must be one run of "
+            "n_soft placeholders (the splice fills exactly that run)",
+            n_marked, n_marked ? first : 0u, n_marked ? last : 0u, n_soft);
+        return 0;
+    }
+    const uint64_t n_rows = w->token_embd ? (uint64_t)w->token_embd->dim[1] : 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] < 0 || (uint64_t)ids[i] >= n_rows) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "token id %d is outside the embedding table (%llu rows)",
+                (int)ids[i], (unsigned long long)n_rows);
+            return 0;
+        }
+    }
+    e->eg2vq_embed_calls++;
+    if (ds4_backend_uses_graph(e->backend)) {
+#ifndef DS4_NO_GPU
+        if (!e->metal_ready) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the %s backend is not ready", ds4_backend_name(e->backend));
+            return 0;
+        }
+        if (!eg2vq_device_ensure(e, n_ids, error, error_cap)) { return 0; }
+        if (!ds4_gpu_eg2vq_embed_image(e->eg2vq_ctx, ids, n_ids, soft, n_soft, out768)) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the device tower refused this item");
+            return 0;
+        }
+        return 1;
+#else
+        if (error && error_cap) snprintf(error, error_cap,
+            "this build has no graph backend support");
+        return 0;
+#endif
+    }
+    if (!w->dense) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the CPU decode cache is not bound for this engine");
+        return 0;
+    }
+    ds4_eg2vq_ref_embed_image(&e->model, &e->weights, ids, n_ids, soft, n_soft, out768);
     return 1;
 }
 

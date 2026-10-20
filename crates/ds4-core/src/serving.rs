@@ -195,6 +195,43 @@ pub struct EmbedCaps {
     /// Tokens over one call's items: `crate::gemma_vq::BATCH_ROWS_MAX`, the row
     /// budget of the tower's single device workspace.
     pub batch_rows_max: u32,
+    /// The image half of the contract, when this family's embedding path takes
+    /// an image at all. `None` is an absence, not a zero: a family whose items
+    /// are text only says so by carrying no image contract.
+    pub image: Option<EmbedImageCaps>,
+}
+
+/// What an embedding family accepts in an item BESIDES text (phase 8, unit 26):
+/// the image's own representation bounds, the width of one of its soft rows,
+/// how many images one item may carry, and whether image work is serialized.
+///
+/// The bounds are the tower's, not this port's (`crate::gemma_vq`'s
+/// `IMAGE_SOFT_TOKENS_*` / `IMAGE_PIXELS_*`, the checkpoint's own
+/// `set_limit_image_tokens(70, 1120)` and the patch area it maps to), and they
+/// are the size solver's window: an image outside it is scaled INTO it, never
+/// refused for its size. What a caller can be refused for is the item ceiling
+/// above, which counts the soft rows an image consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbedImageCaps {
+    /// Soft tokens one image may occupy: the model card's 70 to 1120 (README
+    /// section 5, "Vision Token Budget").
+    pub soft_tokens_min: u32,
+    pub soft_tokens_max: u32,
+    /// The pixels those soft-token bounds map to: `patch_area` (16x16 patch,
+    /// 3x3 pooling) per soft token.
+    pub pixels_min: u32,
+    pub pixels_max: u32,
+    /// Floats in one soft row: the tower's 768-wide output through the
+    /// 768-to-512 projection (`crate::gemma_vq::IMAGE_EMBD`).
+    pub embd: u32,
+    /// Images one item may carry. 1 for this family: the splice entry fills one
+    /// contiguous run of placeholders (`crate::gemma_vq::IMAGE_PER_ITEM_MAX`).
+    pub per_item_max: u32,
+    /// Whether image requests are serialized against one workspace per engine:
+    /// the meaning of `ServingCaps::media_serial`, restated where a caller
+    /// planning concurrency reads it (this family binds ONE device vision
+    /// workspace, grown to the largest image served so far).
+    pub serial: bool,
 }
 
 /// The embedding-shaped cap entry for a family, in the shape of
@@ -208,8 +245,49 @@ pub fn embed_caps(family: ModelFamily) -> Option<EmbedCaps> {
         ModelFamily::GemmaVq => Some(EmbedCaps {
             item_tokens_max: crate::gemma_vq::ITEM_TOKENS_MAX,
             batch_rows_max: crate::gemma_vq::BATCH_ROWS_MAX,
+            image: Some(EmbedImageCaps {
+                soft_tokens_min: crate::gemma_vq::IMAGE_SOFT_TOKENS_MIN,
+                soft_tokens_max: crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX,
+                pixels_min: crate::gemma_vq::IMAGE_PIXELS_MIN,
+                pixels_max: crate::gemma_vq::IMAGE_PIXELS_MAX,
+                embd: crate::gemma_vq::IMAGE_EMBD,
+                per_item_max: crate::gemma_vq::IMAGE_PER_ITEM_MAX,
+                // One vision workspace per engine, exactly as the family's own
+                // `ServingCaps::media_serial` states (the entry below).
+                serial: true,
+            }),
         }),
         _ => None,
+    }
+}
+
+impl EmbedImageCaps {
+    /// The machine-facing shape of the image half, rendered in exactly one place
+    /// so the `/health` row and the plan diagnostics cannot describe the same
+    /// contract two ways. `serial` is `ServingCaps::media_serial`'s meaning
+    /// carried to where a caller planning concurrency reads it.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "soft_tokens_min": self.soft_tokens_min,
+            "soft_tokens_max": self.soft_tokens_max,
+            "pixels_min": self.pixels_min,
+            "pixels_max": self.pixels_max,
+            "embd": self.embd,
+            "per_item_max": self.per_item_max,
+            "serial": self.serial,
+        })
+    }
+}
+
+impl EmbedCaps {
+    /// The same, for the whole embedding contract: the two text numbers a call
+    /// is refused past, and the image half when the family has one.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "item_tokens_max": self.item_tokens_max,
+            "batch_rows_max": self.batch_rows_max,
+            "image": self.image.map(|image| image.to_json()),
+        })
     }
 }
 
@@ -1827,10 +1905,7 @@ impl ResolvedPlan {
             "disk": self.caps.map(|caps| caps.disk.as_str()),
             // The embedding-shaped limits, stated where every other family
             // capability is stated. Null for a decode family.
-            "embed": self.family.and_then(embed_caps).map(|e| json!({
-                "item_tokens_max": e.item_tokens_max,
-                "batch_rows_max": e.batch_rows_max,
-            })),
+            "embed": self.family.and_then(embed_caps).map(|e| e.to_json()),
         })
     }
 

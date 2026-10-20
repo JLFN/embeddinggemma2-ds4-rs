@@ -309,6 +309,38 @@ pub trait DecodeIo {
             "an embedding tower is not loaded on this engine",
         ))
     }
+    /// Phase 8 unit 26: one embedding item's ids WITH an image in it -- the text
+    /// path's construction with the image's one `<|image|>` placeholder expanded
+    /// into the reference's span (`ds4_core::Model::embed_item_media_ids`, which
+    /// documents the refusals: no placeholder, two placeholders, a past-ceiling
+    /// item).  Only an embedding engine answers.
+    fn embed_item_media_ids(
+        &self,
+        _prefix: &str,
+        _text: &str,
+        _n_soft: u32,
+        _add_bos: bool,
+        _add_eos: bool,
+    ) -> Result<Vec<i32>, GenerateError> {
+        Err(GenerateError::Unsupported(
+            "an embedding tower is not loaded on this engine",
+        ))
+    }
+    /// Phase 8 unit 26: one image's soft rows through the vision tower
+    /// (`ds4_core::Model::vision_encode_rows`; `expect_rows` is this engine's
+    /// own probe's token_count for the same bytes).
+    fn vision_encode_rows(&self, _data: &[u8], _expect_rows: u32) -> Result<Vec<f32>, GenerateError> {
+        Err(GenerateError::Unsupported(
+            "an embedding tower is not loaded on this engine",
+        ))
+    }
+    /// Phase 8 unit 26: the splice -- ids whose image span the soft rows fill
+    /// (`ds4_core::Model::embed_gemma_vq_image`).
+    fn embed_gemma_vq_image(&self, _ids: &[i32], _soft: &[f32]) -> Result<Vec<f32>, GenerateError> {
+        Err(GenerateError::Unsupported(
+            "an embedding tower is not loaded on this engine",
+        ))
+    }
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError>;
     /// Start this request's reuse trace. A corrective retry re-syncs inside
     /// the same request, so the sync itself must not erase what the first
@@ -4323,6 +4355,35 @@ impl DecodeIo for NativeDecode<'_> {
             .map_err(|e| GenerateError::Engine(e.to_string()))
     }
 
+    fn embed_item_media_ids(
+        &self,
+        prefix: &str,
+        text: &str,
+        n_soft: u32,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Result<Vec<i32>, GenerateError> {
+        // `message`, not the Display form: these reasons reach the CALLER as a
+        // 400 (the placeholder rule, one image per item, the item ceiling), and
+        // "ds4 bridge error 1: " is the FFI boundary's own label, not part of
+        // the contract the caller reads.
+        self.model
+            .embed_item_media_ids(prefix, text, n_soft, add_bos, add_eos)
+            .map_err(|e| GenerateError::Engine(e.message))
+    }
+
+    fn vision_encode_rows(&self, data: &[u8], expect_rows: u32) -> Result<Vec<f32>, GenerateError> {
+        self.model
+            .vision_encode_rows(data, expect_rows)
+            .map_err(|e| GenerateError::Engine(e.message))
+    }
+
+    fn embed_gemma_vq_image(&self, ids: &[i32], soft: &[f32]) -> Result<Vec<f32>, GenerateError> {
+        self.model
+            .embed_gemma_vq_image(ids, soft)
+            .map_err(|e| GenerateError::Engine(e.message))
+    }
+
     fn v41_generate(
         &self,
         prompt: &[i32],
@@ -4486,7 +4547,10 @@ impl DecodeIo for NativeDecode<'_> {
             .map(|info| VisionProbe {
                 token_count: info.token_count,
             })
-            .map_err(|error| GenerateError::Engine(error.to_string()))
+            // The reason, not the bridge label: an image the reference's own
+            // preprocessing refuses is the CALLER's (the embedding route turns
+            // this into a 400 naming the input).
+            .map_err(|error| GenerateError::Engine(error.message))
     }
 
     fn vision_tokens(&self, data: &[u8]) -> Result<Vec<i32>, GenerateError> {

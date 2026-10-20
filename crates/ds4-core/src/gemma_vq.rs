@@ -107,6 +107,68 @@ pub const ITEM_TOKENS_MAX: u32 = 2048;
 /// caps and enforced by name where a request exceeds it.
 pub const BATCH_ROWS_MAX: u32 = 8192;
 
+/// The id the artifact's own vocabulary gives the image placeholder, and the
+/// position the checkpoint's model card marks an image at
+/// (`.models/EmbeddingGemma-2-914f7f8/README.md` section 5: "`<|image|>` marks
+/// the position of image input"). It is the checkpoint's `image_token_id`
+/// (`config.json:51`) and it is ALSO the id the vision tower's soft rows fill:
+/// the reference processor expands the one placeholder into the model's begin
+/// marker, one placeholder per soft row and its end marker, which is the shape
+/// the vision anchor's own 92-position sequence carries
+/// (tests/parity/eg2vq_vision_anchor.cpp:106-113, and the C header's
+/// `DS4_EG2VQ_IMAGE_TOKEN_ID`, ds4_eg2vq.h). Measured against the artifact:
+///
+///   cargo run -p ds4-core --release --example gemma_vq_vocab -- <artifact.gguf> 255999,258880,258882
+///   ->  255999  <|image>   258880  <|image|>   258882  <image|>
+///
+/// and the tokenizer's own reading of the strings, which is how the wire
+/// builds a sequence:
+///
+///   cargo run -p ds4-core --release --example gemma_vq_tok -- <artifact.gguf> <items.tsv> <prompts.json>
+///   ->  <|image|> = 258880,  <|image> = 255999,  <image|> = 258882
+pub const IMAGE_TOKEN_ID: i32 = 258_880;
+/// The begin and end markers the reference wraps the expanded span with
+/// (`tools/mtmd/mtmd.cpp:955-958` at the pin; `boi_token_id` /
+/// `eoi_token_id`, `.models/EmbeddingGemma-2-914f7f8/config.json:47,50`).
+/// They are carried as STRINGS because that is how they enter a sequence: the
+/// family's tokenizer encodes them from the same vocabulary the reference reads
+/// them out of, so no id here is invented.
+pub const IMAGE_BEGIN_MARKER: &str = "<|image>";
+pub const IMAGE_END_MARKER: &str = "<image|>";
+/// The placeholder as the text carries it, the literal the wire looks for.
+pub const IMAGE_PLACEHOLDER: &str = "<|image|>";
+
+/// The vision tower's soft-token budget for one image: the model card's 70 to
+/// 1120 (README.md section 5, "Vision Token Budget"), which is the checkpoint's
+/// own `hparams.set_limit_image_tokens(70, 1120)` at the pin
+/// (`tools/mtmd/clip.cpp:1734`) over `patch_area` 2304
+/// (`tools/mtmd/clip-model.h:207-212`). The size solver keeps every image inside
+/// this window -- a small one is upscaled, a large one downscaled -- so these
+/// are the engine's own representation bounds, NOT refusal boundaries: the
+/// refusals are the item ceiling above (which counts the soft rows) and the
+/// solver's own "cannot place" stop.
+pub const IMAGE_SOFT_TOKENS_MIN: u32 = 70;
+pub const IMAGE_SOFT_TOKENS_MAX: u32 = 1120;
+/// The pixel window the same budget maps to (`patch_area` x the soft-token
+/// limits), and the largest content the preprocessing will produce.
+pub const IMAGE_PIXELS_MIN: u32 = 161_280;
+pub const IMAGE_PIXELS_MAX: u32 = 2_580_480;
+
+/// Images one item may carry. The splice entry fills ONE contiguous run of
+/// placeholders (`ds4_eg2vq_graph.inc`, `ds4_eg2vq.h`'s
+/// `ds4_eg2vq_ref_embed_image`), so one is what this port accepts; the
+/// checkpoint itself and the reference allow several interleaved media items
+/// (README.md section 5), which would need one span per image. Declared here so
+/// the route can refuse the second one by name rather than mis-splice it.
+pub const IMAGE_PER_ITEM_MAX: u32 = 1;
+
+/// The vision tower's row width: the 768-to-512 projection's output
+/// (`ds4_eg2vq.h`'s `DS4_EG2VQ_N_EMBD`, which is also the mmproj's
+/// `mm.input_projection.weight` row length). The wire needs it to size the row
+/// buffer it hands the C side; `crates/ds4-core/tests/eg2vq_serving_caps.rs`
+/// pins it against the C header so the two cannot drift.
+pub const IMAGE_EMBD: u32 = 512;
+
 type Result<T> = std::result::Result<T, TensorError>;
 
 fn fail(reason: &'static str) -> TensorError {

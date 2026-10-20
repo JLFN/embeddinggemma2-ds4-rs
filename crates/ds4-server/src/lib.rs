@@ -22,6 +22,8 @@ pub mod route;
 pub mod serve;
 #[cfg(test)]
 mod serve_503_body_test;
+#[cfg(test)]
+mod serve_embed_media_test;
 pub mod serve_cont;
 #[cfg(any(feature = "native", test))]
 mod serve_cont_evict;

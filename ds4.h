@@ -320,6 +320,23 @@ void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
    outside the embedding table, and any engine that is not family gemma_vq. */
 int ds4_engine_embed_gemma_vq(ds4_engine *e, const int32_t *ids, uint32_t n_ids,
                               float *out768, char *error, size_t error_cap);
+/* The same entry with an image in the item (phase 8, unit 26).  `ids` is one
+   item's token ids with the image's position already expanded -- the caller
+   builds it, because only the vocabulary knows the markers: bos, the text, the
+   model's begin marker, n_soft placeholders of DS4_EG2VQ_IMAGE_TOKEN_ID, the
+   end marker, the rest of the text, eos -- and `soft` is the vision tower's own
+   output for that image (n_soft rows x 512, exactly what
+   ds4_engine_vision_encode_memory returns; the two calls share one
+   preprocessing, so a caller probes the geometry it needs and then encodes
+   once).  Refuses, never truncates, the text entry's own cases plus: a NULL
+   image, zero soft rows, more soft rows than the tower's size solver will place
+   (DS4_EG2VQ_VISION_SOFT_MAX), and an image span that is not exactly one
+   contiguous run of n_soft placeholders.  A span the splice cannot align is a
+   hard stop inside the tower, so it is turned into a refusal here instead. */
+int ds4_engine_embed_gemma_vq_image(ds4_engine *e,
+                                    const int32_t *ids, uint32_t n_ids,
+                                    const float *soft, uint32_t n_soft,
+                                    float *out768, char *error, size_t error_cap);
 const char *ds4_engine_model_name(ds4_engine *e);
 ds4_chat_format ds4_engine_chat_format(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);

@@ -73,11 +73,21 @@ pub use bind::{
     DSPARK_MARKOV_RANK, DSPARK_N_LAYER, HOST_BIND_MISS,
 };
 pub use engram::{EngramError, EngramHash, EngramRow, EngramShard, EDIO_ALIGN};
-// The gemma_vq family's two embedding-shaped caps: what an embedding call may
-// ask it for (phase 6 row P2.3). Prefixed because the crate root already carries
-// several families' constants.
+// The gemma_vq family's embedding-shaped caps: what an embedding call may ask
+// it for (phase 6 row P2.3), and -- since unit 26 -- what its image half is
+// (the image token id and markers, the tower's soft-token and pixel window, the
+// one-image-per-item policy and the projection's width). Prefixed because the
+// crate root already carries several families' constants.
 pub use gemma_vq::{
-    BATCH_ROWS_MAX as GEMMA_VQ_BATCH_ROWS_MAX, ITEM_TOKENS_MAX as GEMMA_VQ_ITEM_TOKENS_MAX,
+    BATCH_ROWS_MAX as GEMMA_VQ_BATCH_ROWS_MAX, IMAGE_BEGIN_MARKER as GEMMA_VQ_IMAGE_BEGIN_MARKER,
+    IMAGE_EMBD as GEMMA_VQ_IMAGE_EMBD, IMAGE_END_MARKER as GEMMA_VQ_IMAGE_END_MARKER,
+    IMAGE_PER_ITEM_MAX as GEMMA_VQ_IMAGE_PER_ITEM_MAX,
+    IMAGE_PIXELS_MAX as GEMMA_VQ_IMAGE_PIXELS_MAX,
+    IMAGE_PIXELS_MIN as GEMMA_VQ_IMAGE_PIXELS_MIN,
+    IMAGE_PLACEHOLDER as GEMMA_VQ_IMAGE_PLACEHOLDER,
+    IMAGE_SOFT_TOKENS_MAX as GEMMA_VQ_IMAGE_SOFT_TOKENS_MAX,
+    IMAGE_SOFT_TOKENS_MIN as GEMMA_VQ_IMAGE_SOFT_TOKENS_MIN,
+    IMAGE_TOKEN_ID as GEMMA_VQ_IMAGE_TOKEN_ID, ITEM_TOKENS_MAX as GEMMA_VQ_ITEM_TOKENS_MAX,
 };
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};
@@ -2459,6 +2469,286 @@ impl Model {
             ids.push(self.vocab.eos_id);
         }
         ids
+    }
+
+    /// Phase 8, unit 26: one media item's token ids -- the same construction as
+    /// `embed_item_ids`, with the image's ONE `<|image|>` placeholder replaced by
+    /// the span the reference processor produces there: the model's begin
+    /// marker, `n_soft` placeholders (one per soft row the tower will fill) and
+    /// its end marker (`tools/mtmd/mtmd.cpp:955-958` at the pin; the checkpoint's
+    /// own `boi_token_id`/`eoi_token_id`/`image_token_id` in config.json).
+    ///
+    /// The markers are encoded from the family's own vocabulary rather than
+    /// written as ids: a vocabulary that does not carry them is not this model's,
+    /// and that is a refusal here rather than a wrong sequence later. With
+    /// `prefix` empty and `text` the bare placeholder, the result is exactly the
+    /// anchor's 92-position sequence -- [BOS][<|image>] + 88 placeholders +
+    /// [<image|>][EOS], span [2, 90) -- which is what gate 25's target was
+    /// frozen from.
+    ///
+    /// Refusals: a text that carries no placeholder (an image has no position
+    /// the model would read), one that carries two (the splice fills ONE
+    /// contiguous run: `crate::gemma_vq::IMAGE_PER_ITEM_MAX`), a nested or
+    /// empty span, and a marker the vocabulary does not encode as a single
+    /// token.
+    pub fn embed_item_media_ids(
+        &self,
+        prefix: &str,
+        text: &str,
+        n_soft: u32,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Result<Vec<i32>> {
+        embed_media_ids(&self.vocab, prefix, text, n_soft, add_bos, add_eos)
+    }
+
+    /// Phase 8, unit 26: one image's soft rows through the vision tower
+    /// (`ds4_bridge_model_vision_encode_rows` -> the engine's
+    /// `ds4_engine_vision_encode_memory`, the same entry gate 25 measured).
+    /// `expect_rows` is the token_count of THIS model's own
+    /// `vision_probe` for the same bytes: the C side refuses a geometry that
+    /// moved between the two calls rather than reinterpreting the buffer.
+    /// Returns `expect_rows * GEMMA_VQ_IMAGE_EMBD` floats in the pooler's own
+    /// order -- the rows `embed_gemma_vq_image` fills the span with.
+    pub fn vision_encode_rows(&self, data: &[u8], expect_rows: u32) -> Result<Vec<f32>> {
+        if data.is_empty() {
+            return Err(Error {
+                code: 1,
+                message: "the image is empty".into(),
+            });
+        }
+        if expect_rows == 0 || expect_rows > crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the probe reported {expect_rows} rows, outside the tower's own 1..={}",
+                    crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX
+                ),
+            });
+        }
+        let n_floats = (expect_rows as usize) * (crate::gemma_vq::IMAGE_EMBD as usize);
+        let mut rows = vec![0.0f32; n_floats];
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 -- FFI boundary] `raw` is the open model handle;
+        // `data` is a live slice of data.len() bytes, `rows` holds exactly
+        // expect_rows * IMAGE_EMBD floats and the C entry writes only that many.
+        let rc = unsafe {
+            ds4_sys::ds4_bridge_model_vision_encode_rows(
+                self.raw.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                rows.as_mut_ptr(),
+                n_floats as u64,
+                crate::gemma_vq::IMAGE_EMBD,
+                expect_rows,
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if rc == 0 {
+            return Err(fail(1, &err));
+        }
+        Ok(rows)
+    }
+
+    /// Phase 8, unit 26: the gemma_vq embedding entry with an image in the item
+    /// (`ds4_bridge_eg2vq_embed_image` -> `ds4_engine_embed_gemma_vq_image`).
+    /// `ids` are `embed_item_media_ids`' own output and `soft` the rows
+    /// `vision_encode_rows` produced for the image the text marks: exactly one
+    /// contiguous run of `IMAGE_TOKEN_ID` positions in `ids`, one soft row each.
+    /// The span's shape is checked here as well as in C, so the message is the
+    /// same on every backend (the text entry's own reason for duplicating its
+    /// item ceiling).
+    pub fn embed_gemma_vq_image(&self, ids: &[i32], soft: &[f32]) -> Result<Vec<f32>> {
+        const OUT: usize = 768;
+        if ids.is_empty() {
+            return Err(Error {
+                code: 1,
+                message: "an empty item has no embedding".into(),
+            });
+        }
+        if ids.len() > crate::gemma_vq::ITEM_TOKENS_MAX as usize {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the item is {} tokens, past the {} the embedding tower's attention kernel \
+                     holds (crate::gemma_vq::ITEM_TOKENS_MAX)",
+                    ids.len(),
+                    crate::gemma_vq::ITEM_TOKENS_MAX
+                ),
+            });
+        }
+        let width = crate::gemma_vq::IMAGE_EMBD as usize;
+        if soft.is_empty() || soft.len() % width != 0 {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the image's rows are {} floats, not a whole number of {width}-wide rows",
+                    soft.len()
+                ),
+            });
+        }
+        let n_soft = (soft.len() / width) as u32;
+        if n_soft > crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the image has {n_soft} soft rows, past the {} the vision tower's size solver \
+                     will place (crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX)",
+                    crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX
+                ),
+            });
+        }
+        let marked = ids
+            .iter()
+            .filter(|id| **id == crate::gemma_vq::IMAGE_TOKEN_ID)
+            .count();
+        let first = ids
+            .iter()
+            .position(|id| *id == crate::gemma_vq::IMAGE_TOKEN_ID);
+        let last = ids
+            .iter()
+            .rposition(|id| *id == crate::gemma_vq::IMAGE_TOKEN_ID);
+        if marked as u32 != n_soft || last.zip(first).map(|(l, f)| l - f + 1) != Some(n_soft as usize) {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the ids mark {marked} positions as the image placeholder, the image has \
+                     {n_soft} soft rows: the splice fills ONE contiguous run of n_soft \
+                     placeholders (crate::gemma_vq::IMAGE_TOKEN_ID)"
+                ),
+            });
+        }
+        let n_ids = u32::try_from(ids.len()).map_err(|_| Error {
+            code: 1,
+            message: "the item is longer than u32 tokens".into(),
+        })?;
+        let n_soft = u32::try_from(n_soft).map_err(|_| Error {
+            code: 1,
+            message: "the image is wider than u32 rows".into(),
+        })?;
+        let mut out = vec![0.0f32; OUT];
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 -- FFI boundary] `raw` is the open model handle;
+        // `ids` is a live slice of n_ids elements, `soft` holds exactly
+        // n_soft * IMAGE_EMBD floats and `out` the OUT floats the C entry writes
+        // only on success.
+        let rc = unsafe {
+            ds4_sys::ds4_bridge_eg2vq_embed_image(
+                self.raw.as_ptr(),
+                ids.as_ptr(),
+                n_ids,
+                soft.as_ptr(),
+                n_soft,
+                out.as_mut_ptr(),
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if rc == 0 {
+            return Err(fail(1, &err));
+        }
+        Ok(out)
+    }
+}
+
+/// Phase 8, unit 26: the image-span sequence, given the family's vocabulary --
+/// the whole of `Model::embed_item_media_ids`, which is only the thin wrapper
+/// the route calls.  It lives here so the sequence can be built and checked
+/// WITHOUT binding a model's weights (`examples/gemma_vq_media_ids`, which gate
+/// 26 runs against the anchor's own 92-position sequence), while the route, the
+/// example and the model method still share one implementation.
+///
+/// Refusals: a text that carries no placeholder (an image has no position the
+/// model would read), one that carries two (the splice fills ONE contiguous run:
+/// `crate::gemma_vq::IMAGE_PER_ITEM_MAX`), a soft-row count outside the tower's
+/// own window, an item past the token ceiling, and a marker the vocabulary does
+/// not encode as a single token.
+pub fn embed_media_ids(
+    vocab: &Vocab,
+    prefix: &str,
+    text: &str,
+    n_soft: u32,
+    add_bos: bool,
+    add_eos: bool,
+) -> Result<Vec<i32>> {
+    let begin = marker_id(vocab, crate::gemma_vq::IMAGE_BEGIN_MARKER)?;
+    let end = marker_id(vocab, crate::gemma_vq::IMAGE_END_MARKER)?;
+    if n_soft == 0 || n_soft > crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX {
+        return Err(Error {
+            code: 1,
+            message: format!(
+                "the image is {n_soft} soft tokens, outside the tower's own 1..={} \
+                 (crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX)",
+                crate::gemma_vq::IMAGE_SOFT_TOKENS_MAX
+            ),
+        });
+    }
+    let full = format!("{prefix}{text}");
+    let placeholder = crate::gemma_vq::IMAGE_PLACEHOLDER;
+    let Some(at) = full.find(placeholder) else {
+        return Err(Error {
+            code: 1,
+            message: format!(
+                "the item carries an image but its text has no {placeholder} placeholder: \
+                 this family places an image where the text marks it (the checkpoint's \
+                 model card, section 5), so an unmarked image has no position"
+            ),
+        });
+    };
+    if full[at + placeholder.len()..].contains(placeholder) {
+        return Err(Error {
+            code: 1,
+            message: format!(
+                "the item's text carries more than one {placeholder} placeholder, and this \
+                 port places {} image per item (one contiguous span is what the splice \
+                 entry fills; crate::gemma_vq::IMAGE_PER_ITEM_MAX)",
+                crate::gemma_vq::IMAGE_PER_ITEM_MAX
+            ),
+        });
+    }
+    let mut ids = Vec::new();
+    if add_bos {
+        ids.push(vocab.bos_id);
+    }
+    ids.extend(vocab.encode_bytes(full[..at].as_bytes()));
+    ids.push(begin);
+    ids.extend(std::iter::repeat(crate::gemma_vq::IMAGE_TOKEN_ID).take(n_soft as usize));
+    ids.push(end);
+    ids.extend(vocab.encode_bytes(full[at + placeholder.len()..].as_bytes()));
+    if add_eos {
+        ids.push(vocab.eos_id);
+    }
+    if ids.len() > crate::gemma_vq::ITEM_TOKENS_MAX as usize {
+        return Err(Error {
+            code: 1,
+            message: format!(
+                "the item is {} tokens (its {n_soft} soft rows included), past the {} the \
+                 embedding tower's attention kernel holds (crate::gemma_vq::ITEM_TOKENS_MAX)",
+                ids.len(),
+                crate::gemma_vq::ITEM_TOKENS_MAX
+            ),
+        });
+    }
+    Ok(ids)
+}
+
+/// One of the family's marker strings as a single token id, or a refusal naming
+/// the string: the ids of `IMAGE_BEGIN_MARKER` / `IMAGE_END_MARKER` are read out
+/// of the vocabulary, never written down (`<|image>` = 255999 and `<image|>` =
+/// 258882 for this artifact, measured with `examples/gemma_vq_tok`).
+fn marker_id(vocab: &Vocab, marker: &str) -> Result<i32> {
+    let ids = vocab.encode_bytes(marker.as_bytes());
+    match ids.as_slice() {
+        [id] => Ok(*id),
+        _ => Err(Error {
+            code: 1,
+            message: format!(
+                "the vocabulary encodes {marker} as {} tokens, not one: this file is not \
+                 the image-capable artifact this entry expects",
+                ids.len()
+            ),
+        }),
     }
 }
 
