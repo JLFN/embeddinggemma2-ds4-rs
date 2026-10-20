@@ -152,6 +152,21 @@ int ds4_eg2vq_vision_prepare(const uint8_t *data, size_t len,
                              float *canvas, uint64_t canvas_cap,
                              char *err, size_t errlen);
 
+/* The gate's attribution facility, and only that: the CPU forward can also hand
+ * back the three stage buffers a divergence is localized with.  Every pointer
+ * may be NULL, and a NULL `stages` is the shipping path and changes nothing.
+ * `patch` is the tower's input after the patch convolution and the two position
+ * adds (n_patches * 768), `l0` is the residual stream after block 0
+ * (n_patches * 768) and `pooled` the pooled rows before the embedder
+ * (n_soft * 768).  The device leg exposes the same three stages
+ * (ds4_gpu_eg2vq_vision_stage), which is how a mismatch is attributed to a stage
+ * rather than to a guess. */
+typedef struct {
+    float *patch;
+    float *l0;
+    float *pooled;
+} ds4_eg2vq_vision_stages;
+
 /* The whole image path on the CPU: image bytes -> `geo->n_soft` soft tokens of
  * 512 floats each, in the frozen dumps' own row order.  `soft` receives
  * n_soft * 512 floats.  Returns 0 (and writes nothing) on any refusal. */
@@ -161,7 +176,99 @@ int ds4_eg2vq_vision_forward(const struct ds4_model *m,
                              const ds4_eg2vq_vision_opts *opts,
                              float *soft, uint64_t soft_cap,
                              ds4_eg2vq_vision_geometry *geo,
+                             ds4_eg2vq_vision_stages *stages,
                              char *err, size_t errlen);
+
+/* ------------------------------------------------------------------------- *
+ * The DEVICE (CUDA) leg of the same tower (unit 24).  The plan's source is a
+ * slot table built from the companion mmproj by name, exactly the tensors
+ * ds4_eg2vq_vision_bind checks — the device leg's one simplification is that it
+ * uploads the matrices AS THE FILE CARRIES THEM (bf16) instead of widening them
+ * into the CPU leg's 576.0 MiB f32 cache, because its GEMM reads bf16 rows.
+ * ------------------------------------------------------------------------- */
+
+enum {
+    DS4_EG2VQ_VISION_SLOT_PATCH_CONV = 0, /* v.patch_embd.weight, bf16 [768][768]  */
+    DS4_EG2VQ_VISION_SLOT_PROJ,           /* mm.input_projection.weight bf16 [512][768] */
+    DS4_EG2VQ_VISION_SLOT_POS_TABLE,      /* v.position_embd.weight f32 [2][10240][768] */
+    DS4_EG2VQ_VISION_SLOT_LAYER_BASE,     /* + il * DS4_EG2VQ_VISION_SUB_N */
+};
+
+enum {
+    DS4_EG2VQ_VISION_SUB_LN1 = 0,         /* v.blk.N.ln1.weight            f32 [768] */
+    DS4_EG2VQ_VISION_SUB_ATTN_POST,       /* v.blk.N.attn_post_norm.weight f32 [768] */
+    DS4_EG2VQ_VISION_SUB_LN2,             /* v.blk.N.ln2.weight            f32 [768] */
+    DS4_EG2VQ_VISION_SUB_FFN_POST,        /* v.blk.N.ffn_post_norm.weight  f32 [768] */
+    DS4_EG2VQ_VISION_SUB_Q_NORM,          /* v.blk.N.attn_q_norm.weight    f32 [64]  */
+    DS4_EG2VQ_VISION_SUB_K_NORM,          /* v.blk.N.attn_k_norm.weight    f32 [64]  */
+    DS4_EG2VQ_VISION_SUB_Q,               /* v.blk.N.attn_q.weight         bf16 [768][768] */
+    DS4_EG2VQ_VISION_SUB_K,               /* v.blk.N.attn_k.weight         bf16 [768][768] */
+    DS4_EG2VQ_VISION_SUB_V,               /* v.blk.N.attn_v.weight         bf16 [768][768] */
+    DS4_EG2VQ_VISION_SUB_O,               /* v.blk.N.attn_out.weight       bf16 [768][768] */
+    DS4_EG2VQ_VISION_SUB_FFN_GATE,        /* v.blk.N.ffn_gate.weight       bf16 [3072][768] */
+    DS4_EG2VQ_VISION_SUB_FFN_UP,          /* v.blk.N.ffn_up.weight         bf16 [3072][768] */
+    DS4_EG2VQ_VISION_SUB_FFN_DOWN,        /* v.blk.N.ffn_down.weight       bf16 [768][3072] */
+    DS4_EG2VQ_VISION_SUB_N,
+};
+
+enum {
+    DS4_EG2VQ_VISION_SLOT_N = DS4_EG2VQ_VISION_SLOT_LAYER_BASE
+                            + DS4_EG2VQ_VISION_N_LAYER * DS4_EG2VQ_VISION_SUB_N,
+};
+
+enum {
+    DS4_EG2VQ_VISION_KIND_BF16_MATRIX = 0, /* [rows][cols] bf16, rows = out features */
+    DS4_EG2VQ_VISION_KIND_F32_VECTOR  = 1, /* [rows] f32 */
+    DS4_EG2VQ_VISION_KIND_F32_TABLE   = 2, /* [rows][cols] f32 */
+};
+
+typedef struct {
+    const void *host;   /* the tensor's bytes in the mmproj; read before bind returns */
+    uint64_t    bytes;
+    uint32_t    rows;
+    uint32_t    cols;
+    uint32_t    kind;
+} ds4_eg2vq_vision_slot;
+
+/* Fill DS4_EG2VQ_VISION_SLOT_N slots from the companion mmproj.  The same names,
+ * shapes and types ds4_eg2vq_vision_bind requires: a file that is not this tower
+ * stops the load here by name, before any device memory is allocated. */
+void ds4_eg2vq_vision_slot_table(const struct ds4_model *m, ds4_eg2vq_vision_slot *slots);
+
+typedef struct ds4_eg2vq_vision_gpu_model ds4_eg2vq_vision_gpu_model;
+typedef struct ds4_eg2vq_vision_gpu_ctx ds4_eg2vq_vision_gpu_ctx;
+
+ds4_eg2vq_vision_gpu_model *ds4_gpu_eg2vq_vision_bind(const ds4_eg2vq_vision_slot *slots,
+                                                      uint32_t n_slots);
+void ds4_gpu_eg2vq_vision_unbind(ds4_eg2vq_vision_gpu_model *model);
+
+/* Device bytes of the workspace for an image of at most `max_patches` patches
+ * (grid_w * grid_h) and `max_soft` soft tokens; the canvas, the im2col, the
+ * tower's rows and the FFN's width all scale with the patch count. */
+uint64_t ds4_gpu_eg2vq_vision_workspace(uint32_t max_patches, uint32_t max_soft);
+ds4_eg2vq_vision_gpu_ctx *ds4_gpu_eg2vq_vision_create(const ds4_eg2vq_vision_gpu_model *model,
+                                                      uint64_t scratch,
+                                                      uint32_t max_patches,
+                                                      uint32_t max_soft);
+void ds4_gpu_eg2vq_vision_free(ds4_eg2vq_vision_gpu_ctx *ctx);
+
+/* The image path on the device.  The preprocessing is the SAME function the CPU
+ * leg calls (ds4_eg2vq_vision_prepare, the contract gate 23 pins); everything
+ * after it runs in the kernels of cuda/eg2vq_vis.cuh.  `soft` receives
+ * n_soft * 512 floats, in the same row order as the CPU leg's. */
+int ds4_gpu_eg2vq_vision_forward(ds4_eg2vq_vision_gpu_ctx *ctx,
+                                 const uint8_t *data, size_t len,
+                                 const ds4_eg2vq_vision_opts *opts,
+                                 float *soft, uint64_t soft_cap,
+                                 ds4_eg2vq_vision_geometry *geo,
+                                 char *err, size_t errlen);
+
+/* Copy one stage of the last forward out, for the gate's attribution:
+ * "patch" (n_patches * 768), "l0" (n_patches * 768), "pooled" (n_soft * 768) or
+ * "soft" (n_soft * 512).  Returns the number of floats written, 0 for an
+ * unknown stage, no forward yet, or a buffer smaller than the stage. */
+uint64_t ds4_gpu_eg2vq_vision_stage(const ds4_eg2vq_vision_gpu_ctx *ctx,
+                                    const char *stage, float *dst, uint64_t cap);
 
 #ifdef __cplusplus
 }

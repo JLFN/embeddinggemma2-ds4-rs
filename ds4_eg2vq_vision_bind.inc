@@ -148,3 +148,111 @@ void ds4_eg2vq_vision_free(ds4_eg2vq_vision_weights *v) {
     free(v->input_projection);
     memset(v, 0, sizeof(*v));
 }
+
+/* The device plan's source (unit 24).  It is not a second registry: every
+ * geometry and type assertion below is the CPU binder's own call on the same
+ * name, and the byte count is the element count the file's own layout gives
+ * (dim[0] fastest, rows contiguous), which is what both the CPU row reader and
+ * the device upload walk.  A file that binds on the CPU leg therefore fills this
+ * table, and a file that does not stops the load here, at slot resolution, by
+ * name. */
+static void eg2vq_vision_slot_matrix(const ds4_model *m, const char *fmt, uint32_t il,
+                                     ds4_eg2vq_vision_slot *out,
+                                     uint32_t rows, uint32_t cols) {
+    char name[192];
+    snprintf(name, sizeof(name), fmt, il);
+    ds4_tensor *t = required_tensor(m, name);
+    tensor_expect_layout(t, DS4_TENSOR_BF16, 2, (uint64_t)cols, (uint64_t)rows, 0);
+    out->host  = tensor_data(m, t);
+    out->bytes = (uint64_t)rows * cols * 2u;
+    out->rows  = rows;
+    out->cols  = cols;
+    out->kind  = DS4_EG2VQ_VISION_KIND_BF16_MATRIX;
+}
+
+static void eg2vq_vision_slot_vector(const ds4_model *m, const char *fmt, uint32_t il,
+                                     ds4_eg2vq_vision_slot *out, uint32_t d0) {
+    ds4_tensor *t = eg2vq_vision_norm(m, fmt, il, d0);
+    out->host  = tensor_data(m, t);
+    out->bytes = (uint64_t)d0 * 4u;
+    out->rows  = d0;
+    out->cols  = 0;
+    out->kind  = DS4_EG2VQ_VISION_KIND_F32_VECTOR;
+}
+
+void ds4_eg2vq_vision_slot_table(const ds4_model *m, ds4_eg2vq_vision_slot *slots) {
+    if (!m || !slots) { ds4_die("gemma_vq vision: no model for the device slot table"); }
+    memset(slots, 0, sizeof(*slots) * DS4_EG2VQ_VISION_SLOT_N);
+
+    /* 1. the patch convolution (rank 4 in the file, one contiguous GEMM operand
+     * on the device: [768][768] with the row index the file's own memory order)
+     * and the tie-in projection. */
+    {
+        ds4_tensor *t = required_tensor(m, "v.patch_embd.weight");
+        tensor_expect_layout4(t, DS4_TENSOR_BF16, 4,
+                              (uint64_t)DS4_EG2VQ_VISION_PATCH,
+                              (uint64_t)DS4_EG2VQ_VISION_PATCH, 3,
+                              (uint64_t)DS4_EG2VQ_VISION_N_EMBD);
+        ds4_eg2vq_vision_slot *s = &slots[DS4_EG2VQ_VISION_SLOT_PATCH_CONV];
+        s->host  = tensor_data(m, t);
+        s->bytes = (uint64_t)DS4_EG2VQ_VISION_N_EMBD * DS4_EG2VQ_VISION_PATCH
+                 * DS4_EG2VQ_VISION_PATCH * 3u * 2u;
+        s->rows  = DS4_EG2VQ_VISION_N_EMBD;              /* out features */
+        s->cols  = DS4_EG2VQ_VISION_PATCH * DS4_EG2VQ_VISION_PATCH * 3u;
+        s->kind  = DS4_EG2VQ_VISION_KIND_BF16_MATRIX;
+    }
+    {
+        ds4_tensor *t = required_tensor(m, "mm.input_projection.weight");
+        tensor_expect_layout(t, DS4_TENSOR_BF16, 2,
+                             (uint64_t)DS4_EG2VQ_VISION_N_IN,
+                             (uint64_t)DS4_EG2VQ_VISION_N_OUT, 0);
+        ds4_eg2vq_vision_slot *s = &slots[DS4_EG2VQ_VISION_SLOT_PROJ];
+        s->host  = tensor_data(m, t);
+        s->bytes = (uint64_t)DS4_EG2VQ_VISION_N_OUT * DS4_EG2VQ_VISION_N_IN * 2u;
+        s->rows  = DS4_EG2VQ_VISION_N_OUT;
+        s->cols  = DS4_EG2VQ_VISION_N_IN;
+        s->kind  = DS4_EG2VQ_VISION_KIND_BF16_MATRIX;
+    }
+
+    /* 2. the two axial position tables, one blob: slice 0 (X) then slice 1 (Y),
+     * which is the file's own order for ne2 = 2 (gemma4v.cpp:30-34). */
+    {
+        ds4_tensor *t = required_tensor(m, "v.position_embd.weight");
+        tensor_expect_layout(t, DS4_TENSOR_F32, 3,
+                             (uint64_t)DS4_EG2VQ_VISION_N_EMBD,
+                             (uint64_t)DS4_EG2VQ_VISION_POS_SIZE, 2);
+        ds4_eg2vq_vision_slot *s = &slots[DS4_EG2VQ_VISION_SLOT_POS_TABLE];
+        s->host  = tensor_data(m, t);
+        s->bytes = (uint64_t)DS4_EG2VQ_VISION_N_EMBD * DS4_EG2VQ_VISION_POS_SIZE * 2u * 4u;
+        s->rows  = 2u * DS4_EG2VQ_VISION_POS_SIZE;
+        s->cols  = DS4_EG2VQ_VISION_N_EMBD;
+        s->kind  = DS4_EG2VQ_VISION_KIND_F32_TABLE;
+    }
+
+    /* 3. the sixteen blocks, in the CPU binder's own order. */
+    const uint32_t E = DS4_EG2VQ_VISION_N_EMBD;
+    const uint32_t NF = DS4_EG2VQ_VISION_N_FF;
+    for (uint32_t il = 0; il < (uint32_t)DS4_EG2VQ_VISION_N_LAYER; il++) {
+        ds4_eg2vq_vision_slot *base = &slots[DS4_EG2VQ_VISION_SLOT_LAYER_BASE
+                                            + il * (uint32_t)DS4_EG2VQ_VISION_SUB_N];
+        eg2vq_vision_slot_vector(m, "v.blk.%u.ln1.weight", il,
+                                 &base[DS4_EG2VQ_VISION_SUB_LN1], E);
+        eg2vq_vision_slot_vector(m, "v.blk.%u.attn_post_norm.weight", il,
+                                 &base[DS4_EG2VQ_VISION_SUB_ATTN_POST], E);
+        eg2vq_vision_slot_vector(m, "v.blk.%u.ln2.weight", il,
+                                 &base[DS4_EG2VQ_VISION_SUB_LN2], E);
+        eg2vq_vision_slot_vector(m, "v.blk.%u.ffn_post_norm.weight", il,
+                                 &base[DS4_EG2VQ_VISION_SUB_FFN_POST], E);
+        eg2vq_vision_slot_vector(m, "v.blk.%u.attn_q_norm.weight", il,
+                                 &base[DS4_EG2VQ_VISION_SUB_Q_NORM], DS4_EG2VQ_VISION_HEAD_DIM);
+        eg2vq_vision_slot_vector(m, "v.blk.%u.attn_k_norm.weight", il,
+                                 &base[DS4_EG2VQ_VISION_SUB_K_NORM], DS4_EG2VQ_VISION_HEAD_DIM);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.attn_q.weight", il, &base[DS4_EG2VQ_VISION_SUB_Q], E, E);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.attn_k.weight", il, &base[DS4_EG2VQ_VISION_SUB_K], E, E);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.attn_v.weight", il, &base[DS4_EG2VQ_VISION_SUB_V], E, E);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.attn_out.weight", il, &base[DS4_EG2VQ_VISION_SUB_O], E, E);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.ffn_gate.weight", il, &base[DS4_EG2VQ_VISION_SUB_FFN_GATE], NF, E);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.ffn_up.weight", il, &base[DS4_EG2VQ_VISION_SUB_FFN_UP], NF, E);
+        eg2vq_vision_slot_matrix(m, "v.blk.%u.ffn_down.weight", il, &base[DS4_EG2VQ_VISION_SUB_FFN_DOWN], E, NF);
+    }
+}

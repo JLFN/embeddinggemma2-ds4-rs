@@ -438,6 +438,7 @@ int ds4_eg2vq_vision_forward(const ds4_model *m,
                              const ds4_eg2vq_vision_opts *opts,
                              float *soft, uint64_t soft_cap,
                              ds4_eg2vq_vision_geometry *geo,
+                             ds4_eg2vq_vision_stages *stages,
                              char *err, size_t errlen) {
     if (err && errlen) { err[0] = '\0'; }
     if (!m || !v || !v->dense || !data || !len || !soft || !geo) {
@@ -503,6 +504,11 @@ int ds4_eg2vq_vision_forward(const ds4_model *m,
             float *hp = h + (uint64_t)p * E;
             for (uint32_t d = 0; d < E; d++) { hp[d] += ex[d]; }
             for (uint32_t d = 0; d < E; d++) { hp[d] += ey[d]; }
+        }
+        /* the gate's attribution stage 1: the tower's input (see
+         * ds4_eg2vq_vision_stages) */
+        if (stages && stages->patch) {
+            memcpy(stages->patch, h, (size_t)NP * E * sizeof(float));
         }
     }
 
@@ -581,6 +587,10 @@ int ds4_eg2vq_vision_forward(const ds4_model *m,
             float *hp = h + (uint64_t)p * E;
             for (uint32_t d = 0; d < E; d++) { hp[d] += op[d]; }
         }
+        /* the gate's attribution stage 2: the residual stream after block 0 */
+        if (il == 0u && stages && stages->l0) {
+            memcpy(stages->l0, h, (size_t)NP * E * sizeof(float));
+        }
     }
 
     /* 2. the pooler: 3x3 stride 3, then sqrt(n_embd). */
@@ -591,6 +601,10 @@ int ds4_eg2vq_vision_forward(const ds4_model *m,
         pc.grid_w = g.grid_w;
         pc.scale = sqrtf((float)E);
         ds4_parallel_for(g.n_soft, eg2vq_vision_pool_worker, &pc);
+        /* the gate's attribution stage 3: the pooled rows the embedder reads */
+        if (stages && stages->pooled) {
+            memcpy(stages->pooled, pooled, (size_t)g.n_soft * E * sizeof(float));
+        }
     }
 
     /* 3. the multimodal embedder: weightless RMS (eps 1e-6) then the 768->512

@@ -143,7 +143,7 @@ static int run_soft(const char *mmproj, const char *image, int f16_kv) {
     if (!ds4_eg2vq_vision_forward(&mm, &vw, data, len, &opts, soft,
                                  (uint64_t)DS4_EG2VQ_VISION_SOFT_MAX
                                      * DS4_EG2VQ_VISION_N_OUT,
-                                 &g, err, sizeof(err))) {
+                                 &g, NULL, err, sizeof(err))) {
         fprintf(stderr, "eg2vq_vision: the vision forward refused the image: %s\n", err);
         return 1;
     }
