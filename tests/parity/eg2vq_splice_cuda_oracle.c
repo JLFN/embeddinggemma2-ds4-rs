@@ -505,6 +505,84 @@ int main(int argc, char **argv) {
         free(one);
     }
 
+    /* ---- 6. the ENGINE entry: the same images through the two calls the bridge
+     * and the serving route make (ds4_engine_vision_probe / ..._encode_memory).
+     * The engine binds its OWN vision weights and device plans from the same two
+     * files, so this section is the serving surface's own end-to-end check: the
+     * probe's geometry against the oracle's, the soft rows against the CPU leg's. */
+    {
+        ds4_engine_options eopt;
+        memset(&eopt, 0, sizeof(eopt));
+        eopt.model_path = artifact;
+        eopt.vision_path = mmproj;
+        eopt.backend = DS4_BACKEND_CUDA;   /* the enum's zero value is METAL, so this is explicit */
+        ds4_engine *eng = NULL;
+        if (ds4_engine_open(&eng, &eopt) != 0 || !eng) {
+            fprintf(stderr, "SPLICE ORACLE: FAIL: the engine did not open with --vision\n");
+            status = 1;
+        } else if (!ds4_engine_has_vision(eng)) {
+            fprintf(stderr, "SPLICE ORACLE: FAIL: the engine reports no vision encoder\n");
+            status = 1;
+        } else {
+            printf("SPLICE ORACLE: the engine opened with --vision and reports a vision encoder\n");
+            for (uint32_t img = 0; img < n_images && !status; img++) {
+                char stem[256];
+                splice_stem(images[img], stem, sizeof(stem));
+                size_t len = 0;
+                uint8_t *data = splice_read_file(images[img], &len);
+                char err[256];
+                ds4_vision_image_info info;
+                memset(&info, 0, sizeof(info));
+                if (!ds4_engine_vision_probe(eng, data, len, &info, err, sizeof(err))) {
+                    fprintf(stderr, "SPLICE ORACLE: FAIL: the engine probe refused %s: %s\n", stem, err);
+                    status = 1;
+                    free(data);
+                    break;
+                }
+                ds4_vision_embedding emb;
+                memset(&emb, 0, sizeof(emb));
+                if (!ds4_engine_vision_encode_memory(eng, data, len, &emb, err, sizeof(err))) {
+                    fprintf(stderr, "SPLICE ORACLE: FAIL: the engine encode refused %s: %s\n", stem, err);
+                    status = 1;
+                    free(data);
+                    break;
+                }
+                /* the soft rows: the engine's leg against the oracle's own CPU leg,
+                 * recomputed here so every image is compared against its own. */
+                ds4_eg2vq_vision_opts vopts2;
+                vopts2.f16_kv = 1;
+                ds4_eg2vq_vision_geometry g2;
+                if (!ds4_eg2vq_vision_forward(&vm, &vw, data, len, &vopts2, soft_cpu,
+                                              (uint64_t)DS4_EG2VQ_VISION_SOFT_MAX * DS4_EG2VQ_N_EMBD,
+                                              &g2, NULL, err, sizeof(err))) {
+                    fprintf(stderr, "SPLICE ORACLE: FAIL: the CPU vision leg refused %s again: %s\n", stem, err);
+                    status = 1;
+                    ds4_vision_embedding_free(&emb);
+                    free(data);
+                    break;
+                }
+                const uint64_t n = (uint64_t)emb.token_count * DS4_EG2VQ_N_EMBD;
+                const splice_cmp e = splice_compare(emb.data, soft_cpu, emb.token_count,
+                                                    (uint32_t)DS4_EG2VQ_N_EMBD);
+                printf("SPLICE ORACLE: %s engine probe: source %ux%u content %ux%u padded %ux%u grid %ux%u tokens %u\n",
+                       stem, info.source_width, info.source_height, info.content_width,
+                       info.content_height, info.padded_width, info.padded_height,
+                       info.grid_width, info.grid_height, info.token_count);
+                printf("SPLICE ORACLE: %s engine soft rows vs the CPU leg: %llu values, maxabs %.8f relrms %.6f cosine %.8f\n",
+                       stem, (unsigned long long)n, e.maxabs, e.relrms, e.cos);
+                if (emb.token_count != 88u || info.token_count != 88u ||
+                    info.grid_width != 11u || info.grid_height != 8u ||
+                    e.cos < 0.9999) {
+                    fprintf(stderr, "SPLICE ORACLE: FAIL: the engine entry disagrees with the oracle for %s\n", stem);
+                    status = 1;
+                }
+                ds4_vision_embedding_free(&emb);
+                free(data);
+            }
+            ds4_engine_close(eng);
+        }
+    }
+
     printf("\nSPLICE ORACLE: the numbers\n");
     printf("SPLICE ORACLE: worst THE SPLICE (baseline weights, the reference's own soft rows): maxabs %.8f (bound %.3f), relrms %.6f (bound %.3f), cosine %.8f (bound %.3f)\n",
            worst_frozen_maxabs, SPLICE_FROZEN_MAXABS, worst_frozen_relrms, SPLICE_FROZEN_RELRMS,

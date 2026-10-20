@@ -88,6 +88,7 @@ enum {
  * canvas ("clip_encode: copying image 1/1 to input buffer (nx=528, ny=384)")
  * and the token count (image_tokens->nx = 88). */
 typedef struct {
+    uint32_t source_w, source_h;         /* the decoded image, before the size solver */
     uint32_t canvas_w, canvas_h;
     uint32_t region_w, region_h;
     int32_t  offset_x, offset_y;

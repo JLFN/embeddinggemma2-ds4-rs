@@ -37453,6 +37453,17 @@ struct ds4_engine {
     ds4_eg2vq_gpu_ctx   *eg2vq_ctx;
     uint32_t             eg2vq_max_tokens;
     uint64_t             eg2vq_embed_calls;
+    /* Phase 8 (the image path): the companion mmproj bound as the engine's second
+     * model (opt->vision_path, the family pattern at this file's own load switch),
+     * its CPU weights, and -- when the graph backend is live -- the vision device
+     * plan and one workspace sized for the largest image it has served.  See
+     * ds4_engine_vision_probe / ds4_engine_vision_encode_memory. */
+    ds4_eg2vq_vision_weights       eg2vq_vision;
+    ds4_eg2vq_vision_gpu_model    *eg2vq_vision_plan;
+    ds4_eg2vq_vision_gpu_ctx      *eg2vq_vision_ctx;
+    uint32_t                       eg2vq_vision_patches;
+    uint32_t                       eg2vq_vision_soft;
+    uint64_t                       eg2vq_vision_calls;
 };
 
 static bool qwen4exp_ple_cache_mb_valid(uint32_t cache_mb) {
@@ -39248,6 +39259,35 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->arg_key_end_id = vocab_lookup_optional(vocab, "</arg_key>");
         vocab->arg_value_start_id = vocab_lookup_optional(vocab, "<arg_value>");
         vocab->arg_value_end_id = vocab_lookup_optional(vocab, "</arg_value>");
+        vocab->dsml_id = -1;
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+        /* An EMBEDDING family (phase 6): the checkpoint has no chat template and
+         * no language-model head, and its own tokenizer -- the gemma4 BPE -- lives
+         * on the Rust side, which is why the CLI refuses generation for it by
+         * name (ds4_report_embedding_family_refusal) rather than encoding for it.
+         * What the C engine still takes from the file are the two ids the artifact
+         * records; every role id the family's (nonexistent) renderer would use is
+         * left absent, so nothing can be mistaken for a control token.  Before this
+         * case existed the chain fell through to another family's expectations and
+         * the engine could not open the artifact at all, which is what put the
+         * image path (phase 8) out of the engine's reach. */
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id))
+            vocab->bos_id = vocab_lookup_optional(vocab, "<bos>");
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id))
+            vocab->eos_id = vocab_lookup_optional(vocab, "<eos>");
+        vocab->system_id = -1;
+        vocab->user_id = -1;
+        vocab->assistant_id = -1;
+        vocab->tool_id = -1;
+        vocab->reference_id = -1;
+        vocab->plan_start_id = -1;
+        vocab->plan_end_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = -1;
+        vocab->think_end_id = -1;
         vocab->dsml_id = -1;
         return;
     }
@@ -72554,11 +72594,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM53 &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_STEP37 &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LING3VL &&
+             DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GEMMA_VQ &&
              DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MIMO2) ||
             e->backend != DS4_BACKEND_CUDA ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice) {
             fprintf(stderr,
-                    "ds4: --vision/--vision-gguf requires one full V4.1, GLM-5.3, Step, Ling or MiMo CUDA model\n");
+                    "ds4: --vision/--vision-gguf requires one full V4.1, GLM-5.3, Step, Ling, gemma_vq or MiMo CUDA model\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -72591,6 +72632,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             e->vision_image_token = S37_IMAGE_TOKEN;
             e->vision_start_token = 128000;
             e->vision_end_token = 128002;
+        } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+            /* Phase 8: the companion mmproj is the vision tower (dense bf16, the
+             * same file gates 22 to 25 read).  The three ids are the port's own
+             * recorded ones: the span's placeholder is the checkpoint's
+             * image_token_id (ds4_eg2vq.h names it, and gemma_vq_vocab checks it
+             * against the artifact), and the markers are the vocabulary's
+             * "<|image>" / "<image|>" entries (bos 2, eos 1 are the file's own). */
+            ds4_eg2vq_vision_bind(&e->eg2vq_vision, &e->vision_model);
+            e->vision_image_token = (int)DS4_EG2VQ_IMAGE_TOKEN_ID;
+            e->vision_start_token = 255999;
+            e->vision_end_token = 258882;
         } else {
             glm53_vision_weights_bind(&e->vision_weights, &e->vision_model);
             e->vision_image_token = (int)required_u32(
@@ -73397,6 +73449,13 @@ bool ds4_engine_has_embed_gemma_vq(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ;
 }
 
+#ifndef DS4_NO_GPU
+/* Defined below, beside the text tower's own ensure: the image path's device plan
+ * and workspace (phase 8). */
+static int eg2vq_vision_device_ensure(ds4_engine *e, uint32_t patches, uint32_t soft,
+                                      char *error, size_t error_cap);
+#endif
+
 int ds4_engine_vision_probe(ds4_engine *e,
                             const uint8_t *encoded, size_t encoded_len,
                             ds4_vision_image_info *out,
@@ -73428,6 +73487,32 @@ int ds4_engine_vision_probe(ds4_engine *e,
         };
         return 1;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+        /* The preprocessing alone, which touches no weights: the decoded image's
+         * own size, the canvas the size solver chose, the region the PAD_CEIL
+         * composite placed in it, and the pooled grid the soft tokens sit on
+         * (gate 23 pins every one of those numbers for the frozen fixtures). */
+        ds4_eg2vq_vision_geometry geo;
+        uint32_t *pos_x = xmalloc((size_t)DS4_EG2VQ_VISION_MAX_PATCHES * sizeof(uint32_t));
+        uint32_t *pos_y = xmalloc((size_t)DS4_EG2VQ_VISION_MAX_PATCHES * sizeof(uint32_t));
+        const int ok = ds4_eg2vq_vision_prepare(encoded, encoded_len, &geo, pos_x, pos_y,
+                                                NULL, 0, error, error_cap);
+        free(pos_y);
+        free(pos_x);
+        if (!ok) { return 0; }
+        *out = (ds4_vision_image_info){
+            .source_width = geo.source_w,
+            .source_height = geo.source_h,
+            .content_width = geo.region_w,
+            .content_height = geo.region_h,
+            .padded_width = geo.canvas_w,
+            .padded_height = geo.canvas_h,
+            .grid_width = geo.grid_w / (uint32_t)DS4_EG2VQ_VISION_MERGE,
+            .grid_height = geo.grid_h / (uint32_t)DS4_EG2VQ_VISION_MERGE,
+            .token_count = geo.n_soft,
+        };
+        return 1;
+    }
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM53) {
         if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
         return 0;
@@ -73453,6 +73538,55 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
     if (error && error_cap) snprintf(error, error_cap, "CUDA vision is unavailable");
     return 0;
 #else
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GEMMA_VQ) {
+        /* The image path end to end: the SAME preprocessing the probe (and gate
+         * 23) pins -- each leg does it internally, so a probe plus an encode
+         * decodes the image twice and nothing else -- then the tower.  The device
+         * leg is the graph backend's, the CPU reference path the other one, and
+         * both write the same n_soft x 512 rows in the pooler's own order. */
+        if (!e || !e->vision_ready) {
+            if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
+            return 0;
+        }
+        ds4_eg2vq_vision_opts vopts;
+        vopts.f16_kv = 1;
+        ds4_eg2vq_vision_geometry geo;
+        float *soft = xmalloc((size_t)DS4_EG2VQ_VISION_SOFT_MAX * DS4_EG2VQ_N_EMBD * sizeof(float));
+        int ok = 0;
+        if (ds4_backend_uses_graph(e->backend) && e->metal_ready) {
+            /* the shape first, so the workspace is sized before anything is bound:
+             * the preprocessing is the only thing that knows the patch count */
+            uint32_t *pos_x = xmalloc((size_t)DS4_EG2VQ_VISION_MAX_PATCHES * sizeof(uint32_t));
+            uint32_t *pos_y = xmalloc((size_t)DS4_EG2VQ_VISION_MAX_PATCHES * sizeof(uint32_t));
+            ok = ds4_eg2vq_vision_prepare(encoded, encoded_len, &geo, pos_x, pos_y,
+                                          NULL, 0, error, error_cap);
+            free(pos_y);
+            free(pos_x);
+            if (ok) {
+                ok = eg2vq_vision_device_ensure(e, geo.n_patches, geo.n_soft, error, error_cap) &&
+                     ds4_gpu_eg2vq_vision_forward(e->eg2vq_vision_ctx, encoded, encoded_len,
+                                                  &vopts, soft,
+                                                  (uint64_t)DS4_EG2VQ_VISION_SOFT_MAX * DS4_EG2VQ_N_EMBD,
+                                                  &geo, error, error_cap);
+            }
+        } else {
+            ok = ds4_eg2vq_vision_forward(&e->vision_model, &e->eg2vq_vision,
+                                          encoded, encoded_len, &vopts, soft,
+                                          (uint64_t)DS4_EG2VQ_VISION_SOFT_MAX * DS4_EG2VQ_N_EMBD,
+                                          &geo, NULL, error, error_cap);
+        }
+        if (!ok) {
+            free(soft);
+            if (error && error_cap && !error[0]) snprintf(error, error_cap, "the vision encode refused this image");
+            return 0;
+        }
+        e->eg2vq_vision_calls++;
+        out->data = soft;
+        out->token_count = geo.n_soft;
+        out->grid_width = geo.grid_w / (uint32_t)DS4_EG2VQ_VISION_MERGE;
+        out->grid_height = geo.grid_h / (uint32_t)DS4_EG2VQ_VISION_MERGE;
+        return 1;
+    }
     if (!e || !e->vision_ready || !e->vision_map_ready || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM53) {
         if (error && error_cap) snprintf(error, error_cap, "vision encoder is not ready");
         return 0;
@@ -73538,6 +73672,49 @@ static int eg2vq_device_ensure(ds4_engine *e, uint32_t n_tokens,
         return 0;
     }
     e->eg2vq_max_tokens = want;
+    return 1;
+}
+
+/* The image path's own device plan and workspace (phase 8): the companion
+ * mmproj's 211 tensors bound once per engine (289.88 + 62.70 MiB), and one
+ * workspace sized for the largest image this engine has been asked for --
+ * ds4_gpu_eg2vq_vision_workspace is 566.64 MiB at the family's maximum (10080
+ * patches, 1120 soft tokens).  It grows and never shrinks, exactly as the text
+ * tower's does, so a process serving many images pays the allocation once per
+ * size class. */
+static int eg2vq_vision_device_ensure(ds4_engine *e, uint32_t patches, uint32_t soft,
+                                      char *error, size_t error_cap) {
+    if (e->eg2vq_vision_ctx && e->eg2vq_vision_patches >= patches &&
+        e->eg2vq_vision_soft >= soft) { return 1; }
+    if (!e->eg2vq_vision_plan) {
+        static ds4_eg2vq_vision_slot slots[DS4_EG2VQ_VISION_SLOT_N];
+        ds4_eg2vq_vision_slot_table(&e->vision_model, slots);
+        if (!ds4_gpu_init()) {
+            if (error && error_cap) snprintf(error, error_cap, "no CUDA device");
+            return 0;
+        }
+        e->eg2vq_vision_plan = ds4_gpu_eg2vq_vision_bind(slots, (uint32_t)DS4_EG2VQ_VISION_SLOT_N);
+        if (!e->eg2vq_vision_plan) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the device vision plan did not bind (a tensor's name, shape or "
+                "type disagrees with the tower)");
+            return 0;
+        }
+    }
+    if (e->eg2vq_vision_ctx) {
+        ds4_gpu_eg2vq_vision_free(e->eg2vq_vision_ctx);
+        e->eg2vq_vision_ctx = NULL;
+    }
+    const uint64_t scratch = ds4_gpu_eg2vq_vision_workspace(patches, soft);
+    e->eg2vq_vision_ctx = ds4_gpu_eg2vq_vision_create(e->eg2vq_vision_plan, scratch, patches, soft);
+    if (!e->eg2vq_vision_ctx) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "no device workspace for a %u-patch image (the family's ceiling is %u)",
+            patches, (unsigned)DS4_EG2VQ_VISION_MAX_PATCHES);
+        return 0;
+    }
+    e->eg2vq_vision_patches = patches;
+    e->eg2vq_vision_soft = soft;
     return 1;
 }
 #endif
@@ -73748,7 +73925,11 @@ void ds4_engine_close(ds4_engine *e) {
      * the adapter prints their accounting here, once per process). */
     if (e->eg2vq_ctx) { ds4_gpu_eg2vq_free(e->eg2vq_ctx); e->eg2vq_ctx = NULL; }
     if (e->eg2vq_plan) { ds4_gpu_eg2vq_unbind(e->eg2vq_plan); e->eg2vq_plan = NULL; }
+    /* Phase 8: the image path's plan and workspace, the same arrangement. */
+    if (e->eg2vq_vision_ctx) { ds4_gpu_eg2vq_vision_free(e->eg2vq_vision_ctx); e->eg2vq_vision_ctx = NULL; }
+    if (e->eg2vq_vision_plan) { ds4_gpu_eg2vq_vision_unbind(e->eg2vq_vision_plan); e->eg2vq_vision_plan = NULL; }
 #endif
+    ds4_eg2vq_vision_free(&e->eg2vq_vision);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();

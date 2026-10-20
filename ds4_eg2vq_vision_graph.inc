@@ -243,6 +243,8 @@ int ds4_eg2vq_vision_prepare(const uint8_t *data, size_t len,
         pos_y[i] = i / grid_w;
     }
 
+    geo->source_w = (uint32_t)src_w;
+    geo->source_h = (uint32_t)src_h;
     geo->canvas_w = canvas_w;
     geo->canvas_h = canvas_h;
     geo->region_w = region_w;
