@@ -177,7 +177,7 @@ void ds4_eg2vq_ref_embed_image(const struct ds4_model *m, const struct ds4_weigh
                                const float *soft, uint32_t n_soft, float *out768);
 
 /* The longest item the device path accepts: the attention kernel's key plane
- * (cuda/eg2vq_attn.cuh:49, EG2VQ_ATTN_KEYS_MAX; the equality is asserted in
+ * (cuda/eg2vq_attn.cuh:93, EG2VQ_ATTN_KEYS_MAX; the equality is asserted in
  * ds4_eg2vq_gpu.cuh).  A longer item is REFUSED by the entry point rather than
  * truncated -- a plane that silently covered half an item would be a wrong
  * answer, not a slow one. */

@@ -307,6 +307,8 @@ int main(void) {
         CK(cudaMemcpy(dlen, lenv.data(), (size_t)tok * 4, cudaMemcpyHostToDevice));
         CK(cudaMemset(dy, 0, yref.size() * 4));
         int packed_ok = 1;
+        /* the plane is the item ceiling, so this case's own bound is the item
+         * lengths being different, not a cap the caller passes. */
         if (!eg2vq_attn(dy, dq, dk, dv, dpos, dlen, tok, n_head, nkv, hd, half)) {
             printf("FAIL: the launcher refused the packed block\n");
             fails++;
