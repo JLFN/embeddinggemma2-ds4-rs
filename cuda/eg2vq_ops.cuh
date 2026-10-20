@@ -14,16 +14,17 @@
  *                     ggml ops.cpp:4224-4231)
  *   eg2vq_ops_rms_head  the same over each head vector (graph:264-277; the q and
  *                     k norms carry a weight, the v norm is weightless)
- *   eg2vq_ops_rope    NeoX rotation over the whole head, pairs (i, i + hd/2)
+ *   eg2vq_ops_rope    NeoX rotation over the whole head, pairs (i, i + hd/2),
+ *                     indexed by each row's position INSIDE its item
  *                     (graph:60-77; ops.cpp:6289-6301 and :6375-6391)
  *   eg2vq_ops_gelu_mul  gelu(gate) * up, tanh GELU at ggml's coefficients
  *                     (graph:39-41, :307-309, :322-326)
- *   eg2vq_ops_pool    mean pool over the token axis then L2 normalize
+ *   eg2vq_ops_pool    mean pool over an ITEM's rows then L2 normalize
  *                     (graph:356-367; llama-graph.cpp:4049-4053;
  *                     common.cpp:1923-1941)
- *   eg2vq_ops_proj768 the output projection: per token, RMS by output_norm and a
- *                     dot with each of the 768 bf16 rows, accumulated across the
- *                     item (graph:339-356)
+ *   eg2vq_ops_proj768 the output projection: per row, RMS by output_norm and a
+ *                     dot with each of the 768 bf16 rows into that row's own
+ *                     plane (graph:339-356)
  *
  * Two deliberate choices, both stated because they are deviations from a literal
  * transcription of the graph's *code* and not of its arithmetic:
@@ -258,18 +259,28 @@ static inline int eg2vq_ops_rms_head(float *x, const float *w, uint32_t rows,
 
 /* ---- NeoX RoPE over the whole head --------------------------------------- */
 
-/* cos_tab and sin_tab are [n_pos][hd/2], indexed by the row's own position (a
- * prefill has no cache, so position == row index, graph:133-136 with pos = t). */
+/* cos_tab and sin_tab are [n_pos][hd/2], indexed by the row's own POSITION
+ * WITHIN ITS ITEM (a prefill has no cache, so position == row index inside the
+ * item, graph:133-136 with pos = t).  `pos` carries that position per row: a
+ * call packs one or more items into one contiguous block (unit 27), and the
+ * reference's batched path likewise carries per-token pos[] with the sequences
+ * packed contiguously (src/llama-batch.cpp:140-193) -- positions are
+ * per-sequence, never counted from the block's start.  A single-item call passes
+ * pos[t] = t, which is the pre-batch indexing exactly.  The tables have
+ * DS4_EG2VQ_MAX_TOKENS positions (the item ceiling), because a position is
+ * always < its item's length. */
 __global__ void eg2vq_ops_rope_kernel(
         float *__restrict__ x, const float *__restrict__ cos_tab,
-        const float *__restrict__ sin_tab, uint32_t rows, uint32_t heads, uint32_t hd) {
+        const float *__restrict__ sin_tab, const int32_t *__restrict__ pos,
+        uint32_t rows, uint32_t heads, uint32_t hd) {
     const uint32_t r = blockIdx.x;
     const uint32_t h = blockIdx.y;
     if (r >= rows || h >= heads) { return; }
     const uint32_t half = hd / 2u;
+    const uint32_t p = (uint32_t)pos[r];
     float *v = x + ((size_t)r * heads + h) * hd;
-    const float *c = cos_tab + (size_t)r * half;
-    const float *s = sin_tab + (size_t)r * half;
+    const float *c = cos_tab + (size_t)p * half;
+    const float *s = sin_tab + (size_t)p * half;
     for (uint32_t i = threadIdx.x; i < half; i += blockDim.x) {
         const float x0 = v[i], x1 = v[i + half];
         v[i] = x0 * c[i] - x1 * s[i];
@@ -278,10 +289,10 @@ __global__ void eg2vq_ops_rope_kernel(
 }
 
 static inline int eg2vq_ops_rope(float *x, const float *cos_tab, const float *sin_tab,
-                                 uint32_t rows, uint32_t heads, uint32_t hd) {
-    if (!x || !cos_tab || !sin_tab || !rows || !heads || !hd || (hd % 2u)) { return 0; }
+                                 const int32_t *pos, uint32_t rows, uint32_t heads, uint32_t hd) {
+    if (!x || !cos_tab || !sin_tab || !pos || !rows || !heads || !hd || (hd % 2u)) { return 0; }
     dim3 grid(rows, heads);
-    eg2vq_ops_rope_kernel<<<grid, 128>>>(x, cos_tab, sin_tab, rows, heads, hd);
+    eg2vq_ops_rope_kernel<<<grid, 128>>>(x, cos_tab, sin_tab, pos, rows, heads, hd);
     return 1;
 }
 
@@ -301,10 +312,15 @@ static inline int eg2vq_ops_gelu_mul(float *gate, const float *up, uint64_t n) {
 
 /* ---- the 768 projection with output_norm, and the mean pool + L2 ---------- */
 
-/* One block per token: e = RMS(h[t], norm_w) is computed once per block, then
+/* One block per ROW: e = RMS(h[row], norm_w) is computed once per block, then
  * each thread owns a few of the 768 outputs and dots the bf16 weight row with e.
- * The result is accumulated (not overwritten) so the mean pool can follow without
- * a second buffer (graph:344-356). */
+ * The result goes to this row's OWN acc row (acc + row * n_out), so every
+ * element's accumulation happens inside one thread of one block and an item's
+ * numbers cannot depend on which other items share the call (unit 27; before the
+ * batch this kernel atomicAdd'ed every row's contribution into one 768-float
+ * accumulator, whose sum order was the atomics' own).  The pool below then reads
+ * those rows in order, which is the CPU reference's own sum order
+ * (ds4_eg2vq_graph.inc:363-365: `out768[o] += ref_row_dot(...)` per token). */
 __global__ void eg2vq_ops_proj768_kernel(
         float *__restrict__ acc, const float *__restrict__ h,
         const uint16_t *__restrict__ w, const float *__restrict__ norm_w,
@@ -313,6 +329,7 @@ __global__ void eg2vq_ops_proj768_kernel(
     extern __shared__ float e_s[];
     __shared__ double ssum[256];
     const float *ht = h + (size_t)t * n_embd;
+    float *accrow = acc + (size_t)t * n_out;
     double local = 0.0;
     for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
         const double v = (double)ht[i];
@@ -338,19 +355,36 @@ __global__ void eg2vq_ops_proj768_kernel(
             memcpy(&v, &u, 4);
             a += v * e_s[i];
         }
-        atomicAdd(&acc[o], a);
+        accrow[o] = a;
     }
 }
 
-/* mean over the item's tokens, then L2 normalize with the graph's zero guard */
-__global__ void eg2vq_ops_pool_l2_kernel(float *__restrict__ v, uint32_t n_out, uint32_t n_tok) {
+/* One block per ITEM: mean over the ITEM's rows, then L2 normalize with the
+ * graph's zero guard.  `acc` is the per-row projection plane and `off` the
+ * batch's item spans (off[i]..off[i+1] rows), so an item's mean is its own row
+ * count -- the same denominator the single-item path used (1/n_tok,
+ * ds4_eg2vq_graph.inc:370-377, src/llama-graph.cpp:4049-4053 with weight 1/n),
+ * and the same f32 accumulation order over its rows, which is what makes a
+ * batched item's vector the single-item vector. */
+__global__ void eg2vq_ops_pool_item_kernel(float *__restrict__ out, const float *__restrict__ acc,
+                                           uint32_t n_out, const uint32_t *__restrict__ off,
+                                           uint32_t n_items) {
+    const uint32_t i = blockIdx.x;
+    if (i >= n_items) { return; }
+    const uint32_t r0 = off[i], r1 = off[i + 1u];
+    const uint32_t n_tok = r1 - r0;
     const float mean = 1.0f / (float)n_tok;
-    for (uint32_t o = threadIdx.x; o < n_out; o += blockDim.x) { v[o] *= mean; }
+    float *dst = out + (size_t)i * n_out;
+    for (uint32_t o = threadIdx.x; o < n_out; o += blockDim.x) {
+        float sum = 0.0f;
+        for (uint32_t r = r0; r < r1; r++) { sum += acc[(size_t)r * n_out + o]; }
+        dst[o] = sum * mean;
+    }
     __syncthreads();
     __shared__ double ssum[256];
     double local = 0.0;
     for (uint32_t o = threadIdx.x; o < n_out; o += blockDim.x) {
-        const double t = (double)v[o];
+        const double t = (double)dst[o];
         local += t * t;
     }
     ssum[threadIdx.x] = local;
@@ -361,17 +395,23 @@ __global__ void eg2vq_ops_pool_l2_kernel(float *__restrict__ v, uint32_t n_out, 
     }
     const double norm = sqrt(ssum[0]);
     const float inv = norm > 0.0 ? (float)(1.0 / norm) : 0.0f;
-    for (uint32_t o = threadIdx.x; o < n_out; o += blockDim.x) { v[o] *= inv; }
+    for (uint32_t o = threadIdx.x; o < n_out; o += blockDim.x) { dst[o] *= inv; }
 }
 
-static inline int eg2vq_ops_proj768_pool(float *out768, const float *h, const uint16_t *w,
-                                         const float *norm_w, uint32_t n_tok, uint32_t n_embd,
-                                         uint32_t n_out, float eps) {
-    if (!out768 || !h || !w || !norm_w || !n_tok || !n_embd || !n_out) { return 0; }
-    cudaMemsetAsync(out768, 0, (size_t)n_out * sizeof(float));
-    eg2vq_ops_proj768_kernel<<<n_tok, 256, (size_t)n_embd * sizeof(float)>>>(
-        out768, h, w, norm_w, n_embd, n_out, eps);
-    eg2vq_ops_pool_l2_kernel<<<1, 256>>>(out768, n_out, n_tok);
+/* The projection + pool of a whole call: `n_tokens` rows (the batch's items
+ * packed contiguously), `n_items` spans in `off` (off[0] == 0, off[n_items] ==
+ * n_tokens, every span non-empty -- the core refuses anything else), and
+ * `out768` takes n_items * n_out floats, item i's vector at i * n_out. */
+static inline int eg2vq_ops_proj768_pool_batch(float *out768, float *acc, const float *h,
+                                               const uint16_t *w, const float *norm_w,
+                                               const uint32_t *off, uint32_t n_items,
+                                               uint32_t n_tokens, uint32_t n_embd,
+                                               uint32_t n_out, float eps) {
+    if (!out768 || !acc || !h || !w || !norm_w || !off || !n_items || !n_tokens ||
+        !n_embd || !n_out) { return 0; }
+    eg2vq_ops_proj768_kernel<<<n_tokens, 256, (size_t)n_embd * sizeof(float)>>>(
+        acc, h, w, norm_w, n_embd, n_out, eps);
+    eg2vq_ops_pool_item_kernel<<<n_items, 256>>>(out768, acc, n_out, off, n_items);
     return 1;
 }
 

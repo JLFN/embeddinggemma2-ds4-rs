@@ -53,13 +53,24 @@ static inline uint64_t eg2vq_gpu_elems(const ds4_eg2vq_aux *a) {
     return (uint64_t)a->rows * (uint64_t)a->cols;
 }
 
-/* The per-item workspace layout, computed in one place so ds4_gpu_eg2vq_workspace
- * and ds4_gpu_eg2vq_create can never disagree.  Offsets are bytes. */
+/* The workspace layout, computed in one place so ds4_gpu_eg2vq_workspace
+ * and ds4_gpu_eg2vq_create can never disagree.  Offsets are bytes.
+ *
+ * Every buffer is sized by the ROW BUDGET (unit 27): the block a call packs is
+ * as long as its items add up to, not as long as one item.  The three batch
+ * metadata planes are 8 bytes per row (pos, len) plus 4 bytes per row's worth of
+ * item spans, against the 108,548 bytes a row already costs; the projection's own
+ * per-row output (`acc`) and the pooled per-item result (`out`) are 3,072 bytes
+ * each, which is what makes the batch's row 114,700 bytes rather than 108,548
+ * (out is sized by rows even though only n_items <= rows entries are written, so
+ * the layout stays linear in the budget and independent of the call). */
 typedef struct {
     uint64_t ids, out, h, x, f, a;
     uint64_t q_swa, q_full, kv, attn_swa, attn_full;
     uint64_t fg, fu, fd, pg, pp, ple;
     uint64_t in_soft;                        /* the image splice's soft block */
+    uint64_t pos, len, off;                  /* the batch's per-row and per-item metadata */
+    uint64_t acc;                            /* the per-row 768 projection plane */
     uint64_t total;
 } eg2vq_gpu_layout;
 
@@ -70,18 +81,19 @@ static inline uint64_t eg2vq_gpu_kv_bytes(uint32_t max_tokens) {
            (uint64_t)DS4_EG2VQ_HEAD_DIM_SWA * sizeof(float);
 }
 
-static eg2vq_gpu_layout eg2vq_gpu_layout_of(uint32_t max_tokens) {
-    const uint64_t t = max_tokens;
+static eg2vq_gpu_layout eg2vq_gpu_layout_of(uint32_t max_rows) {
+    const uint64_t t = max_rows;
     const uint64_t E = (uint64_t)DS4_EG2VQ_N_EMBD;
+    const uint64_t O = (uint64_t)DS4_EG2VQ_N_OUT;
     const uint64_t PL = (uint64_t)DS4_EG2VQ_PER_LAYER;
     const uint64_t NF = (uint64_t)DS4_EG2VQ_N_FF;
     const uint64_t q_swa = t * (uint64_t)DS4_EG2VQ_N_HEAD * (uint64_t)DS4_EG2VQ_HEAD_DIM_SWA;
     const uint64_t q_full = t * (uint64_t)DS4_EG2VQ_N_HEAD * (uint64_t)DS4_EG2VQ_HEAD_DIM_FULL;
-    const uint64_t kv_terms = eg2vq_gpu_kv_bytes(max_tokens);
+    const uint64_t kv_terms = eg2vq_gpu_kv_bytes(max_rows);
     eg2vq_gpu_layout L = {};
     uint64_t c = 0;
     L.ids = c;        c += eg2vq_gpu_round16(t * sizeof(int32_t));
-    L.out = c;        c += eg2vq_gpu_round16((uint64_t)DS4_EG2VQ_N_OUT * sizeof(float));
+    L.out = c;        c += eg2vq_gpu_round16(t * O * sizeof(float));
     L.h = c;          c += eg2vq_gpu_round16(t * E * sizeof(float));
     L.x = c;          c += eg2vq_gpu_round16(t * E * sizeof(float));
     L.f = c;          c += eg2vq_gpu_round16(t * E * sizeof(float));
@@ -100,6 +112,13 @@ static eg2vq_gpu_layout eg2vq_gpu_layout_of(uint32_t max_tokens) {
     /* the image splice's soft block: at most one row per token, so the item's own
      * ceiling bounds it (ds4_gpu_eg2vq_embed_image refuses a longer block). */
     L.in_soft = c;    c += eg2vq_gpu_round16(t * E * sizeof(float));
+    /* the batch's metadata: each row's position inside its item and that item's
+     * row count (int32 each), and the n_items + 1 item spans (uint32). */
+    L.pos = c;        c += eg2vq_gpu_round16(t * sizeof(int32_t));
+    L.len = c;        c += eg2vq_gpu_round16(t * sizeof(int32_t));
+    L.off = c;        c += eg2vq_gpu_round16((t + 1u) * sizeof(uint32_t));
+    /* the projection's per-row result, which the pool reduces per item */
+    L.acc = c;        c += eg2vq_gpu_round16(t * O * sizeof(float));
     L.total = c;
     return L;
 }
@@ -119,12 +138,13 @@ struct ds4_eg2vq_gpu_model {
 
 struct ds4_eg2vq_gpu_ctx {
     const ds4_eg2vq_gpu_model *model = nullptr;
-    ds4_gpu_tensor *scratch = nullptr;      /* ids, the 768 accumulator, the tower's rows */
+    ds4_gpu_tensor *scratch = nullptr;      /* the rows, the batch metadata, the output planes */
     ds4_gpu_tensor *rope_tab = nullptr;     /* cos|sin for both rope bases */
     eg2vq_gpu_layout L = {};
-    uint32_t max_tokens = 0;
+    uint32_t max_rows = 0;                  /* the row budget this workspace holds */
+    uint32_t rope_positions = 0;            /* table entries = the item ceiling, not the budget */
     float layer_scalar[DS4_EG2VQ_N_LAYER] = {};
-    uint64_t calls = 0, tokens = 0;
+    uint64_t calls = 0, tokens = 0, items = 0;
 };
 
 static inline const uint8_t *eg2vq_gpu_pay(const ds4_eg2vq_gpu_model *g, uint32_t rec) {
@@ -307,17 +327,18 @@ extern "C" ds4_eg2vq_gpu_model *ds4_gpu_eg2vq_bind(const void *map, uint64_t siz
     return plan;
 }
 
-extern "C" uint64_t ds4_gpu_eg2vq_workspace(uint32_t max_tokens) {
-    if (!max_tokens) { return 0; }
-    return eg2vq_gpu_layout_of(max_tokens).total;
+extern "C" uint64_t ds4_gpu_eg2vq_workspace(uint32_t max_rows) {
+    if (!max_rows) { return 0; }
+    return eg2vq_gpu_layout_of(max_rows).total;
 }
 
 extern "C" void ds4_gpu_eg2vq_free(ds4_eg2vq_gpu_ctx *ctx) {
     if (!ctx) { return; }
     if (ctx->calls) {
-        fprintf(stderr, "ds4: gemma_vq device path calls=%llu tokens=%llu "
+        fprintf(stderr, "ds4: gemma_vq device path calls=%llu items=%llu tokens=%llu "
                         "payload=%.2f MiB weights=%.2f MiB workspace=%.2f MiB\n",
-                (unsigned long long)ctx->calls, (unsigned long long)ctx->tokens,
+                (unsigned long long)ctx->calls, (unsigned long long)ctx->items,
+                (unsigned long long)ctx->tokens,
                 (double)ctx->model->payload_bytes / 1048576.0,
                 (double)ctx->model->aux_bytes / 1048576.0,
                 (double)ctx->L.total / 1048576.0);
@@ -328,13 +349,14 @@ extern "C" void ds4_gpu_eg2vq_free(ds4_eg2vq_gpu_ctx *ctx) {
 }
 
 extern "C" ds4_eg2vq_gpu_ctx *ds4_gpu_eg2vq_create(const ds4_eg2vq_gpu_model *model,
-        uint64_t scratch, uint32_t max_tokens) {
-    if (!model || !model->payload || !model->aux || !max_tokens) { return nullptr; }
-    if (max_tokens > (uint32_t)EG2VQ_ATTN_KEYS_MAX) {
-        fprintf(stderr, "ds4: gemma_vq device path takes at most %d tokens an item\n", (int)EG2VQ_ATTN_KEYS_MAX);
+        uint64_t scratch, uint32_t max_rows) {
+    if (!model || !model->payload || !model->aux || !max_rows) { return nullptr; }
+    if (max_rows > (uint32_t)DS4_EG2VQ_MAX_ROWS) {
+        fprintf(stderr, "ds4: gemma_vq device path takes at most %u rows in one call\n",
+                (unsigned)DS4_EG2VQ_MAX_ROWS);
         return nullptr;
     }
-    const eg2vq_gpu_layout L = eg2vq_gpu_layout_of(max_tokens);
+    const eg2vq_gpu_layout L = eg2vq_gpu_layout_of(max_rows);
     if (scratch < L.total) {
         fprintf(stderr, "ds4: gemma_vq device path needs %llu bytes of workspace, given %llu\n",
                 (unsigned long long)L.total, (unsigned long long)scratch);
@@ -344,40 +366,46 @@ extern "C" ds4_eg2vq_gpu_ctx *ds4_gpu_eg2vq_create(const ds4_eg2vq_gpu_model *mo
     if (!ctx) { return nullptr; }
     ctx->model = model;
     ctx->L = L;
-    ctx->max_tokens = max_tokens;
+    ctx->max_rows = max_rows;
     ctx->scratch = ds4_gpu_tensor_alloc(L.total);
-    /* The RoPE tables: one [max_tokens][hd/2] cos and one sin per rope base, the
+    /* The RoPE tables: one [n_pos][hd/2] cos and one sin per rope base, the
      * sliding layers' 1e4 over head_dim 256 and the full layers' 1e6 over 512
      * (ds4_eg2vq.h:65-68).  The tables exist because this build compiles with
      * --use_fast_math, whose sinf/cosf lose ~8e-05 rad at position 1414; the
      * angle is accumulated exactly as the graph accumulates it (theta *=
      * theta_scale in f32) and only the trig is computed in double
-     * (cuda/eg2vq_ops.cuh's note; measured bit-identical in the ops gate). */
+     * (cuda/eg2vq_ops.cuh's note; measured bit-identical in the ops gate).
+     * They are sized by the ITEM CEILING, not by the row budget: a table is
+     * indexed by a row's position inside its item (`pos`, unit 27), and the core
+     * refuses any item longer than DS4_EG2VQ_MAX_TOKENS, so no position can reach
+     * past it however long the packed block is. */
     const uint64_t swa_half = (uint64_t)DS4_EG2VQ_HEAD_DIM_SWA / 2u;
     const uint64_t full_half = (uint64_t)DS4_EG2VQ_HEAD_DIM_FULL / 2u;
-    const uint64_t rope_bytes = eg2vq_gpu_round16(2u * max_tokens * swa_half * sizeof(float))
-                              + eg2vq_gpu_round16(2u * max_tokens * full_half * sizeof(float));
+    const uint64_t n_pos = (uint64_t)DS4_EG2VQ_MAX_TOKENS;
+    const uint64_t rope_bytes = eg2vq_gpu_round16(2u * n_pos * swa_half * sizeof(float))
+                              + eg2vq_gpu_round16(2u * n_pos * full_half * sizeof(float));
     ctx->rope_tab = ds4_gpu_tensor_alloc(rope_bytes);
     if (!ctx->scratch || !ctx->rope_tab) { ds4_gpu_eg2vq_free(ctx); return nullptr; }
+    ctx->rope_positions = (uint32_t)n_pos;
     {
-        std::vector<float> tab((size_t)(2u * max_tokens * swa_half + 2u * max_tokens * full_half), 0.0f);
+        std::vector<float> tab((size_t)(2u * n_pos * swa_half + 2u * n_pos * full_half), 0.0f);
         float *swa = tab.data();
-        float *full = swa + 2u * max_tokens * swa_half;
+        float *full = swa + 2u * n_pos * swa_half;
         const float base_swa = (float)DS4_EG2VQ_ROPE_BASE_SWA;
         const float base_full = (float)DS4_EG2VQ_ROPE_BASE;
         const float ts_swa = powf(base_swa, -2.0f / (float)DS4_EG2VQ_HEAD_DIM_SWA);
         const float ts_full = powf(base_full, -2.0f / (float)DS4_EG2VQ_HEAD_DIM_FULL);
-        for (uint32_t p = 0; p < max_tokens; p++) {
+        for (uint64_t p = 0; p < n_pos; p++) {
             float theta = (float)p;
             for (uint64_t i = 0; i < swa_half; i++) {
                 swa[p * swa_half + i] = (float)cos((double)theta);
-                swa[max_tokens * swa_half + p * swa_half + i] = (float)sin((double)theta);
+                swa[n_pos * swa_half + p * swa_half + i] = (float)sin((double)theta);
                 theta *= ts_swa;
             }
             theta = (float)p;
             for (uint64_t i = 0; i < full_half; i++) {
                 full[p * full_half + i] = (float)cos((double)theta);
-                full[max_tokens * full_half + p * full_half + i] = (float)sin((double)theta);
+                full[n_pos * full_half + p * full_half + i] = (float)sin((double)theta);
                 theta *= ts_full;
             }
         }
@@ -398,26 +426,73 @@ extern "C" ds4_eg2vq_gpu_ctx *ds4_gpu_eg2vq_create(const ds4_eg2vq_gpu_model *mo
     }
     ctx->calls = 0;
     ctx->tokens = 0;
+    ctx->items = 0;
     return ctx;
 }
 
-/* One item, the CPU reference forward's op order (ds4_eg2vq_graph.inc:169-370).
- * The numeric comments cite that file; every constant is ds4_eg2vq.h's.
+/* One call's items, the CPU reference forward's op order
+ * (ds4_eg2vq_graph.inc:169-370) run over the items PACKED into one contiguous
+ * row block.  The numeric comments cite that file; every constant is
+ * ds4_eg2vq.h's.
  *
- * `soft`/`n_soft`/`span_start` are the IMAGE SPLICE (ds4_eg2vq_ref_embed_image's
- * device twin): when they are given, the ids' span rows take the soft block's
- * rows unscaled and every other row is the token table's scaled by sqrt(n_embd).
- * The span must be contiguous — soft rows are addressed as t - span_start — and
- * the caller (ds4_gpu_eg2vq_embed_image) has already checked that. */
+ * The batch is the reference's own semantics (unit 27): llama.cpp packs a
+ * ubatch's sequences contiguously and carries per-token seq_id[] and pos[]
+ * (src/llama-batch.cpp:140-193) while its mask keeps sequences apart
+ * (src/llama-graph.cpp:482-517), so tokens of different items can never attend to
+ * each other and no position is counted from the block's start.  Here the same
+ * two facts travel as `pos[t]` (row t's position inside its item) and `len[t]`
+ * (its item's row count), both DERIVED from `item_off` in this one place -- the
+ * spans are the caller's whole statement about the block, so a second, caller-
+ * supplied copy of the same information could only disagree with it.
+ *
+ * One item is the same call with n_items == 1, which is why the single-item and
+ * batched entries cannot disagree: every item's rows are computed from its own
+ * rows and positions, and the pool reduces the item's own rows in order
+ * (cuda/eg2vq_ops.cuh's pool_item), so an item's vector is the same whether it
+ * shares the call or not.
+ *
+ * `soft`/`n_soft` are the IMAGE SPLICE (ds4_eg2vq_ref_embed_image's device twin)
+ * and describe the ONE item of a one-item call: the ids' span rows take the soft
+ * block's rows unscaled and every other row is the token table's scaled by
+ * sqrt(n_embd).  The span must be contiguous -- soft rows are addressed as
+ * t - span_start -- and the span's start and shape are DERIVED here from the ids,
+ * exactly as the CPU reference derives them (ds4_eg2vq_graph.inc:207-232): one
+ * contiguous run of exactly n_soft placeholders, or the call is refused. */
 static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
-        uint32_t n_ids, const float *soft, uint32_t n_soft, uint32_t span_start,
-        float *out768) {
-    if (!ctx || !ids || !out768) { return 0; }
-    if (!n_ids || n_ids > ctx->max_tokens) { return 0; }
+        const uint32_t *item_off, uint32_t n_items, uint32_t n_ids,
+        const float *soft, uint32_t n_soft, float *out768) {
+    if (!ctx || !ids || !item_off || !out768) { return 0; }
+    if (!n_items || !n_ids || n_ids > ctx->max_rows) { return 0; }
     const ds4_eg2vq_gpu_model *g = ctx->model;
     if (!g->n_vocab) { return 0; }
+    /* the span table is the block's own description: it must cover n_ids rows
+     * from 0, every item must be non-empty, and no item may be longer than the
+     * item ceiling (its window is the attention kernel's key plane). */
+    if (item_off[0] != 0u || item_off[n_items] != n_ids) { return 0; }
+    for (uint32_t i = 0; i < n_items; i++) {
+        const uint32_t len = item_off[i + 1u] - item_off[i];
+        if (!len || len > (uint32_t)DS4_EG2VQ_MAX_TOKENS) { return 0; }
+        if (item_off[i] >= item_off[i + 1u]) { return 0; }       /* the table must rise */
+    }
     const int spliced = (soft && n_soft) ? 1 : 0;
-    if (spliced && span_start + n_soft > n_ids) { return 0; }
+    uint32_t span_start = 0;
+    if (spliced) {
+        if (n_items != 1u) { return 0; }                         /* the splice is one item's */
+        /* The span's start is DERIVED from the ids, exactly as the CPU reference
+         * derives it while it fills the block (ds4_eg2vq_graph.inc:207-232): the
+         * placeholders must be one contiguous run of exactly n_soft rows, and a
+         * second, caller-supplied copy of the start could only disagree with what
+         * the ids say. */
+        uint32_t seen = 0;
+        for (uint32_t t = 0; t < n_ids; t++) {
+            if ((uint32_t)ids[t] != (uint32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) { continue; }
+            if (!seen) { span_start = t; }
+            seen++;
+            if (t != span_start + seen - 1u) { return 0; }        /* not contiguous */
+        }
+        if (seen != n_soft) { return 0; }
+        if (span_start + n_soft > n_ids) { return 0; }
+    }
     for (uint32_t t = 0; t < n_ids; t++) {                       /* the graph dies here; the API refuses */
         if (ids[t] < 0) { return 0; }
         if (spliced && (uint32_t)ids[t] == (uint32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) {
@@ -432,17 +507,38 @@ static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
     const uint32_t NF = (uint32_t)DS4_EG2VQ_N_FF;
     const float eps = DS4_EG2VQ_RMS_EPS;
     const float *swa_base = (const float *)ctx->rope_tab->ptr;
-    const uint64_t swa_floats = (uint64_t)ctx->max_tokens * DS4_EG2VQ_HEAD_DIM_SWA / 2u;
+    const uint64_t swa_floats = (uint64_t)ctx->rope_positions * DS4_EG2VQ_HEAD_DIM_SWA / 2u;
     const float *full_base = (const float *)((const char *)ctx->rope_tab->ptr +
                                              eg2vq_gpu_round16(2u * swa_floats * sizeof(float)));
-    const uint64_t full_floats = (uint64_t)ctx->max_tokens * DS4_EG2VQ_HEAD_DIM_FULL / 2u;
+    const uint64_t full_floats = (uint64_t)ctx->rope_positions * DS4_EG2VQ_HEAD_DIM_FULL / 2u;
+
+    /* the batch metadata: each row's position inside its item and that item's
+     * length, derived from the spans here and uploaded once per call (8 bytes a
+     * row against the 114,700 the row's own planes cost). */
+    {
+        std::vector<int32_t> pos(n_ids), len(n_ids);
+        for (uint32_t i = 0; i < n_items; i++) {
+            const uint32_t r0 = item_off[i], r1 = item_off[i + 1u];
+            for (uint32_t t = r0; t < r1; t++) {
+                pos[t] = (int32_t)(t - r0);
+                len[t] = (int32_t)(r1 - r0);
+            }
+        }
+        if (!ds4_gpu_tensor_write(ctx->scratch, ctx->L.pos, pos.data(), (size_t)n_ids * sizeof(int32_t)) ||
+            !ds4_gpu_tensor_write(ctx->scratch, ctx->L.len, len.data(), (size_t)n_ids * sizeof(int32_t)) ||
+            !ds4_gpu_tensor_write(ctx->scratch, ctx->L.off, item_off,
+                                  (size_t)(n_items + 1u) * sizeof(uint32_t))) { return 0; }
+    }
+    const int32_t *pos = (const int32_t *)eg2vq_gpu_buf(ctx, ctx->L.pos);
+    const int32_t *len = (const int32_t *)eg2vq_gpu_buf(ctx, ctx->L.len);
+    const uint32_t *off = (const uint32_t *)eg2vq_gpu_buf(ctx, ctx->L.off);
 
     float *h = eg2vq_gpu_frow(ctx, ctx->L.h);
     float *x = eg2vq_gpu_frow(ctx, ctx->L.x);
     float *f = eg2vq_gpu_frow(ctx, ctx->L.f);
     float *a = eg2vq_gpu_frow(ctx, ctx->L.a);
     float *k = eg2vq_gpu_frow(ctx, ctx->L.kv);
-    float *v = eg2vq_gpu_frow(ctx, ctx->L.kv + eg2vq_gpu_kv_bytes(ctx->max_tokens));
+    float *v = eg2vq_gpu_frow(ctx, ctx->L.kv + eg2vq_gpu_kv_bytes(ctx->max_rows));
     float *fg = eg2vq_gpu_frow(ctx, ctx->L.fg);
     float *fu = eg2vq_gpu_frow(ctx, ctx->L.fu);
     float *fd = eg2vq_gpu_frow(ctx, ctx->L.fd);
@@ -503,15 +599,17 @@ static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
         if (!eg2vq_vq_gemm(k, x, E, eg2vq_gpu_pay(g, rec + DS4_EG2VQ_REC_L_K), nkv * hd, E, n_ids)) { return 0; }
         if (!eg2vq_vq_gemm(v, x, E, eg2vq_gpu_pay(g, rec + DS4_EG2VQ_REC_L_V), nkv * hd, E, n_ids)) { return 0; }
         /* c/d. per-head RMS (weighted on q and k, weightless on v) and RoPE over
-         * the whole head (graph:260-277) */
+         * the whole head (graph:260-277), the rotation indexed by each row's
+         * POSITION inside its item (unit 27) */
         if (!eg2vq_ops_rms_head(q, qn, n_ids, DS4_EG2VQ_N_HEAD, hd, eps)) { return 0; }
-        if (!eg2vq_ops_rope(q, rc, rs, n_ids, DS4_EG2VQ_N_HEAD, hd)) { return 0; }
+        if (!eg2vq_ops_rope(q, rc, rs, pos, n_ids, DS4_EG2VQ_N_HEAD, hd)) { return 0; }
         if (!eg2vq_ops_rms_head(k, kn, n_ids, nkv, hd, eps)) { return 0; }
-        if (!eg2vq_ops_rope(k, rc, rs, n_ids, nkv, hd)) { return 0; }
+        if (!eg2vq_ops_rope(k, rc, rs, pos, n_ids, nkv, hd)) { return 0; }
         if (!eg2vq_ops_rms_head(v, NULL, n_ids, nkv, hd, eps)) { return 0; }
-        /* e. attention, scale 1.0, non-causal, the symmetric +-512 window
-         * (graph:279-288) */
-        if (!eg2vq_attn(attn, q, k, v, n_ids, DS4_EG2VQ_N_HEAD, nkv, hd, half_swa)) { return 0; }
+        /* e. attention, scale 1.0, non-causal, the symmetric +-512 window inside
+         * each row's OWN item (graph:279-288; `pos`/`len` carry the item bounds,
+         * which is what keeps the batch's items apart) */
+        if (!eg2vq_attn(attn, q, k, v, pos, len, n_ids, DS4_EG2VQ_N_HEAD, nkv, hd, half_swa)) { return 0; }
         /* f. o_proj (graph:290-291) */
         if (!eg2vq_vq_gemm(a, attn, qw, eg2vq_gpu_pay(g, rec + DS4_EG2VQ_REC_L_O), E, qw, n_ids)) { return 0; }
         /* g. h += attn_post_norm(o) (graph:293-300) */
@@ -537,37 +635,47 @@ static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
         eg2vq_ops_scale(h, ctx->layer_scalar[il], (uint64_t)n_ids * E);
     }
 
-    /* 4. output_norm, the 768 projection, the mean pool and L2 (graph:339-367) */
-    if (!eg2vq_ops_proj768_pool(out, h,
+    /* 4. output_norm, the 768 projection, the per-item mean pool and L2
+     * (graph:339-367): the projection writes every row's own plane and the pool
+     * reduces each item's rows in order, so an item's vector is its own. */
+    if (!eg2vq_ops_proj768_pool_batch(out, eg2vq_gpu_frow(ctx, ctx->L.acc), h,
             (const uint16_t *)((const char *)g->aux->ptr + g->aux_off[DS4_EG2VQ_AUX_OUTPUT]),
-            eg2vq_gpu_w(g, DS4_EG2VQ_AUX_OUTPUT_NORM), n_ids, E, DS4_EG2VQ_N_OUT, eps)) { return 0; }
+            eg2vq_gpu_w(g, DS4_EG2VQ_AUX_OUTPUT_NORM), off, n_items, n_ids, E,
+            (uint32_t)DS4_EG2VQ_N_OUT, eps)) { return 0; }
     if (!cuda_ok(cudaGetLastError(), "gemma_vq device tower")) { return 0; }
     if (!ds4_gpu_tensor_read(ctx->scratch, ctx->L.out, out768,
-                             (size_t)DS4_EG2VQ_N_OUT * sizeof(float))) { return 0; }
+                             (size_t)n_items * DS4_EG2VQ_N_OUT * sizeof(float))) { return 0; }
     ctx->calls++;
+    ctx->items += n_items;
     ctx->tokens += n_ids;
     return 1;
 }
 
-extern "C" int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
-        uint32_t n_ids, float *out768) {
-    return eg2vq_gpu_embed_core(ctx, ids, n_ids, NULL, 0, 0, out768);
+/* The batch: n_items items packed into one contiguous row block, `item_off` the
+ * n_items + 1 spans (off[0] = 0, off[n_items] = n_ids), `out768` taking
+ * n_items * DS4_EG2VQ_N_OUT floats, item i's vector at i * DS4_EG2VQ_N_OUT. */
+extern "C" int ds4_gpu_eg2vq_embed_batch(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
+        const uint32_t *item_off, uint32_t n_items, uint32_t n_ids, float *out768) {
+    return eg2vq_gpu_embed_core(ctx, ids, item_off, n_items, n_ids, NULL, 0, out768);
 }
 
-/* The image splice, and the span's own shape check: the ids must carry a
- * contiguous run of exactly `n_soft` DS4_EG2VQ_IMAGE_TOKEN_ID placeholders, or
- * the soft rows cannot be addressed (and a span that disagrees with the soft
- * block is refused rather than truncated). */
+/* One item: the batch of one.  The same refusals, plus the item ceiling that the
+ * one-item call has always had (the batch's core checks every item's length
+ * against it too, so the two entries cannot disagree). */
+extern "C" int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
+        uint32_t n_ids, float *out768) {
+    const uint32_t item_off[2] = { 0u, n_ids };
+    return eg2vq_gpu_embed_core(ctx, ids, item_off, 1u, n_ids, NULL, 0, out768);
+}
+
+/* The image splice: a one-item call with the vision tower's `n_soft` soft rows
+ * filling the positions the ids mark as DS4_EG2VQ_IMAGE_TOKEN_ID.  The span's
+ * shape -- one contiguous run of exactly n_soft placeholders -- is checked by the
+ * core, which is where the block is filled and where the CPU reference checks it
+ * too (ds4_eg2vq_graph.inc:207-232); a second copy here could only disagree. */
 extern "C" int ds4_gpu_eg2vq_embed_image(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
         uint32_t n_ids, const float *soft, uint32_t n_soft, float *out768) {
     if (!ctx || !ids || !soft || !n_soft || !out768) { return 0; }
-    uint32_t span_start = 0, seen = 0;
-    for (uint32_t t = 0; t < n_ids; t++) {
-        if ((uint32_t)ids[t] != (uint32_t)DS4_EG2VQ_IMAGE_TOKEN_ID) { continue; }
-        if (!seen) { span_start = t; }
-        seen++;
-        if (t != span_start + seen - 1u) { return 0; }   /* not contiguous */
-    }
-    if (seen != n_soft) { return 0; }
-    return eg2vq_gpu_embed_core(ctx, ids, n_ids, soft, n_soft, span_start, out768);
+    const uint32_t item_off[2] = { 0u, n_ids };
+    return eg2vq_gpu_embed_core(ctx, ids, item_off, 1u, n_ids, soft, n_soft, out768);
 }

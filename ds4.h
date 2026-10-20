@@ -320,6 +320,24 @@ void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
    outside the embedding table, and any engine that is not family gemma_vq. */
 int ds4_engine_embed_gemma_vq(ds4_engine *e, const int32_t *ids, uint32_t n_ids,
                               float *out768, char *error, size_t error_cap);
+/* SEVERAL items through the tower in ONE call (unit 27, phase-doc row P2.3's
+   last slice).  `ids` is n_ids token ids with the request's items PACKED
+   contiguously (item 0's bos..eos, then item 1's, ...), `item_off` their
+   n_items + 1 spans (item_off[0] == 0, item_off[n_items] == n_ids), and `out`
+   takes n_items * 768 floats, item i's vector at i * 768 -- the same vectors
+   ds4_engine_embed_gemma_vq returns for the same item on its own, which is the
+   batch's whole contract (tools/eg2_embed_batch_gate27.sh measures it).
+   Refuses, never truncates, the one-item entry's own cases plus: zero items, a
+   span table that does not rise from 0 to n_ids (an empty item, a hole, a
+   disagreement with n_ids), a total past the row budget the workspace holds
+   (DS4_EG2VQ_MAX_ROWS, which is what the serving caps advertise as
+   embed.batch_rows_max), and an ITEM past the token ceiling.  The device
+   workspace is ensured ONCE for the whole call's rows; a batch is a size class,
+   not a per-item allocation. */
+int ds4_engine_embed_gemma_vq_batch(ds4_engine *e, const int32_t *ids,
+                                    const uint32_t *item_off, uint32_t n_items,
+                                    uint32_t n_ids, float *out,
+                                    char *error, size_t error_cap);
 /* The same entry with an image in the item (phase 8, unit 26).  `ids` is one
    item's token ids with the image's position already expanded -- the caller
    builds it, because only the vocabulary knows the markers: bos, the text, the

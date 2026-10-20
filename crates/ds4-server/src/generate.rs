@@ -309,6 +309,17 @@ pub trait DecodeIo {
             "an embedding tower is not loaded on this engine",
         ))
     }
+    /// Unit 27: several embedding items in ONE tower call
+    /// (`ds4_core::Model::embed_gemma_vq_batch`).  `ids` is every item's ids laid
+    /// end to end in request order and `item_off` their n_items + 1 spans; the
+    /// answer is n_items * 768 floats, item i's vector at i * 768 -- the vector
+    /// `embed_gemma_vq` returns for that item on its own.  Only an embedding
+    /// engine answers.
+    fn embed_gemma_vq_batch(&self, _ids: &[i32], _item_off: &[u32]) -> Result<Vec<f32>, GenerateError> {
+        Err(GenerateError::Unsupported(
+            "an embedding tower is not loaded on this engine",
+        ))
+    }
     /// Phase 8 unit 26: one embedding item's ids WITH an image in it -- the text
     /// path's construction with the image's one `<|image|>` placeholder expanded
     /// into the reference's span (`ds4_core::Model::embed_item_media_ids`, which
@@ -4352,6 +4363,12 @@ impl DecodeIo for NativeDecode<'_> {
     fn embed_gemma_vq(&self, ids: &[i32]) -> Result<Vec<f32>, GenerateError> {
         self.model
             .embed_gemma_vq(ids)
+            .map_err(|e| GenerateError::Engine(e.to_string()))
+    }
+
+    fn embed_gemma_vq_batch(&self, ids: &[i32], item_off: &[u32]) -> Result<Vec<f32>, GenerateError> {
+        self.model
+            .embed_gemma_vq_batch(ids, item_off)
             .map_err(|e| GenerateError::Engine(e.to_string()))
     }
 

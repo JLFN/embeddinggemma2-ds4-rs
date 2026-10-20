@@ -24,6 +24,7 @@ pub mod serve;
 mod serve_503_body_test;
 #[cfg(test)]
 mod serve_embed_media_test;
+mod serve_embed_batch_test;
 pub mod serve_cont;
 #[cfg(any(feature = "native", test))]
 mod serve_cont_evict;

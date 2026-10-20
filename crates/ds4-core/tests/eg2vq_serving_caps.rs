@@ -78,21 +78,64 @@ fn item_ceiling_is_one_number_in_rust_c_and_cuda() {
 
 #[test]
 fn batch_row_budget_costs_what_the_layout_charges() {
-    // The workspace layout (`ds4_eg2vq_gpu.cuh:72-99`) is linear in rows: 27,136
-    // f32 planes per row plus that row's 4-byte id. The measured cross-check is
-    // docs/eg2vq-device-gate7.txt:407-411, where max_tokens 2048 reads 212.01 MiB
-    // (2048 x 108,548 B = 222,306,304 B = 212.0078 MiB; the QA pass for unit 20
-    // corrected the 212.0086 this comment first carried). The constant is a
-    // policy, so what is asserted here is the arithmetic a reader relies on, not
-    // the policy.
-    const PER_ROW: u64 = 4 + 27_136 * 4;
-    assert_eq!(PER_ROW, 108_548, "the per-row workspace charge changed");
+    // The workspace layout (`ds4_eg2vq_gpu.cuh`'s `eg2vq_gpu_layout_of`) is
+    // linear in the row budget.  Per row it carries:
+    //
+    //    27,648 f32 planes   110,592 B   h, x, f, a (512 each), q_swa (4 x 256),
+    //                                    q_full (4 x 512), k + v (2 x 2 x 256),
+    //                                    attn_swa, attn_full, fg, fu (2,048
+    //                                    each), fd (512), pg, pp (512 each),
+    //                                    ple (512 x 24) and the image splice's
+    //                                    in_soft (512)
+    //    ids                       4 B   int32, the row's token id
+    //    pos, len                  8 B   the batch's per-row metadata (unit 27)
+    //    out, acc              6,144 B   the projection's per-row plane and the
+    //                                    pooled per-item result, 768 f32 each
+    //                        ---------
+    //                         116,748 B
+    //
+    // plus the (rows + 1) uint32 item spans, rounded up to the layout's 16-byte
+    // alignment.  The measured cross-check is the device oracle's own printout:
+    // 228.03 MiB at 2,048 rows and 912.13 MiB at the 8,192-row budget
+    // (tools/eg2_embed_batch_gate27.sh prints both; before unit 27 the same
+    // oracle read 216.01 MiB at 2,048 rows).
+    //
+    // What this test pinned before unit 27 was 108,548 B (4 + 27,136 x 4) and
+    // 848.0 MiB, and that arithmetic had already gone stale one unit earlier:
+    // unit 25 added the image splice's 512-float `in_soft` plane, so the layout
+    // had been charging 110,592 B a row (2,048 more) while this test, the
+    // constant's comment and the 848.0 MiB figure still said 108,548 -- which is
+    // what the gate-7 measurement of 212.01 MiB at max_tokens 2,048 reflects.
+    // The numbers below are the layout's own, plane by plane, and they are now
+    // cross-checked against a measurement rather than against themselves.
+    const PLANES_PER_ROW: u64 = 27_648;
+    const PLANE_BYTES: u64 = PLANES_PER_ROW * 4;
+    assert_eq!(PLANE_BYTES, 110_592, "the tower's per-row planes changed");
+    const PER_ROW: u64 = PLANE_BYTES + 4 + 4 + 4 + 768 * 4 + 768 * 4;
+    assert_eq!(PER_ROW, 116_748, "the per-row workspace charge changed");
     let rows = u64::from(ds4_core::GEMMA_VQ_BATCH_ROWS_MAX);
-    let mib = (rows * PER_ROW) as f64 / (1024.0 * 1024.0);
+    assert_eq!(rows, 8192, "the row budget is the port's declared policy");
+    // The C entry point's own row ceiling is the same number: the caps the
+    // server advertises must be the bound the engine enforces.
+    let c_header = include_str!("../../../ds4_eg2vq.h");
+    assert_eq!(
+        define_in(c_header, "ds4_eg2vq.h", "DS4_EG2VQ_MAX_ROWS"),
+        rows,
+        "the C row budget and crate::gemma_vq::BATCH_ROWS_MAX diverged"
+    );
+    let spans = ((rows + 1) * 4 + 15) & !15;
+    let mib = (rows * PER_ROW + spans) as f64 / (1024.0 * 1024.0);
     assert!(
-        (mib - 848.0).abs() < 1.0,
-        "BATCH_ROWS_MAX {rows} now costs {mib:.1} MiB of workspace, not the ~848 MiB \
-         the constant's comment and the phase evidence state"
+        (mib - 912.13).abs() < 0.05,
+        "BATCH_ROWS_MAX {rows} now costs {mib:.2} MiB of workspace, not the 912.13 MiB \
+         the constant's comment and the unit-27 evidence state"
+    );
+    // and the single-item ceiling's own workspace, which the device gate measures
+    let spans_2048 = ((2048 + 1) * 4 + 15) & !15;
+    let at_2048 = (2048 * PER_ROW + spans_2048) as f64 / (1024.0 * 1024.0);
+    assert!(
+        (at_2048 - 228.03).abs() < 0.05,
+        "2,048 rows now costs {at_2048:.2} MiB, not the 228.03 MiB gate 27 measures"
     );
 }
 

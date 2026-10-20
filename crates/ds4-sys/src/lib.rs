@@ -835,6 +835,25 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    /// Unit 27: several embedding items in ONE tower call.  `ids` is `n_ids`
+    /// token ids with the request's items packed contiguously and `item_off`
+    /// their `n_items + 1` spans (`item_off[0] == 0`, `item_off[n_items] ==
+    /// n_ids`); `out` takes `n_items * 768` floats, item i's vector at
+    /// `i * 768` -- the same vector `ds4_bridge_eg2vq_embed` returns for that
+    /// item alone.  Returns 1 on success, 0 with the reason in `err` (the
+    /// one-item refusals plus a span table that disagrees with `n_ids`, an item
+    /// past the token ceiling, or rows past the batch budget).
+    pub fn ds4_bridge_eg2vq_embed_batch(
+        m: *mut ds4_bridge_model,
+        ids: *const i32,
+        item_off: *const u32,
+        n_items: u32,
+        n_ids: u32,
+        out: *mut f32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     /// Phase 8, unit 26: the same call with an image in the item.  `ids` carry
     /// the image's span as one contiguous run of n_soft placeholders (the Rust
     /// route builds them, ds4_core::gemma_vq::IMAGE_TOKEN_ID); `soft` is the

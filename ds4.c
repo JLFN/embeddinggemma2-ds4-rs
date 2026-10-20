@@ -37444,14 +37444,17 @@ struct ds4_engine {
     bool spec_draft_disabled;
     uint64_t mtp_guard_drafts;
     uint64_t mtp_guard_hits;
-    /* Phase 6 (gemma_vq embedding): the device plan and its per-item workspace,
-     * bound once per engine and reused by every item -- this is what makes the
-     * tower's 55.9 MiB of payloads device-resident instead of re-uploaded per
-     * request.  Both stay NULL on the CPU path, where the bound dense cache is
-     * the decode.  See ds4_engine_embed_gemma_vq. */
+    /* Phase 6 (gemma_vq embedding): the device plan and its workspace, bound once
+     * per engine and reused by every call -- this is what makes the tower's
+     * 55.9 MiB of payloads device-resident instead of re-uploaded per request.
+     * The workspace is sized by ROWS (unit 27: one call may carry several items,
+     * up to DS4_EG2VQ_MAX_ROWS of them together), so `eg2vq_max_rows` is the row
+     * count this engine's workspace currently holds.  Both stay NULL on the CPU
+     * path, where the bound dense cache is the decode.  See
+     * ds4_engine_embed_gemma_vq and ds4_engine_embed_gemma_vq_batch. */
     ds4_eg2vq_gpu_model *eg2vq_plan;
     ds4_eg2vq_gpu_ctx   *eg2vq_ctx;
-    uint32_t             eg2vq_max_tokens;
+    uint32_t             eg2vq_max_rows;
     uint64_t             eg2vq_embed_calls;
     /* Phase 8 (the image path): the companion mmproj bound as the engine's second
      * model (opt->vision_path, the family pattern at this file's own load switch),
@@ -73646,12 +73649,14 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
  * ------------------------------------------------------------------------- */
 
 #ifndef DS4_NO_GPU
-/* Bind the plan and a workspace big enough for `n_tokens`, once per engine.
- * The workspace grows and never shrinks (a longer item rebuilds it), so a
- * process serving many items pays the allocation once per size class. */
-static int eg2vq_device_ensure(ds4_engine *e, uint32_t n_tokens,
+/* Bind the plan and a workspace big enough for `n_rows` rows, once per engine.
+ * The workspace grows and never shrinks (a longer call rebuilds it), so a process
+ * serving many items pays the allocation once per size class -- and a batch is a
+ * size class of its own (unit 27: the rows of ALL the call's items, which is why
+ * this is a row count and not an item length). */
+static int eg2vq_device_ensure(ds4_engine *e, uint32_t n_rows,
                                char *error, size_t error_cap) {
-    if (e->eg2vq_ctx && e->eg2vq_max_tokens >= n_tokens) { return 1; }
+    if (e->eg2vq_ctx && e->eg2vq_max_rows >= n_rows) { return 1; }
     if (!e->eg2vq_plan) {
         ds4_eg2vq_record records[DS4_EG2VQ_REC_N];
         ds4_eg2vq_aux aux[DS4_EG2VQ_AUX_N];
@@ -73674,17 +73679,17 @@ static int eg2vq_device_ensure(ds4_engine *e, uint32_t n_tokens,
             return 0;
         }
     }
-    uint32_t want = (n_tokens + 255u) & ~255u;
-    if (want > DS4_EG2VQ_MAX_TOKENS) { want = DS4_EG2VQ_MAX_TOKENS; }
+    uint32_t want = (n_rows + 255u) & ~255u;
+    if (want > DS4_EG2VQ_MAX_ROWS) { want = DS4_EG2VQ_MAX_ROWS; }
     if (e->eg2vq_ctx) { ds4_gpu_eg2vq_free(e->eg2vq_ctx); e->eg2vq_ctx = NULL; }
     const uint64_t scratch = ds4_gpu_eg2vq_workspace(want);
     e->eg2vq_ctx = ds4_gpu_eg2vq_create(e->eg2vq_plan, scratch, want);
     if (!e->eg2vq_ctx) {
         if (error && error_cap) snprintf(error, error_cap,
-            "no device workspace for %u tokens", want);
+            "no device workspace for %u rows", want);
         return 0;
     }
-    e->eg2vq_max_tokens = want;
+    e->eg2vq_max_rows = want;
     return 1;
 }
 
@@ -73799,6 +73804,121 @@ int ds4_engine_embed_gemma_vq(ds4_engine *e, const int32_t *ids, uint32_t n_ids,
         return 0;
     }
     ds4_eg2vq_ref_embed(&e->model, &e->weights, ids, n_ids, out768);
+    return 1;
+}
+
+/* Unit 27: several items in ONE call, the batch row P2.3's last slice.
+ *
+ * Why this exists at all: an array request used to pay one host round trip, one
+ * wave of kernel launches and one sync PER ITEM (the route looped, and both the
+ * engine entry and the device adapter took one item).  Here the items are packed
+ * into one contiguous row block and carried by ONE pass through the tower, with
+ * the reference's own batched semantics -- per-row positions inside their items
+ * and attention that cannot leave its own item (the long comment in
+ * ds4_eg2vq_gpu.cuh's core cites src/llama-batch.cpp and src/llama-graph.cpp) --
+ * so every item's vector is the vector the one-item entry returns for it.
+ *
+ * The refusals are the one-item entry's own plus the shape of the span table: it
+ * must rise from 0 to n_ids, no item may be empty, no item may be longer than the
+ * key plane, and the rows together may not exceed the budget
+ * (DS4_EG2VQ_MAX_ROWS) whose workspace the device path allocates.  Nothing here
+ * truncates: a span table that disagrees with n_ids is a caller error, not
+ * something to reinterpret. */
+int ds4_engine_embed_gemma_vq_batch(ds4_engine *e, const int32_t *ids,
+                                    const uint32_t *item_off, uint32_t n_items,
+                                    uint32_t n_ids, float *out,
+                                    char *error, size_t error_cap) {
+    if (error && error_cap) error[0] = '\0';
+    if (!e || !ids || !item_off || !out) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid embed arguments");
+        return 0;
+    }
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GEMMA_VQ) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "this engine is not a gemma_vq embedding model");
+        return 0;
+    }
+    const ds4_eg2vq_weights *w = e->weights.eg2vq;
+    if (!w) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the gemma_vq weights are not bound");
+        return 0;
+    }
+    if (n_items == 0) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "a batch of no items has no embedding");
+        return 0;
+    }
+    if (n_ids == 0) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "an empty item has no embedding");
+        return 0;
+    }
+    if (item_off[0] != 0u || item_off[n_items] != n_ids) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the item spans do not cover %u rows: they start at %u and end at %u",
+            n_ids, item_off[0], item_off[n_items]);
+        return 0;
+    }
+    if (n_ids > DS4_EG2VQ_MAX_ROWS) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the call's items add up to %u rows, past the %u-row budget of one "
+            "device workspace", n_ids, (unsigned)DS4_EG2VQ_MAX_ROWS);
+        return 0;
+    }
+    for (uint32_t i = 0; i < n_items; i++) {
+        const uint32_t len = item_off[i + 1u] - item_off[i];
+        if (len == 0) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "item %u is empty (its span is [%u, %u))",
+                i, item_off[i], item_off[i + 1u]);
+            return 0;
+        }
+        if (len > DS4_EG2VQ_MAX_TOKENS) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "item %u is %u tokens, past the %u-token key plane of the "
+                "attention kernel", i, len, DS4_EG2VQ_MAX_TOKENS);
+            return 0;
+        }
+    }
+    /* The id range is the token table's own row count: the table IS the
+     * embedding matrix, so a constant here would be a second source of truth. */
+    const uint64_t n_rows = w->token_embd ? (uint64_t)w->token_embd->dim[1] : 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] < 0 || (uint64_t)ids[i] >= n_rows) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "token id %d is outside the embedding table (%llu rows)",
+                (int)ids[i], (unsigned long long)n_rows);
+            return 0;
+        }
+    }
+    e->eg2vq_embed_calls++;
+    if (ds4_backend_uses_graph(e->backend)) {
+#ifndef DS4_NO_GPU
+        if (!e->metal_ready) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the %s backend is not ready", ds4_backend_name(e->backend));
+            return 0;
+        }
+        if (!eg2vq_device_ensure(e, n_ids, error, error_cap)) { return 0; }
+        if (!ds4_gpu_eg2vq_embed_batch(e->eg2vq_ctx, ids, item_off, n_items, n_ids, out)) {
+            if (error && error_cap) snprintf(error, error_cap,
+                "the device tower refused these items");
+            return 0;
+        }
+        return 1;
+#else
+        if (error && error_cap) snprintf(error, error_cap,
+            "this build has no graph backend support");
+        return 0;
+#endif
+    }
+    if (!w->dense) {
+        if (error && error_cap) snprintf(error, error_cap,
+            "the CPU decode cache is not bound for this engine");
+        return 0;
+    }
+    ds4_eg2vq_ref_embed_batch(&e->model, &e->weights, ids, item_off, n_items, n_ids, out);
     return 1;
 }
 

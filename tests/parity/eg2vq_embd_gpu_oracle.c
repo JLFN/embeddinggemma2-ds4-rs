@@ -25,7 +25,7 @@
  *
  *   usage: eg2vq_embd_gpu_oracle <artifact.gguf> <ids.tsv>
  *              [--out <device-raw.tsv>] [--ref <cpu-raw.tsv>]
- *              [--items N] [--max-tokens N]
+ *              [--items N] [--max-tokens N] [--batch] [--batch-synth N]
  *
  * <ids.tsv> is the Rust host's own per-item token dump
  * (crates/ds4-core/examples/gemma_vq_tok.rs): <item> <TAB> <prompt> <TAB> <ntok>
@@ -36,6 +36,16 @@
  * One device plan and one workspace serve every item: the payloads and the
  * weights cross PCIe once, at bind, and the per-item traffic is the ids up and
  * the 768-vector down.
+ *
+ * UNIT 27 adds the batch legs: --batch runs the same items as ONE packed call
+ * (the item spans from the file's own order) and compares every element against
+ * the per-item vectors above, printing one call's wall time against the per-item
+ * sum; --batch-synth N runs one synthetic call of exactly N rows so the row
+ * budget's boundary (8192 rows accepted, 8193 refused) is a measured line rather
+ * than an arithmetic claim.  A refused synthetic batch exits 9.  --batch-bad runs
+ * the malformed span tables (an empty item, a table that does not cover the rows,
+ * zero items, an item past the token ceiling) and exits 9 if any was accepted;
+ * --no-cpu skips the per-item CPU leg, which the batch legs do not need.
  */
 #include "../../ds4.c"
 
@@ -55,10 +65,35 @@ typedef struct {
     float v[DS4_EG2VQ_N_OUT];
 } eg2vq_ref_item;
 
+/* Unit 27: one item kept for the batch leg -- its ids, and the vector the
+ * per-item device call produced for it (the thing the batch must reproduce). */
+typedef struct {
+    int32_t *ids;
+    unsigned long ntok;
+    float v[DS4_EG2VQ_N_OUT];
+} eg2vq_kept_item;
+
+typedef struct {
+    unsigned long items;
+    unsigned long rows;
+    unsigned long run;      /* the run of items with one length (for --batch-synth) */
+    double batch_sec;
+    int ok;                 /* the device batch entry's own verdict */
+    int identical;          /* every element of every item byte-identical to its per-item run */
+    double max_delta;       /* the largest per-element difference seen */
+} eg2vq_batch_leg;
+
 static void usage(void) {
     fprintf(stderr, "usage: eg2vq_embd_gpu_oracle <artifact.gguf> <ids.tsv> "
                     "[--out <device-raw.tsv>] [--out-cpu <cpu-raw.tsv>] [--ref <cpu-raw.tsv>] "
-                    "[--items N] [--skip N] [--max-tokens N]\n");
+                    "[--items N] [--skip N] [--max-tokens N] [--batch] [--batch-synth N] "
+                    "[--batch-bad] [--no-cpu]\n"
+                    "  --batch           also run the same items as ONE packed call and "
+                    "compare it against the per-item vectors\n"
+                    "  --batch-synth N   run one synthetic call of exactly N rows (the row "
+                    "budget's boundary); exits 9 if it is refused\n"
+                    "  --batch-bad       run the malformed span tables; exits 9 if any is accepted\n"
+                    "  --no-cpu          skip the per-item CPU leg (the batch legs need none)\n");
     exit(2);
 }
 
@@ -149,9 +184,54 @@ static void compare(const float *a, const float *b, double *cos, double *rel) {
     *rel = na > 0.0 ? sqrt(d2 / na) : 0.0;
 }
 
+/* Unit 27: one batch call over `n_items` items packed contiguously, against the
+ * per-item vectors the caller already has.  `off` is the item spans, `out_i`
+ * item i's per-item vector, `ids` the packed ids.  Returns what the call did;
+ * the workspace is sized ONCE for the whole block, which is the point. */
+static int eg2vq_batch_run(ds4_eg2vq_gpu_model *plan, const int32_t *ids,
+                           const uint32_t *off, uint32_t n_items, uint32_t n_rows,
+                           const eg2vq_kept_item *items, eg2vq_batch_leg *leg) {
+    const uint32_t want = (n_rows + 255u) & ~255u;
+    const uint64_t scratch = ds4_gpu_eg2vq_workspace(want);
+    ds4_eg2vq_gpu_ctx *bctx = ds4_gpu_eg2vq_create(plan, scratch, want);
+    leg->items = n_items;
+    leg->rows = n_rows;
+    leg->run = 0;
+    leg->batch_sec = 0.0;
+    leg->ok = 0;
+    leg->identical = 0;
+    leg->max_delta = 0.0;
+    if (!bctx) { return 0; }                      /* the create refusal is its own report */
+    float *out = xmalloc((size_t)n_items * (size_t)DS4_EG2VQ_N_OUT * sizeof(float));
+    const double t0 = now_sec();
+    const int ok = ds4_gpu_eg2vq_embed_batch(bctx, ids, off, n_items, n_rows, out);
+    const double secs = now_sec() - t0;
+    if (!ok) { free(out); ds4_gpu_eg2vq_free(bctx); return 0; }
+    double max_delta = 0.0;
+    int identical = 1;
+    for (uint32_t i = 0; i < n_items; i++) {
+        for (uint32_t o = 0; o < (uint32_t)DS4_EG2VQ_N_OUT; o++) {
+            const float a = out[(size_t)i * DS4_EG2VQ_N_OUT + o];
+            const float b = items[i].v[o];
+            const double d = fabs((double)a - (double)b);
+            if (d > max_delta) { max_delta = d; }
+            if (memcmp(&a, &b, sizeof a) != 0) { identical = 0; }
+        }
+    }
+    free(out);
+    ds4_gpu_eg2vq_free(bctx);
+    leg->ok = 1;
+    leg->identical = identical;
+    leg->max_delta = max_delta;
+    leg->batch_sec = secs;
+    return 1;
+}
+
 int main(int argc, char **argv) {
     const char *gguf = NULL, *ids_path = NULL, *out_path = NULL, *out_cpu_path = NULL, *ref_path = NULL;
     unsigned long items_max = 0, skip = 0, max_tokens = 2048;
+    int batch = 0, batch_bad = 0, no_cpu = 0;
+    unsigned long batch_synth = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--out") && i + 1 < argc) { out_path = argv[++i]; }
         else if (!strcmp(argv[i], "--out-cpu") && i + 1 < argc) { out_cpu_path = argv[++i]; }
@@ -159,6 +239,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--items") && i + 1 < argc) { items_max = strtoul(argv[++i], NULL, 10); }
         else if (!strcmp(argv[i], "--skip") && i + 1 < argc) { skip = strtoul(argv[++i], NULL, 10); }
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) { max_tokens = strtoul(argv[++i], NULL, 10); }
+        else if (!strcmp(argv[i], "--batch")) { batch = 1; }
+        else if (!strcmp(argv[i], "--batch-synth") && i + 1 < argc) { batch_synth = strtoul(argv[++i], NULL, 10); }
+        else if (!strcmp(argv[i], "--batch-bad")) { batch_bad = 1; }
+        else if (!strcmp(argv[i], "--no-cpu")) { no_cpu = 1; }
         else if (!gguf) { gguf = argv[i]; }
         else if (!ids_path) { ids_path = argv[i]; }
         else { usage(); }
@@ -229,11 +313,14 @@ int main(int argc, char **argv) {
     char *line = NULL;
     size_t line_cap = 0;
     ssize_t len;
-    uint64_t items = 0, tokens = 0, seen = 0;
+    uint64_t items = 0, tokens = 0, seen = 0, first_tokens = 0;
     double cpu_secs = 0.0, gpu_secs = 0.0, first_gpu_secs = 0.0;
     double min_cos = 1.0, max_rel = 0.0, min_cos_cpu_ref = 1.0, min_cos_dev_ref = 1.0;
     int status = 0, ref_mismatch = 0;
     float cpu_v[DS4_EG2VQ_N_OUT], dev_v[DS4_EG2VQ_N_OUT];
+    /* unit 27: the items kept for the batch leg (--batch / --batch-synth) */
+    eg2vq_kept_item *kept = NULL;
+    size_t n_kept = 0, cap_kept = 0;
 
     while ((len = getline(&line, &line_cap, fp)) >= 0) {
         char *s = line;
@@ -264,34 +351,57 @@ int main(int argc, char **argv) {
         }
 
         const double c0 = now_sec();
-        ds4_eg2vq_ref_embed(&model, &weights, ids, (uint32_t)ntok, cpu_v);
+        if (!no_cpu) {
+            ds4_eg2vq_ref_embed(&model, &weights, ids, (uint32_t)ntok, cpu_v);
+        }
         const double cpu_sec = now_sec() - c0;
 
         const double g0 = now_sec();
         const int ok = ds4_gpu_eg2vq_embed(ctx, ids, (uint32_t)ntok, dev_v);
         const double gpu_sec = now_sec() - g0;
-        free(ids);
         if (!ok) {
             fprintf(stderr, "eg2vq_embd_gpu: the device tower refused %s (%lu tokens)\n", item, ntok);
+            free(ids);
             status = 1;
             break;
         }
+        /* unit 27: keep the ids and the per-item vector for the batch leg, which
+         * compares the one call's vectors against exactly these. */
+        if (batch || batch_synth || batch_bad) {
+            if (n_kept == cap_kept) {
+                cap_kept = cap_kept ? cap_kept * 2u : 64u;
+                kept = xrealloc(kept, cap_kept * sizeof(*kept));
+            }
+            kept[n_kept].ids = ids;
+            kept[n_kept].ntok = ntok;
+            memcpy(kept[n_kept].v, dev_v, sizeof dev_v);
+            n_kept++;
+            ids = NULL;
+        }
+        free(ids);
 
         double cos = 0.0, rel = 0.0;
-        compare(cpu_v, dev_v, &cos, &rel);
-        if (cos < min_cos) { min_cos = cos; }
-        if (rel > max_rel) { max_rel = rel; }
-        if (items == 0) { first_gpu_secs = gpu_sec; }
+        if (!no_cpu) {
+            compare(cpu_v, dev_v, &cos, &rel);
+            if (cos < min_cos) { min_cos = cos; }
+            if (rel > max_rel) { max_rel = rel; }
+        }
+        if (items == 0) { first_gpu_secs = gpu_sec; first_tokens = ntok; }
 
-        printf("%-28.28s %6lu %12.9f %11.3e %9.2f %9.2f",
-               item, ntok, cos, rel, cpu_sec * 1000.0, gpu_sec * 1000.0);
+        if (no_cpu) {
+            printf("%-28.28s %6lu %12s %11s %9s %9.2f", item, ntok, "-", "-", "-",
+                   gpu_sec * 1000.0);
+        } else {
+            printf("%-28.28s %6lu %12.9f %11.3e %9.2f %9.2f",
+                   item, ntok, cos, rel, cpu_sec * 1000.0, gpu_sec * 1000.0);
+        }
         if (ref_path) {
             if (seen < n_ref && ref[seen].ntok == ntok && !strcmp(ref[seen].id, item)) {
                 double rc = 0.0, rr = 0.0, dc = 0.0, dr = 0.0;
-                compare(cpu_v, ref[seen].v, &rc, &rr);
+                if (!no_cpu) { compare(cpu_v, ref[seen].v, &rc, &rr); }
                 compare(dev_v, ref[seen].v, &dc, &dr);
-                printf(" %12.9f %12.9f", rc, dc);
-                if (rc < min_cos_cpu_ref) { min_cos_cpu_ref = rc; }
+                printf(" %12.9f %12.9f", no_cpu ? 0.0 : rc, dc);
+                if (!no_cpu && rc < min_cos_cpu_ref) { min_cos_cpu_ref = rc; }
                 if (dc < min_cos_dev_ref) { min_cos_dev_ref = dc; }
             } else {
                 printf(" %12s %12s", "-", "-");
@@ -330,33 +440,258 @@ int main(int argc, char **argv) {
     if (out_fp) { fclose(out_fp); }
     if (out_cpu_fp) { fclose(out_cpu_fp); }
 
+    /* ---- unit 27: the batch --------------------------------------------------
+     * The same items in ONE call, against the per-item vectors above: this is the
+     * batch's whole claim (`a batched item's vector EQUALS its single-item
+     * vector`), measured element by element and byte by byte, plus what one call
+     * costs against the sum of the per-item calls.  Nothing here is a tolerance
+     * the run may drift inside: the two legs compute the same items with the same
+     * plan, and the item-relative kernels make the batched arithmetic identical,
+     * so the comparison is `identical`.  --batch-synth N then builds a batch of
+     * exactly N rows out of the loaded items, to walk the row budget's boundary.
+     */
+    if ((batch || batch_synth || batch_bad) && !status && items) {
+        int bad_accepted = 0;
+        /* ---- the span table is the block's own description -------------------
+         * A table that does not describe the rows must be REFUSED, never
+         * reinterpreted: an empty item (a span that does not rise), a table that
+         * does not end at n_rows, zero items, and an item past the token ceiling
+         * (which the kernel's key plane cannot hold -- unit 27 moved that check
+         * out of the launcher and into the core, where the lengths are known).
+         * Each case is one call on a workspace sized for the rows it claims. */
+        if (batch_bad && n_kept >= 2) {
+            const uint32_t a = (uint32_t)kept[0].ntok, b = (uint32_t)kept[1].ntok;
+            const uint32_t rows = a + b;
+            int32_t *packed = xmalloc((size_t)rows * sizeof(int32_t));
+            memcpy(packed, kept[0].ids, (size_t)a * sizeof(int32_t));
+            memcpy(packed + a, kept[1].ids, (size_t)b * sizeof(int32_t));
+            float *out = xmalloc((size_t)2 * DS4_EG2VQ_N_OUT * sizeof(float));
+            ds4_eg2vq_gpu_ctx *c = ds4_gpu_eg2vq_create(
+                plan, ds4_gpu_eg2vq_workspace(rows), rows);
+            const uint32_t good[3] = { 0, a, rows };
+            const uint32_t empty_item[3] = { 0, 0, rows };
+            const uint32_t short_table[3] = { 0, a, rows - 1u };
+            const uint32_t flat_table[3] = { 0, a, a };
+            struct { const char *name; const uint32_t *off; uint32_t n_items; } cases[] = {
+                { "a span that does not rise (empty item)", empty_item, 2 },
+                { "a table that does not end at n_ids", short_table, 2 },
+                { "a table that does not cover (flat end)", flat_table, 2 },
+                { "zero items", good, 0 },
+            };
+            printf("\n== the batch's refusals (unit 27) ==\n");
+            if (!c) {
+                printf("FAIL: no workspace for the refusal cases\n");
+                bad_accepted = 1;
+            } else {
+                for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+                    /* each refusal must leave the CALLER's buffer alone: fill it
+                     * with a sentinel first and check every float after */
+                    for (size_t k = 0; k < (size_t)2 * DS4_EG2VQ_N_OUT; k++) { out[k] = 5.0f; }
+                    const int ok = ds4_gpu_eg2vq_embed_batch(c, packed, cases[i].off,
+                                                             cases[i].n_items, rows, out);
+                    int untouched = 1;
+                    for (size_t k = 0; k < (size_t)2 * DS4_EG2VQ_N_OUT; k++) {
+                        if (out[k] != 5.0f) { untouched = 0; }
+                    }
+                    printf("%-44s %s\n", cases[i].name,
+                           ok ? "ACCEPTED (BUG)"
+                              : (untouched ? "refused, output untouched" : "refused but WROTE"));
+                    if (ok || !untouched) { bad_accepted = 1; }
+                }
+                /* and the item ceiling: 2049 rows in one item, on a block of 2049
+                 * rows built by cycling an item that is long enough */
+                const uint32_t long_rows = (uint32_t)DS4_EG2VQ_MAX_TOKENS + 1u;
+                int32_t *longpacked = xmalloc((size_t)long_rows * sizeof(int32_t));
+                for (uint32_t t = 0; t < long_rows; t++) {
+                    longpacked[t] = kept[0].ids[t % (uint32_t)kept[0].ntok];
+                }
+                ds4_eg2vq_gpu_ctx *lc = ds4_gpu_eg2vq_create(
+                    plan, ds4_gpu_eg2vq_workspace(long_rows), long_rows);
+                if (!lc) {
+                    printf("%-44s %s\n", "a 2049-token item (past the key plane)",
+                           "not testable: no workspace");
+                    bad_accepted = 1;
+                } else {
+                    const uint32_t one[2] = { 0, long_rows };
+                    for (size_t k = 0; k < (size_t)2 * DS4_EG2VQ_N_OUT; k++) { out[k] = 5.0f; }
+                    const int ok = ds4_gpu_eg2vq_embed_batch(lc, longpacked, one, 1, long_rows, out);
+                    int untouched = 1;
+                    for (size_t k = 0; k < (size_t)2 * DS4_EG2VQ_N_OUT; k++) {
+                        if (out[k] != 5.0f) { untouched = 0; }
+                    }
+                    printf("%-44s %s\n", "a 2049-token item (past the key plane)",
+                           ok ? "ACCEPTED (BUG)"
+                              : (untouched ? "refused, output untouched" : "refused but WROTE"));
+                    if (ok || !untouched) { bad_accepted = 1; }
+                    ds4_gpu_eg2vq_free(lc);
+                }
+                free(longpacked);
+                ds4_gpu_eg2vq_free(c);
+            }
+            free(out);
+            free(packed);
+        }
+        if (!batch && !batch_synth) {
+            for (size_t i = 0; i < n_kept; i++) { free(kept[i].ids); }
+            free(kept);
+            ds4_gpu_eg2vq_free(ctx);
+            ds4_gpu_eg2vq_unbind(plan);
+            model_close(&model);
+            return bad_accepted ? 9 : 0;
+        }
+        /* the refusal leg must leave no CUDA error behind for the legs after it:
+         * a stale error would surface at the next leg's own error check */
+        {
+            const cudaError_t leftover = cudaGetLastError();
+            if (leftover != cudaSuccess) {
+                printf("FAIL: the CUDA context carried %s before the batch leg\n",
+                       cudaGetErrorString(leftover));
+                bad_accepted = 1;
+            }
+        }
+        eg2vq_batch_leg leg = {0};
+        eg2vq_kept_item *use = kept;
+        size_t n_use = n_kept;
+        int synth = 0;
+        if (batch_synth) {
+            /* Items of the ceiling's own length (2048) so the row count is exact:
+             * N / 2048 items of 2048 rows and one more with the remainder, their
+             * ids cycled from the first loaded item (the tower does not care that
+             * the text is nonsense -- the row budget is what is under test), and
+             * no per-item run to compare against. */
+            synth = 1;
+            const unsigned long synth_items = (unsigned long)(batch_synth / DS4_EG2VQ_MAX_TOKENS) +
+                                              ((batch_synth % DS4_EG2VQ_MAX_TOKENS) ? 1u : 0u);
+            use = xmalloc((size_t)synth_items * sizeof(*use));
+            unsigned long at = 0;
+            for (unsigned long i = 0; i < synth_items; i++) {
+                const unsigned long len = (batch_synth - at > DS4_EG2VQ_MAX_TOKENS)
+                                              ? DS4_EG2VQ_MAX_TOKENS
+                                              : (batch_synth - at);
+                use[i].ids = xmalloc((size_t)len * sizeof(int32_t));
+                for (unsigned long t = 0; t < len; t++) {
+                    use[i].ids[t] = kept[0].ids[t % kept[0].ntok];
+                }
+                use[i].ntok = len;
+                memset(use[i].v, 0, sizeof use[i].v);
+                at += len;
+            }
+            n_use = (size_t)synth_items;
+        }
+        unsigned long rows = 0;
+        for (size_t i = 0; i < n_use; i++) { rows += use[i].ntok; }
+        int32_t *packed = xmalloc((size_t)rows * sizeof(int32_t));
+        uint32_t *off = xmalloc((n_use + 1u) * sizeof(uint32_t));
+        off[0] = 0;
+        for (size_t i = 0; i < n_use; i++) {
+            for (unsigned long t = 0; t < use[i].ntok; t++) {
+                packed[off[i] + t] = use[i].ids[t];
+            }
+            off[i + 1] = off[i] + (uint32_t)use[i].ntok;
+        }
+        const unsigned long want_rows = ((uint32_t)rows + 255u) & ~(unsigned long)255u;
+        int ran = eg2vq_batch_run(plan, packed, off, (uint32_t)n_use, (uint32_t)rows, use, &leg);
+        const double batch_first_sec = leg.batch_sec;
+        /* A second call on a FRESH context (the same workspace, its pages now
+         * touched): the first call above pays the allocation's own first-touch
+         * cost, which the per-item loop did not, so the comparison is reported
+         * both ways rather than against whichever one flatters the batch. */
+        eg2vq_batch_leg warm_leg = {0};
+        if (ran && !synth) {
+            (void)eg2vq_batch_run(plan, packed, off, (uint32_t)n_use, (uint32_t)rows, use, &warm_leg);
+        }
+        printf("\n== the batch (unit 27) ==\n");
+        printf("call:  %zu items, %lu rows, one workspace of %.2f MiB, %.1f ms\n",
+               n_use, rows,
+               (double)ds4_gpu_eg2vq_workspace((uint32_t)want_rows) / 1048576.0,
+               leg.batch_sec * 1000.0);
+        int refused = 0;
+        if (!ran) {
+            printf("refused: the device batch entry took none of this call "
+                   "(the %u-row budget or the %u-token item ceiling)\n",
+                   (unsigned)DS4_EG2VQ_MAX_ROWS, (unsigned)DS4_EG2VQ_MAX_TOKENS);
+            refused = 1;
+            if (!synth) { status = 1; }              /* the fixture itself must batch */
+        } else if (synth) {
+            printf("accepted: %lu rows in one call (a synthetic batch has no per-item "
+                   "vectors to compare against)\n", rows);
+        } else {
+            const double warm_sec = gpu_secs - first_gpu_secs;
+            const unsigned long warm_rows = tokens - first_tokens;
+            printf("equality: %s, max per-element delta %.3e over %zu items x %d values\n",
+                   leg.identical ? "every element byte-identical to the per-item run" : "DIFFERENT",
+                   leg.max_delta, n_use, (int)DS4_EG2VQ_N_OUT);
+            printf("per-item: %.1f ms for %lu rows (%.0f rows/s), of which the first item's "
+                   "%.1f ms/%lu rows carries this process's first wave\n",
+                   gpu_secs * 1000.0, rows, gpu_secs > 0.0 ? (double)rows / gpu_secs : 0.0,
+                   first_gpu_secs * 1000.0, (unsigned long)first_tokens);
+            printf("per-item, warm (first excluded): %.1f ms for %lu rows (%.0f rows/s)\n",
+                   warm_sec * 1000.0, warm_rows,
+                   warm_sec > 0.0 ? (double)warm_rows / warm_sec : 0.0);
+            printf("one call: %.1f ms for %lu rows (%.0f rows/s) -- ONE launch wave against %lu\n",
+                   leg.batch_sec * 1000.0, rows,
+                   leg.batch_sec > 0.0 ? (double)rows / leg.batch_sec : 0.0,
+                   (unsigned long)items);
+            printf("one call, warm context: %.1f ms for %lu rows (%.0f rows/s)\n",
+                   warm_leg.batch_sec * 1000.0, rows,
+                   warm_leg.batch_sec > 0.0 ? (double)rows / warm_leg.batch_sec : 0.0);
+            printf("ratio: one warm call is %.2fx the per-item total, %.2fx its warm rate\n",
+                   warm_leg.batch_sec > 0.0 ? warm_leg.batch_sec / gpu_secs : 0.0,
+                   gpu_secs > 0.0 ? (gpu_secs / warm_leg.batch_sec) : 0.0);
+            if (!leg.identical || !warm_leg.identical) { status = 1; }
+            (void)batch_first_sec;
+        }
+        if (synth) {
+            for (size_t i = 0; i < n_use; i++) { free(use[i].ids); }
+            free(use);
+        }
+        free(packed);
+        free(off);
+        for (size_t i = 0; i < n_kept; i++) { free(kept[i].ids); }
+        free(kept);
+        ds4_gpu_eg2vq_free(ctx);
+        ds4_gpu_eg2vq_unbind(plan);
+        model_close(&model);
+        /* A refused synthetic batch is the boundary leg's expected OUTCOME, so it
+         * gets its own exit code (9) instead of being read as a pass. */
+        if (refused || bad_accepted) { return 9; }
+        return status ? 1 : 0;
+    }
+    for (size_t i = 0; i < n_kept; i++) { free(kept[i].ids); }
+    free(kept);
+
     printf("\n== the numbers ==\n");
     printf("items %llu tokens %llu\n", (unsigned long long)items, (unsigned long long)tokens);
     printf("parity: min cos(device, cpu) %.9f  max rel_rms %.3e  (declared: cos >= %.6f, rel_rms <= %.0e)\n",
            min_cos, max_rel, EG2VQ_GPU_COS_MIN, EG2VQ_GPU_REL_RMS_MAX);
+    if (no_cpu) { printf("parity: NOT MEASURED in this run (--no-cpu: the batch legs need no per-item CPU leg)\n"); }
     if (ref_path) {
         printf("against the committed cpu raw: min cos(cpu, ref) %.9f  min cos(device, ref) %.9f",
                min_cos_cpu_ref, min_cos_dev_ref);
         if (ref_mismatch) { printf("  (%d items not comparable: id/ntok or length mismatch)", ref_mismatch); }
         printf("\n");
     }
-    printf("cpu:    %8.2f s total, %7.3f s/item, %7.1f tokens/s (this harness's -O0 reference entry)\n",
-           cpu_secs, items ? cpu_secs / (double)items : 0.0, cpu_secs > 0.0 ? (double)tokens / cpu_secs : 0.0);
+    if (!no_cpu) {
+        printf("cpu:    %8.2f s total, %7.3f s/item, %7.1f tokens/s (this harness's -O0 reference entry)\n",
+               cpu_secs, items ? cpu_secs / (double)items : 0.0, cpu_secs > 0.0 ? (double)tokens / cpu_secs : 0.0);
+    }
     printf("device: %8.2f s total, %7.3f s/item, %7.1f tokens/s (ids upload + 24 layers + readback)\n",
            gpu_secs, items ? gpu_secs / (double)items : 0.0, gpu_secs > 0.0 ? (double)tokens / gpu_secs : 0.0);
     if (items > 1) {
         const double warm = gpu_secs - first_gpu_secs;
         printf("device steady state (first item excluded): %7.3f s/item, %7.1f tokens/s\n",
-               warm / (double)(items - 1), warm > 0.0 ? (double)(tokens - 1) / warm : 0.0);
+               warm / (double)(items - 1), warm > 0.0 ? (double)(tokens - first_tokens) / warm : 0.0);
     }
-    printf("speedup: %.1fx per item over the same ids in this process\n",
-           gpu_secs > 0.0 ? cpu_secs / gpu_secs : 0.0);
+    if (!no_cpu) {
+        printf("speedup: %.1fx per item over the same ids in this process\n",
+               gpu_secs > 0.0 ? cpu_secs / gpu_secs : 0.0);
+    }
 
     ds4_gpu_eg2vq_free(ctx);
     ds4_gpu_eg2vq_unbind(plan);
     model_close(&model);
 
-    const int pass = !status && min_cos >= EG2VQ_GPU_COS_MIN && max_rel <= EG2VQ_GPU_REL_RMS_MAX;
+    const int pass = !status && (no_cpu || (min_cos >= EG2VQ_GPU_COS_MIN && max_rel <= EG2VQ_GPU_REL_RMS_MAX));
     if (status) { printf("eg2vq_embd_gpu: the ids file stopped the run\n"); }
     printf("%s\n", pass ? "EG2VQ_GPU_PASS" : "EG2VQ_GPU_FAIL");
     return pass ? 0 : 1;

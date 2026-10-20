@@ -2451,6 +2451,116 @@ impl Model {
         Ok(out)
     }
 
+    /// Unit 27 (phase-doc row P2.3's last slice): SEVERAL items through the
+    /// tower in ONE call -- `ds4_bridge_eg2vq_embed_batch` ->
+    /// `ds4_engine_embed_gemma_vq_batch`, the same entries the one-item call
+    /// reaches, with the items packed into one contiguous row block instead of
+    /// one call each.  `ids` is every item's ids laid end to end in request
+    /// order and `item_off` their `n_items + 1` spans, so item `i`'s ids are
+    /// `ids[item_off[i]..item_off[i + 1]]` -- the shape the route already
+    /// tokenized.
+    ///
+    /// Returns `n_items * 768` floats, item `i`'s vector at `i * 768`: the
+    /// vector `embed_gemma_vq` returns for that item alone, which is the batch's
+    /// contract (every row's arithmetic depends only on its own item --
+    /// `ds4_eg2vq_gpu.cuh`'s core derives each row's position inside its item and
+    /// its item's bounds, and the pool reduces an item's own rows in order).
+    ///
+    /// The refusals mirror the C entry's, checked here as well so the message is
+    /// the same on every backend: an empty batch, a span table that does not rise
+    /// from 0 to `n_ids` (an empty item, a hole, a disagreement), an item past
+    /// `ITEM_TOKENS_MAX`, and rows past `BATCH_ROWS_MAX` -- the two numbers
+    /// `embed_caps` advertises.
+    pub fn embed_gemma_vq_batch(&self, ids: &[i32], item_off: &[u32]) -> Result<Vec<f32>> {
+        const OUT: usize = 768;
+        if item_off.len() < 2 {
+            return Err(Error {
+                code: 1,
+                message: "a batch of no items has no embedding".into(),
+            });
+        }
+        let n_items = item_off.len() - 1;
+        let n_ids = ids.len();
+        if n_ids == 0 {
+            return Err(Error {
+                code: 1,
+                message: "an empty item has no embedding".into(),
+            });
+        }
+        if item_off[0] != 0 || item_off[n_items] != n_ids as u32 {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the item spans do not cover {n_ids} rows: they start at {} and end at {}",
+                    item_off[0], item_off[n_items]
+                ),
+            });
+        }
+        if n_ids > crate::gemma_vq::BATCH_ROWS_MAX as usize {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "the call's items add up to {n_ids} rows, past the {} rows one embedding \
+                     call may occupy (crate::gemma_vq::BATCH_ROWS_MAX)",
+                    crate::gemma_vq::BATCH_ROWS_MAX
+                ),
+            });
+        }
+        for i in 0..n_items {
+            let len = (item_off[i + 1] - item_off[i]) as usize;
+            if len == 0 {
+                return Err(Error {
+                    code: 1,
+                    message: format!(
+                        "input[{i}] is empty (its span is [{}, {}))",
+                        item_off[i],
+                        item_off[i + 1]
+                    ),
+                });
+            }
+            if len > crate::gemma_vq::ITEM_TOKENS_MAX as usize {
+                return Err(Error {
+                    code: 1,
+                    message: format!(
+                        "input[{i}] is {len} tokens, past the {} the embedding tower's attention \
+                         kernel holds (crate::gemma_vq::ITEM_TOKENS_MAX)",
+                        crate::gemma_vq::ITEM_TOKENS_MAX
+                    ),
+                });
+            }
+        }
+        let n_items_u32 = u32::try_from(n_items).map_err(|_| Error {
+            code: 1,
+            message: "the batch has more items than u32".into(),
+        })?;
+        let n_ids_u32 = u32::try_from(n_ids).map_err(|_| Error {
+            code: 1,
+            message: "the batch is longer than u32 tokens".into(),
+        })?;
+        let mut out = vec![0.0f32; n_items * OUT];
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 -- FFI boundary] `raw` is the open model handle;
+        // `ids` and `item_off` are live slices whose lengths are the two counts
+        // passed, and `out` holds n_items * OUT floats, which the C entry writes
+        // only on success.
+        let rc = unsafe {
+            ds4_sys::ds4_bridge_eg2vq_embed_batch(
+                self.raw.as_ptr(),
+                ids.as_ptr(),
+                item_off.as_ptr(),
+                n_items_u32,
+                n_ids_u32,
+                out.as_mut_ptr(),
+                err.as_mut_ptr().cast(),
+                err.len(),
+            )
+        };
+        if rc == 0 {
+            return Err(fail(1, &err));
+        }
+        Ok(out)
+    }
+
     /// Phase 6: one embedding item's token ids, built the way the reference
     /// driver builds them (`examples/gemma_vq_tok.rs`): the caller's prompt
     /// prefix, then the text through the family's own tokenizer, wrapped in the

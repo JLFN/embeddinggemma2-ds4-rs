@@ -1958,6 +1958,13 @@ fn embed_text(args: &ShadowArgs) -> Result<String, String> {
 /// the artifact's special-token flags, then run through the C engine's
 /// embedding entry (device tower on a graph backend, the same reference forward
 /// on CPU) -- the route and this verb reach the same function.
+///
+/// Unit 27 (batching) left this verb on the ONE-item entry deliberately: a verb
+/// whose contract is one item cannot use a batch row budget, and this is the
+/// entry that stays exercised because of it (the route's array requests reach
+/// `embed_gemma_vq_batch` instead, which is the packed row block of
+/// `ds4_eg2vq_gpu.cuh`; a batch of one item is the same computation, so the two
+/// cannot disagree).
 fn run_embed(model: &ds4_core::Model, args: &ShadowArgs, model_path: &str) -> Result<i32, String> {
     if !model.embeds_text() {
         return Err("ds4-rs: --embed needs a gemma_vq artifact: this model's family is not \

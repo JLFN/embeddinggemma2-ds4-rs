@@ -57,6 +57,43 @@ static void ref_rms_head(std::vector<float> &x, const std::vector<float> *w, uin
     }
 }
 
+// graph:339-367: the output_norm RMS and the bf16 projection per row, summed
+// over the rows of ONE item, then that item's mean and L2 normalization --
+// item-relative because the device pool is (unit 27, cuda/eg2vq_ops.cuh's
+// eg2vq_ops_pool_item_kernel), so `want` is built the same way for a single item
+// and for one item of a packed batch.
+static void ref_proj_pool(const std::vector<float> &h, uint32_t r0, uint32_t r1,
+                          const std::vector<uint16_t> &w, const std::vector<float> &nw,
+                          uint32_t n_embd, uint32_t n_out, std::vector<float> &want) {
+    want.assign(n_out, 0.0f);
+    for (uint32_t t = r0; t < r1; t++) {
+        std::vector<float> e(n_embd);
+        double ss = 0.0;
+        for (uint32_t i = 0; i < n_embd; i++) {
+            ss += (double)h[(size_t)t * n_embd + i] * (double)h[(size_t)t * n_embd + i];
+        }
+        const float scale = 1.0f / sqrtf((float)(ss / (double)n_embd) + EG2VQ_EPS);
+        for (uint32_t i = 0; i < n_embd; i++) { e[i] = h[(size_t)t * n_embd + i] * scale * nw[i]; }
+        for (uint32_t o = 0; o < n_out; o++) {
+            float a = 0.0f;
+            for (uint32_t i = 0; i < n_embd; i++) {
+                const uint32_t u = (uint32_t)w[(size_t)o * n_embd + i] << 16;
+                float f;
+                memcpy(&f, &u, 4);
+                a += f * e[i];
+            }
+            want[o] += a;
+        }
+    }
+    const float mean = 1.0f / (float)(r1 - r0);
+    for (float &v : want) { v *= mean; }
+    double ss = 0.0;
+    for (float v : want) { ss += (double)v * (double)v; }
+    const double norm = sqrt(ss);
+    const float inv = norm > 0.0 ? (float)(1.0 / norm) : 0.0f;
+    for (float &v : want) { v *= inv; }
+}
+
 // graph:60-77, with the angle accumulation the graph itself does
 static void rope_tables(std::vector<float> &cos_tab, std::vector<float> &sin_tab,
                         uint32_t n_pos, uint32_t hd, float base) {
@@ -74,20 +111,30 @@ static void rope_tables(std::vector<float> &cos_tab, std::vector<float> &sin_tab
     }
 }
 
-static void ref_rope(std::vector<float> &x, uint32_t rows, uint32_t heads, uint32_t hd,
-                     const std::vector<float> &cos_tab, const std::vector<float> &sin_tab) {
+// Rotate `rows` rows starting at r0, reading the table at positions p0..p0+rows
+// (unit 27: the device kernel indexes the table by each row's position INSIDE its
+// item, and one item is the p0 == 0, r0 == 0 case).
+static void ref_rope_at(std::vector<float> &x, uint32_t r0, uint32_t rows, uint32_t heads, uint32_t hd,
+                        const std::vector<float> &cos_tab, const std::vector<float> &sin_tab,
+                        uint32_t p0) {
     const uint32_t half = hd / 2u;
-    for (uint32_t r = 0; r < rows; r++) {
+    for (uint32_t r = r0; r < r0 + rows; r++) {
+        const uint32_t p = p0 + (r - r0);
         for (uint32_t h = 0; h < heads; h++) {
             float *v = &x[((size_t)r * heads + h) * hd];
             for (uint32_t i = 0; i < half; i++) {
-                const float c = cos_tab[(size_t)r * half + i], s = sin_tab[(size_t)r * half + i];
+                const float c = cos_tab[(size_t)p * half + i], s = sin_tab[(size_t)p * half + i];
                 const float x0 = v[i], x1 = v[i + half];
                 v[i] = x0 * c - x1 * s;
                 v[i + half] = x0 * s + x1 * c;
             }
         }
     }
+}
+
+static void ref_rope(std::vector<float> &x, uint32_t rows, uint32_t heads, uint32_t hd,
+                     const std::vector<float> &cos_tab, const std::vector<float> &sin_tab) {
+    ref_rope_at(x, 0, rows, heads, hd, cos_tab, sin_tab, 0);
 }
 
 static double rel_rms(const std::vector<float> &a, const std::vector<float> &b, double *maxabs) {
@@ -178,6 +225,7 @@ int main(void) {
         std::vector<float> x((size_t)rows * n_head * hd);
         for (float &v : x) { v = nd(rng); }
         float *dx = NULL, *dc = NULL, *ds = NULL;
+        int32_t *dpos = NULL;
         CK(cudaMalloc(&dx, x.size() * 4));
         for (float base : {1.0e4f, 1.0e6f}) {
             rope_tables(cos_tab, sin_tab, rows, hd, base);
@@ -188,7 +236,12 @@ int main(void) {
             if (!ds) { CK(cudaMalloc(&ds, sin_tab.size() * 4)); }
             CK(cudaMemcpy(dc, cos_tab.data(), cos_tab.size() * 4, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(ds, sin_tab.data(), sin_tab.size() * 4, cudaMemcpyHostToDevice));
-            eg2vq_ops_rope(dx, dc, ds, rows, n_head, hd);
+            /* one item: a row's position IS its row index (unit 27's `pos`) */
+            std::vector<int32_t> pos(rows);
+            for (uint32_t t = 0; t < rows; t++) { pos[t] = (int32_t)t; }
+            if (!dpos) { CK(cudaMalloc(&dpos, (size_t)rows * 4)); }
+            CK(cudaMemcpy(dpos, pos.data(), (size_t)rows * 4, cudaMemcpyHostToDevice));
+            eg2vq_ops_rope(dx, dc, ds, dpos, rows, n_head, hd);
             CK(cudaDeviceSynchronize());
             std::vector<float> got(x.size());
             CK(cudaMemcpy(got.data(), dx, got.size() * 4, cudaMemcpyDeviceToHost));
@@ -196,7 +249,50 @@ int main(void) {
             snprintf(tag, sizeof(tag), "rope 1414x4x256, base %.0e", (double)base);
             double ma; const double r3 = rel_rms(got, want, &ma); fails += report(tag, r3, ma, 1e-6);
         }
-        cudaFree(dx); cudaFree(dc); cudaFree(ds);
+        cudaFree(dx); cudaFree(dc); cudaFree(ds); cudaFree(dpos);
+    }
+
+    /* ---- unit 27: RoPE's position is per ITEM -------------------------------
+     * Two items (40 and 600 rows) packed into one block: the second item's rows
+     * must be rotated with the table entries of THEIR own positions 0..599, not
+     * with the block's row indices 40..639, which is what a batch call's `pos`
+     * carries.  The reference is the same table read twice, once per item. */
+    {
+        const uint32_t hd = 256, half = 40, other = 600;
+        const uint32_t rows = half + other;
+        std::vector<float> cos_tab, sin_tab, x((size_t)rows * n_head * hd);
+        for (float &v : x) { v = nd(rng); }
+        rope_tables(cos_tab, sin_tab, rows, hd, 1.0e4f);
+        std::vector<float> want = x;
+        ref_rope_at(want, 0, half, n_head, hd, cos_tab, sin_tab, 0);
+        ref_rope_at(want, half, other, n_head, hd, cos_tab, sin_tab, 0);
+        std::vector<int32_t> pos(rows);
+        for (uint32_t t = 0; t < rows; t++) {
+            pos[t] = (int32_t)(t < half ? t : t - half);
+        }
+        float *dx = NULL, *dc = NULL, *ds = NULL;
+        int32_t *dpos = NULL;
+        CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMalloc(&dc, cos_tab.size() * 4));
+        CK(cudaMalloc(&ds, sin_tab.size() * 4)); CK(cudaMalloc(&dpos, (size_t)rows * 4));
+        CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dc, cos_tab.data(), cos_tab.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ds, sin_tab.data(), sin_tab.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dpos, pos.data(), (size_t)rows * 4, cudaMemcpyHostToDevice));
+        eg2vq_ops_rope(dx, dc, ds, dpos, rows, n_head, hd);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> got(x.size());
+        CK(cudaMemcpy(got.data(), dx, got.size() * 4, cudaMemcpyDeviceToHost));
+        // exact comparison against the per-item reference: the table entry is the
+        // only input, so a different `pos` shows up immediately
+        double ma = 0.0;
+        for (size_t i = 0; i < got.size(); i++) {
+            const double d = fabs((double)got[i] - (double)want[i]);
+            if (d > ma) { ma = d; }
+        }
+        printf("%-44s maxabs %.2e | %s\n", "rope pos restarts per item",
+               ma, ma == 0.0 ? "ok" : "OUT OF BOUND");
+        if (ma != 0.0) { fails++; }
+        cudaFree(dx); cudaFree(dc); cudaFree(ds); cudaFree(dpos);
     }
 
     /* ---- gelu(gate) * up ---------------------------------------------------- */
@@ -279,35 +375,23 @@ int main(void) {
             memcpy(&v, &b, 2);
         }
         auto bf16v = [](uint16_t u) { const uint32_t x = (uint32_t)u << 16; float f; memcpy(&f, &x, 4); return f; };
-        std::vector<float> want(n_out, 0.0f);
-        for (uint32_t t = 0; t < n_tok; t++) {
-            std::vector<float> e(n_embd);
-            double ss = 0.0;
-            for (uint32_t i = 0; i < n_embd; i++) { ss += (double)h[(size_t)t * n_embd + i] * (double)h[(size_t)t * n_embd + i]; }
-            const float scale = 1.0f / sqrtf((float)(ss / (double)n_embd) + EG2VQ_EPS);
-            for (uint32_t i = 0; i < n_embd; i++) { e[i] = h[(size_t)t * n_embd + i] * scale * nw[i]; }
-            for (uint32_t o = 0; o < n_out; o++) {
-                float a = 0.0f;
-                for (uint32_t i = 0; i < n_embd; i++) { a += bf16v(w[(size_t)o * n_embd + i]) * e[i]; }
-                want[o] += a;
-            }
-        }
-        const float mean = 1.0f / (float)n_tok;
-        for (float &v : want) { v *= mean; }
-        double ss = 0.0;
-        for (float v : want) { ss += (double)v * (double)v; }
-        const double norm = sqrt(ss);
-        const float inv = norm > 0.0 ? (float)(1.0 / norm) : 0.0f;
-        for (float &v : want) { v *= inv; }
+        (void)bf16v;
+        std::vector<float> want;
+        ref_proj_pool(h, 0, n_tok, w, nw, n_embd, n_out, want);
 
-        float *dh = NULL, *dnw = NULL, *dy = NULL;
+        float *dh = NULL, *dnw = NULL, *dy = NULL, *dacc = NULL;
         uint16_t *dw = NULL;
+        uint32_t *doff = NULL;
+        const uint32_t off_one[2] = { 0u, n_tok };
         CK(cudaMalloc(&dh, h.size() * 4)); CK(cudaMalloc(&dnw, nw.size() * 4));
         CK(cudaMalloc(&dy, n_out * 4)); CK(cudaMalloc(&dw, w.size() * 2));
+        CK(cudaMalloc(&dacc, (size_t)n_tok * n_out * 4));
+        CK(cudaMalloc(&doff, sizeof(off_one)));
         CK(cudaMemcpy(dh, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dnw, nw.data(), nw.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
-        if (!eg2vq_ops_proj768_pool(dy, dh, dw, dnw, n_tok, n_embd, n_out, EG2VQ_EPS)) {
+        CK(cudaMemcpy(doff, off_one, sizeof(off_one), cudaMemcpyHostToDevice));
+        if (!eg2vq_ops_proj768_pool_batch(dy, dacc, dh, dw, dnw, doff, 1u, n_tok, n_embd, n_out, EG2VQ_EPS)) {
             printf("FAIL: the 768 projection launcher refused the shape\n");
             fails++;
         }
@@ -324,6 +408,67 @@ int main(void) {
                fabs(sqrt(ns) - 1.0) <= 1e-6 ? "ok" : "OUT OF BOUND");
         if (fabs(sqrt(ns) - 1.0) > 1e-6) { fails++; }
         cudaFree(dh); cudaFree(dnw); cudaFree(dy); cudaFree(dw);
+        cudaFree(dacc); cudaFree(doff);
+    }
+
+    /* ---- unit 27: the pool is per ITEM -------------------------------------
+     * Three items of very different lengths (1, 349 and 40 rows) packed into one
+     * block: the same kernel pair must return each item's OWN mean/L2 vector, so
+     * every item is compared against the reference run for it alone.  A pool that
+     * averaged the block, or that let one item's rows into another's, cannot
+     * pass this. */
+    {
+        const uint32_t n_out = 768;
+        const uint32_t lens[3] = { 1u, 349u, 40u };
+        const uint32_t n_tok = lens[0] + lens[1] + lens[2];
+        std::vector<float> h((size_t)n_tok * n_embd), nw(n_embd);
+        std::vector<uint16_t> w((size_t)n_out * n_embd);
+        for (float &v : h) { v = nd(rng); }
+        for (float &v : nw) { v = 1.0f + 0.1f * nd(rng); }
+        for (uint16_t &v : w) {
+            __nv_bfloat16 b = __float2bfloat16(0.02f * nd(rng));
+            memcpy(&v, &b, 2);
+        }
+        uint32_t off_h[4] = { 0u, 0u, 0u, 0u };
+        for (uint32_t i = 0; i < 3; i++) { off_h[i + 1] = off_h[i] + lens[i]; }
+
+        float *dh = NULL, *dnw = NULL, *dy = NULL, *dacc = NULL;
+        uint16_t *dw = NULL;
+        uint32_t *doff = NULL;
+        CK(cudaMalloc(&dh, h.size() * 4)); CK(cudaMalloc(&dnw, nw.size() * 4));
+        CK(cudaMalloc(&dy, (size_t)3 * n_out * 4)); CK(cudaMalloc(&dw, w.size() * 2));
+        CK(cudaMalloc(&dacc, (size_t)n_tok * n_out * 4));
+        CK(cudaMalloc(&doff, sizeof(off_h)));
+        CK(cudaMemcpy(dh, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dnw, nw.data(), nw.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(doff, off_h, sizeof(off_h), cudaMemcpyHostToDevice));
+        int ok = 1;
+        if (!eg2vq_ops_proj768_pool_batch(dy, dacc, dh, dw, dnw, doff, 3u, n_tok, n_embd, n_out, EG2VQ_EPS)) {
+            printf("FAIL: the 3-item pool launcher refused the shape\n");
+            fails++;
+            ok = 0;
+        }
+        if (ok) {
+            CK(cudaDeviceSynchronize());
+            std::vector<float> got((size_t)3 * n_out);
+            CK(cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost));
+            double worst = 0.0;
+            for (uint32_t i = 0; i < 3; i++) {
+                std::vector<float> want;
+                ref_proj_pool(h, off_h[i], off_h[i + 1], w, nw, n_embd, n_out, want);
+                double ma;
+                const double rel = rel_rms(std::vector<float>(got.begin() + (size_t)i * n_out,
+                                                              got.begin() + (size_t)(i + 1) * n_out),
+                                           want, &ma);
+                if (rel > worst) { worst = rel; }
+            }
+            printf("%-44s worst rel_rms %.2e | %s\n", "3 items packed (1/349/40 rows)",
+                   worst, worst <= 1e-5 ? "ok" : "OUT OF BOUND");
+            if (!(worst <= 1e-5)) { fails++; }
+        }
+        cudaFree(dh); cudaFree(dnw); cudaFree(dy); cudaFree(dw);
+        cudaFree(dacc); cudaFree(doff);
     }
 
     /* ---- the IEEE half widening (P3.3 step 2) ------------------------------- */

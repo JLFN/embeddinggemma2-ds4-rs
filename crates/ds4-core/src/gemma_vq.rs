@@ -95,16 +95,32 @@ pub const ITEM_TOKENS_MAX: u32 = 2048;
 
 /// Total tokens over one batch's items: the row budget a batched embedding call
 /// may occupy in the tower's single workspace, and therefore the device memory
-/// a batch may ask for. The layout is exactly linear in rows at 108,548 bytes
-/// each (106.0 KiB: the tower's 27,136 f32 planes per row plus the 4-byte id,
-/// `ds4_eg2vq_gpu.cuh:72-99`), so 8192 rows is four times the single-item
-/// ceiling and 848.0 MiB of workspace -- checkable against the measured
-/// 212.01 MiB at max_tokens 2048 (docs/eg2vq-device-gate7.txt:407-411,
-/// :589-590), which is four times less.
+/// a batch may ask for. It is the thing unit 27 made reachable: before it, an
+/// array request paid one tower pass per item, and this number bound the sum
+/// without anything being able to use it.
+///
+/// The layout is exactly linear in rows at 116,748 bytes each (114.0 KiB: the
+/// tower's 27,648 f32 planes per row, the 4-byte id, the batch's 4 + 4 bytes of
+/// position/length metadata, and the projection's own 768-float output plane plus
+/// the pooled 768-float result plane the batch pools per item,
+/// `ds4_eg2vq_gpu.cuh`'s `eg2vq_gpu_layout_of`), plus the (rows + 1) item spans.
+/// So 8192 rows is four times the single-item ceiling and 912.13 MiB of
+/// workspace, checkable against the measured 228.03 MiB at 2048 rows
+/// (`tools/eg2_embed_batch_gate27.sh` prints both from the device oracle).
+///
+/// The same numbers were 108,548 bytes and 848.0 MiB before unit 27, and that
+/// arithmetic was already one plane stale: unit 25's image splice added the
+/// 512-float `in_soft` plane (2,048 bytes a row), which this comment and
+/// crates/ds4-core/tests/eg2vq_serving_caps.rs kept quoting at the pre-splice
+/// cost while the layout charged the new one. Unit 27's gate measures the
+/// workspace it actually allocates, which is why the correction is stated here
+/// rather than silently folded in.
 ///
 /// This is a POLICY of this port, not a file fact: nothing in the artifact
 /// states a batch width, so the number is declared here, stated in the serving
-/// caps and enforced by name where a request exceeds it.
+/// caps, mirrored by the C entry point's `DS4_EG2VQ_MAX_ROWS` (held equal by
+/// crates/ds4-core/tests/eg2vq_serving_caps.rs, which reads the header as text)
+/// and enforced by name where a request exceeds it.
 pub const BATCH_ROWS_MAX: u32 = 8192;
 
 /// The id the artifact's own vocabulary gives the image placeholder, and the

@@ -983,6 +983,20 @@ int ds4_bridge_eg2vq_embed(ds4_bridge_model *m, const int32_t *ids, uint32_t n_i
     return ds4_engine_embed_gemma_vq(m->engine, ids, n_ids, out768, err, errlen);
 }
 
+/* Unit 27: several items in one call.  The spans are the caller's (Rust builds
+ * them while it tokenizes), so this is only the family check and the call, like
+ * the one-item entry above; the engine owns every refusal. */
+int ds4_bridge_eg2vq_embed_batch(ds4_bridge_model *m, const int32_t *ids,
+                                 const uint32_t *item_off, uint32_t n_items,
+                                 uint32_t n_ids, float *out, char *err, size_t errlen) {
+    if (!m || !m->engine) {
+        set_err(err, errlen, "no model is open");
+        return 0;
+    }
+    return ds4_engine_embed_gemma_vq_batch(m->engine, ids, item_off, n_items, n_ids,
+                                           out, err, errlen);
+}
+
 /* Phase 8, unit 26: the image half of the entry above, and the vision tower's
  * rows it consumes.  Both are thin: the engine owns the arithmetic, the Rust
  * route owns the sequence. */

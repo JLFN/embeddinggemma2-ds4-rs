@@ -399,6 +399,42 @@ void ds4_eg2vq_ref_embed(const ds4_model *m, const ds4_weights *w,
     eg2vq_ref_embed_core(m, w, ids, n_ids, NULL, 0, out768);
 }
 
+/* The batch entry (unit 27): the items PACKED into one row block, each embedded
+ * by the SAME one-item core with its own ids and its own positions -- this loop
+ * is the whole of the CPU leg's batching, and it is deliberate.  The CPU path is
+ * this port's oracle (phase 4: 768 mean cosine 0.999996809 against the frozen
+ * anchor), so its job is to be the thing the device leg is measured against, not
+ * to be fast; looping the gated one-item core makes "the batch of one item IS the
+ * single-item call" true by construction here, which is exactly the property the
+ * device leg's packed kernels then have to reproduce.
+ *
+ * The reference itself batches its sequences into one ubatch
+ * (src/llama-batch.cpp:140-193 packs several sequences contiguously with
+ * per-token seq_id[] and pos[]) and masks between them
+ * (src/llama-graph.cpp:482-517), so a packed device call is the same computation;
+ * it is the DEVICE leg that has to keep the items apart explicitly (the
+ * item-relative key range in cuda/eg2vq_attn.cuh and the per-item pool in
+ * cuda/eg2vq_ops.cuh), because here each item simply runs alone. */
+void ds4_eg2vq_ref_embed_batch(const ds4_model *m, const ds4_weights *w,
+                               const int32_t *ids, const uint32_t *item_off,
+                               uint32_t n_items, uint32_t n_ids, float *out768) {
+    if (!m || !w || !ids || !item_off || !out768 || !n_items || !n_ids) {
+        ds4_die("gemma_vq: the batch entry needs items, ids and a span table");
+    }
+    if (item_off[0] != 0 || item_off[n_items] != n_ids) {
+        ds4_die("gemma_vq: the batch's spans do not cover its rows");
+    }
+    for (uint32_t i = 0; i < n_items; i++) {
+        const uint32_t r0 = item_off[i], r1 = item_off[i + 1u];
+        if (r1 <= r0) { ds4_die("gemma_vq: the batch has an empty item"); }
+        if (r1 - r0 > DS4_EG2VQ_MAX_TOKENS) {
+            ds4_die("gemma_vq: a batched item is past the attention key plane");
+        }
+        eg2vq_ref_embed_core(m, w, ids + r0, r1 - r0, NULL, 0,
+                             out768 + (size_t)i * (size_t)DS4_EG2VQ_N_OUT);
+    }
+}
+
 void ds4_eg2vq_ref_embed_image(const ds4_model *m, const ds4_weights *w,
                                const int32_t *ids, uint32_t n_ids,
                                const float *soft, uint32_t n_soft, float *out768) {

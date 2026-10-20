@@ -403,6 +403,17 @@ void ds4_bridge_v41_vision_rows_free(float *rows);
 int ds4_bridge_eg2vq_has_embed(ds4_bridge_model *m);
 int ds4_bridge_eg2vq_embed(ds4_bridge_model *m, const int32_t *ids, uint32_t n_ids,
                            float *out768, char *err, size_t errlen);
+/* Unit 27: several items in ONE call through ds4_engine_embed_gemma_vq_batch
+ * (ds4.h: the one-item refusals plus a span table that does not rise from 0 to
+ * n_ids, an item past the key plane, or rows past the batch budget).  `ids` is
+ * n_ids token ids with the items packed contiguously, `item_off` their n_items + 1
+ * spans, and `out` takes n_items * 768 floats -- the same vectors the call above
+ * returns for the same item alone, which is the contract the batch gate measures.
+ * The spans are Rust's, because Rust is where the request's items were tokenized;
+ * this call only carries them. */
+int ds4_bridge_eg2vq_embed_batch(ds4_bridge_model *m, const int32_t *ids,
+                                 const uint32_t *item_off, uint32_t n_items,
+                                 uint32_t n_ids, float *out, char *err, size_t errlen);
 /* Phase 8, unit 26: the same call with an image in the item, through
  * ds4_engine_embed_gemma_vq_image (ds4.h: its refusals are the text entry's
  * plus an image span that is not one contiguous run of n_soft placeholders).

@@ -132,6 +132,21 @@ typedef struct {
 void ds4_eg2vq_ref_embed(const struct ds4_model *m, const struct ds4_weights *w,
                          const int32_t *ids, uint32_t n_ids, float *out768);
 
+/* The CPU reference's BATCH entry (unit 27): the same forward, `n_items` items
+ * packed into `n_ids` contiguous rows with `item_off` the n_items + 1 spans
+ * (off[0] = 0, off[n_items] = n_ids), and `out768` taking
+ * n_items * DS4_EG2VQ_N_OUT floats, item i's vector at i * DS4_EG2VQ_N_OUT.
+ *
+ * It LOOPS the one-item reference above, item by item, deliberately: the CPU leg
+ * is this port's oracle, not its speed path (the device leg is), and looping the
+ * already-gated reference is what makes the two legs comparable at all -- the
+ * batch's whole claim is that a batched item's vector EQUALS its single-item
+ * vector.  The one-item entry is therefore bit-identical to the batch of one by
+ * construction here, and the device leg is measured against it. */
+void ds4_eg2vq_ref_embed_batch(const struct ds4_model *m, const struct ds4_weights *w,
+                               const int32_t *ids, const uint32_t *item_off,
+                               uint32_t n_items, uint32_t n_ids, float *out768);
+
 /* The image span's placeholder id, from the checkpoint's own config.json
  * (image_token_id 258880).  Its vocabulary string is "<|image|>", while the two
  * MARKERS the reference wraps the span with are "<|image>" = 255999 and
@@ -167,6 +182,18 @@ void ds4_eg2vq_ref_embed_image(const struct ds4_model *m, const struct ds4_weigh
  * truncated -- a plane that silently covered half an item would be a wrong
  * answer, not a slow one. */
 #define DS4_EG2VQ_MAX_TOKENS 2048u
+
+/* The row budget of the tower's ONE device workspace: how many rows all of one
+ * call's items may add up to (unit 27, the batch).  This is a POLICY of the port,
+ * not a file fact -- nothing in the artifact states a batch width -- and it is the
+ * number the serving caps advertise as `embed.batch_rows_max`
+ * (crates/ds4-core/src/gemma_vq.rs BATCH_ROWS_MAX, which this macro mirrors and
+ * crates/ds4-core/tests/eg2vq_serving_caps.rs holds equal by reading this header
+ * as text).  The workspace is linear in rows at 114,700 bytes each
+ * (ds4_eg2vq_gpu.cuh's layout: the tower's per-row planes, the batch metadata and
+ * the projection's own per-row planes), so the cap is 896.2 MiB of device
+ * workspace.  A call past it is refused by name, never truncated. */
+#define DS4_EG2VQ_MAX_ROWS 8192u
 
 /* ------------------------------------------------------------------------- *
  * The device path (embeddinggemma2-handoff.md PHASE 7, phase-doc rows
@@ -266,21 +293,38 @@ ds4_eg2vq_gpu_model *ds4_gpu_eg2vq_bind(const void *map, uint64_t size,
     const ds4_eg2vq_aux *aux, uint32_t aux_count);
 void ds4_gpu_eg2vq_unbind(ds4_eg2vq_gpu_model *model);
 
-/* Device bytes of the per-item workspace for an item of at most `max_tokens`
- * tokens (the handoff's PHASE 7 shape: one arena, reused by every item). */
-uint64_t ds4_gpu_eg2vq_workspace(uint32_t max_tokens);
-/* `max_tokens` <= 2048 (the attention kernel's key plane); 0 for a plan or a
+/* Device bytes of the workspace for a call whose items add up to at most
+ * `max_rows` rows (the handoff's PHASE 7 shape: one arena, reused by every call;
+ * the layout is linear in rows, ds4_eg2vq_gpu.cuh). */
+uint64_t ds4_gpu_eg2vq_workspace(uint32_t max_rows);
+/* `max_rows` <= DS4_EG2VQ_MAX_ROWS (the row budget; the ITEM ceiling is
+ * DS4_EG2VQ_MAX_TOKENS and is checked per item, at every call); 0 for a plan or a
  * size outside that. */
 ds4_eg2vq_gpu_ctx *ds4_gpu_eg2vq_create(const ds4_eg2vq_gpu_model *model,
-    uint64_t scratch, uint32_t max_tokens);
+    uint64_t scratch, uint32_t max_rows);
 void ds4_gpu_eg2vq_free(ds4_eg2vq_gpu_ctx *ctx);
 
 /* One item on the device: `n_ids` token ids (BOS..EOS, as the host's tokenizer
  * emits them) -> the mean-pooled, L2-normalized 768-dim vector, the same
  * function ds4_eg2vq_ref_embed computes on the CPU.  Returns 0 (and writes
- * nothing) for an empty item, an item longer than the context's max_tokens, or
- * a token id the embedding table cannot address. */
+ * nothing) for an empty item, an item longer than DS4_EG2VQ_MAX_TOKENS, or a
+ * token id the embedding table cannot address. */
 int ds4_gpu_eg2vq_embed(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids, uint32_t n_ids, float *out768);
+
+/* SEVERAL items in ONE call (unit 27): `n_items` items packed into one
+ * contiguous row block of `n_ids` rows, `item_off` their n_items + 1 spans, and
+ * `out768` taking n_items * DS4_EG2VQ_N_OUT floats (item i at i *
+ * DS4_EG2VQ_N_OUT).  Positions and item bounds are DERIVED from the spans here,
+ * so there is one statement about the block, not two.
+ *
+ * Returns 0 (and writes nothing) for the one-item refusals plus: n_items == 0,
+ * n_ids past the context's row budget, a span table that does not cover n_ids
+ * from 0, an empty item, or an item past DS4_EG2VQ_MAX_TOKENS.  Every item's own
+ * arithmetic is independent of the call's composition -- that is the batch's
+ * contract and what tools/eg2_embed_batch_gate27.sh measures. */
+int ds4_gpu_eg2vq_embed_batch(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
+                              const uint32_t *item_off, uint32_t n_items,
+                              uint32_t n_ids, float *out768);
 
 /* The image splice on the device: the same call, with the vision tower's
  * `n_soft` soft rows (DS4_EG2VQ_N_EMBD floats each) filling the positions the

@@ -1679,12 +1679,27 @@ fn embed_refuse<W: TerminalSink>(out: &mut W, cfg: &ServerConfig, msg: &str) -> 
     }
 }
 
+/// Unit 27: one prepared item of an embedding request -- the ids the tower will
+/// read, and, when the item carries an image, the image's own bytes and the
+/// soft-row count this engine's probe reported for them.  Preparing every item
+/// before embedding any is what lets the text items share one tower call.
+struct PreparedEmbedItem<'a> {
+    ids: Vec<i32>,
+    image: Option<(&'a crate::parse::RequestImage, u32)>,
+}
+
 /// Phase 6 row P2.3: the owner-side embedding run.  Runs on the thread that holds the
-/// engine (the same `&mut dyn DecodeIo` that generation uses), one item at a
-/// time, in request order: prefix + text -> ids (`embed_item_ids`, the
-/// artifact's BOS/EOS flags) -> the tower (`embed_gemma_vq`) -> optional
-/// Matryoshka truncation (`ds4_core::mrl_truncate`).  This is exactly the CLI's
-/// `run_embed` path, so the two cannot disagree.
+/// engine (the same `&mut dyn DecodeIo` that generation uses), in request order:
+/// prefix + text -> ids (`embed_item_ids`, the artifact's BOS/EOS flags) -> the
+/// tower -> optional Matryoshka truncation (`ds4_core::mrl_truncate`).  This is
+/// exactly the CLI's `run_embed` path, so the two cannot disagree.
+///
+/// Unit 27 (row P2.3's last slice): the tower half is now TWO passes -- every
+/// item prepared first, then the text items through ONE batched call
+/// (`embed_gemma_vq_batch`, the packed row block of `ds4_eg2vq_gpu.cuh`) and each
+/// media item through its own (`embed_gemma_vq_image`).  A batched item's vector
+/// IS its single-item vector (that is the batch's contract), so the response is
+/// the same text the one-item loop produced.
 fn run_embed<W: TerminalSink>(
     cfg: &ServerConfig,
     embed: EmbedRequest,
@@ -1723,7 +1738,12 @@ fn run_embed<W: TerminalSink>(
             Settlement::CANCELED
         };
     }
-    let mut data = String::new();
+    // Unit 27: an embedding request is prepared in full -- every item's ids (the
+    // reference's own sequence for a text item, the image splice for a media one)
+    // and every caps check -- and only then embedded, because the TEXT items
+    // share one tower call (several items in one packed row block,
+    // `embed_gemma_vq_batch`) while the media ones each keep their own.
+    let mut prepared: Vec<PreparedEmbedItem<'_>> = Vec::with_capacity(embed.inputs.len());
     let mut total_tokens: usize = 0;
     for (i, item) in embed.inputs.iter().enumerate() {
         // Phase 8 unit 26: an item with an image runs the engine's own order --
@@ -1828,21 +1848,64 @@ fn run_embed<W: TerminalSink>(
                 );
             }
         }
-        let vector = match &item.image {
-            Some(image) => {
-                let rows = match engine.vision_encode_rows(&image.data, image_rows) {
-                    Ok(rows) => rows,
-                    Err(e) => return embed_fail(out, cfg, &e.to_string()),
-                };
-                match engine.embed_gemma_vq_image(&ids, &rows) {
-                    Ok(v) => v,
-                    Err(e) => return embed_fail(out, cfg, &e.to_string()),
-                }
-            }
-            None => match engine.embed_gemma_vq(&ids) {
-                Ok(v) => v,
-                Err(e) => return embed_fail(out, cfg, &e.to_string()),
-            },
+        // Unit 27: the vectors are computed AFTER every item is prepared, so the
+        // text items can share ONE tower call (below); prepare the ids and the
+        // caps checks here.
+        prepared.push(PreparedEmbedItem {
+            ids,
+            image: item.image.as_ref().map(|image| (image, image_rows)),
+        });
+    }
+    // Unit 27: the text items go through the tower in ONE batch call -- their
+    // ids laid end to end in request order, with the spans the tokenizer just
+    // produced -- and each item with an image keeps its own call: the device
+    // holds ONE vision workspace per engine (the media path is serial by design,
+    // `embed.image.serial`), and the tower call is the cheap half of a media item
+    // next to its encoder.
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; prepared.len()];
+    let text_items: Vec<usize> = prepared
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.image.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if !text_items.is_empty() {
+        let mut ids: Vec<i32> = Vec::new();
+        let mut item_off: Vec<u32> = Vec::with_capacity(text_items.len() + 1);
+        item_off.push(0);
+        for &i in &text_items {
+            ids.extend_from_slice(&prepared[i].ids);
+            item_off.push(ids.len() as u32);
+        }
+        let batch = match engine.embed_gemma_vq_batch(&ids, &item_off) {
+            Ok(v) => v,
+            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+        };
+        for (k, &i) in text_items.iter().enumerate() {
+            let at = k * ds4_core::GEMMA_VQ_OUT_DIM;
+            vectors[i] = Some(batch[at..at + ds4_core::GEMMA_VQ_OUT_DIM].to_vec());
+        }
+    }
+    for (i, item) in prepared.iter().enumerate() {
+        let Some((image, image_rows)) = item.image else {
+            continue;
+        };
+        let rows = match engine.vision_encode_rows(&image.data, image_rows) {
+            Ok(rows) => rows,
+            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+        };
+        match engine.embed_gemma_vq_image(&item.ids, &rows) {
+            Ok(v) => vectors[i] = Some(v),
+            Err(e) => return embed_fail(out, cfg, &e.to_string()),
+        }
+    }
+    let mut data = String::new();
+    for (i, vector) in vectors.into_iter().enumerate() {
+        // A vector per prepared item: the batch fills the text items, the loop
+        // above fills the media ones, and this is the one place the two meet, so
+        // a gap is a bug rather than a shape a caller could ask for.
+        let Some(vector) = vector else {
+            return embed_fail(out, cfg, &format!("input[{i}] produced no embedding"));
         };
         let vector = match embed.dimensions {
             Some(d) => match ds4_core::mrl_truncate(vector, d) {
