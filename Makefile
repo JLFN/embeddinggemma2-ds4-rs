@@ -315,7 +315,7 @@ proof-rust-cuda-opp-c: ds4 ds4-c
 			--work-dir "$$root/rust" --check-expected "$$expected"
 endif
 
-ds4.o: ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS) ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_mimo2_graph.inc ds4_mimo2_batch.inc ds4_mimo2_session.inc ds4_mimo2_mtp.inc ds4_mimo2_media.inc ds4_mimo2_payload.inc ds4_mimo2_dflash.inc cuda/mimo2_dflash_host.h ds4_dots3_batch.inc ds4_dots3_mtp.inc ds4_step37_graph.inc ds4_step37_vision.inc ds4_ling3vl_graph.inc ds4_ling3vl_vision.inc ds4_ling3vl_rope.h ds4_ling3vl_batch.inc ds4_eg2vq_graph.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h ds41_forward.h ds41_kvfmt.h ds4_ds41_forward.inc vendor/stb_image.h ds4_ds41_sample.inc ds4_ds41_graph.inc ds4_ds41_draft.inc ds4_ds41_vision.inc
+ds4.o: ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS) ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_mimo2_graph.inc ds4_mimo2_batch.inc ds4_mimo2_session.inc ds4_mimo2_mtp.inc ds4_mimo2_media.inc ds4_mimo2_payload.inc ds4_mimo2_dflash.inc cuda/mimo2_dflash_host.h ds4_dots3_batch.inc ds4_dots3_mtp.inc ds4_step37_graph.inc ds4_step37_vision.inc ds4_ling3vl_graph.inc ds4_ling3vl_vision.inc ds4_ling3vl_rope.h ds4_ling3vl_batch.inc ds4_eg2vq_graph.inc ds4_eg2vq_vision.h ds4_eg2vq_vision_bind.inc ds4_eg2vq_vision_graph.inc ds4_resize_pillow.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h ds41_forward.h ds41_kvfmt.h ds4_ds41_forward.inc vendor/stb_image.h ds4_ds41_sample.inc ds4_ds41_graph.inc ds4_ds41_draft.inc ds4_ds41_vision.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 # Rust FFI seam: wraps ds4.h so crates/ds4-sys never bindgens the engine header.
@@ -620,8 +620,15 @@ tests/parity/tokenizer_c_oracle: tests/parity/tokenizer_c_oracle.c ds4.c ds4.h n
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
 
-tests/parity/eg2vq_embd_c_oracle: tests/parity/eg2vq_embd_c_oracle.c ds4.c ds4.h ds4_eg2vq_graph.inc native/bridge/ds4_host_load.h
+tests/parity/eg2vq_embd_c_oracle: tests/parity/eg2vq_embd_c_oracle.c ds4.c ds4.h ds4_eg2vq_graph.inc ds4_eg2vq_vision.h ds4_eg2vq_vision_bind.inc ds4_eg2vq_vision_graph.inc ds4_resize_pillow.inc native/bridge/ds4_host_load.h
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+# The vision oracle is -O3 even here: its tower is 240 GFLOP per image, so the
+# -O0 its siblings use would take minutes instead of seconds.  Gate 23
+# (tools/eg2_vision_gate23.sh) compiles its own copy with this same flag set.
+tests/parity/eg2vq_vision_c_oracle: tests/parity/eg2vq_vision_c_oracle.c ds4.c ds4.h ds4_eg2vq_graph.inc ds4_eg2vq_vision.h ds4_eg2vq_vision_bind.inc ds4_eg2vq_vision_graph.inc ds4_resize_pillow.inc native/bridge/ds4_host_load.h
+	$(CC) $(CFLAGS) -O3 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
 
 tests/parity/agent_c_oracle: tests/parity/agent_c_oracle.c ds4_agent.c
@@ -834,7 +841,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c $(IQUEST_NATIVE_INCS) ds4_naive_bind.inc ds4_naive_plan.h ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_eg2vq_graph.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c $(IQUEST_NATIVE_INCS) ds4_naive_bind.inc ds4_naive_plan.h ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_eg2vq_graph.inc ds4_eg2vq_vision.h ds4_eg2vq_vision_bind.inc ds4_eg2vq_vision_graph.inc ds4_resize_pillow.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 # Native checkpoint changes must reach incremental production/test builds.
