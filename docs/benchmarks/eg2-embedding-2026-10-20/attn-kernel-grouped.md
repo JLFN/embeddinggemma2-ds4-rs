@@ -341,9 +341,8 @@ EG2_EMBED_SERVER=$PWD/../../ds4-server EG2_EMBED_CLI=$PWD/../../ds4 \
 Building either probe against the CURRENT header instead compiles and runs but
 fails its own anchor (probe-attn: `V0 IS NOT THE SHIPPED KERNEL`, five shapes,
 exit 1; probe-attn-grp: `ON=0 IS NOT THE SHIPPED KERNEL`, six shapes, exit 1):
-the
-shipped launcher runs the grouped form for head_dim 256/512 now, so a probe whose
-baseline is the lane-per-key body can only be the pre-change instrument its
+the shipped launcher runs the grouped form for head_dim 256/512 now, so a probe
+whose baseline is the lane-per-key body can only be the pre-change instrument its
 committed output says it is.
 
 Files: `attn-ablation.txt` (the ablation), `attn-grouped-probe.txt` (the
