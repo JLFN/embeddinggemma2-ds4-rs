@@ -166,7 +166,7 @@ which is what bit-identity predicts — device steady state 2,060.9 tokens/s and
 figure, `docs/eg2vq-device-gate7.txt:461`: 1,499.0 tokens/s steady state for the
 unoptimized device tower. Both sides are therefore cross-window, a day apart, and
 this row is corroboration, not the claim: the claim is the interleaved bench and
-the interleaved corpus above. (The attention unit's handoff quoted 1,499.6 for
+the interleaved corpus above. (The attention unit's own QA report quoted 1,499.6 for
 its own re-run and two other readings of the shipped kernel were seen while this
 unit was in flight — 2,048.6 and 2,008.9 tokens/s — but neither is backed by a
 committed raw file, so only the cited pair is used here.)
