@@ -1,0 +1,16 @@
+# probe-vq — ablation of eg2vq_vq_gemm_kernel, 15 repeats per row
+# V0 base | V1 one x load/4 tokens | V2 no gather | V3 FMA-only(UB) | V4 loads-only | V5 x block-uniform
+shape              rows  tokens  var     ms_med    gflop/s         V1         V2         V4         V5
+k/v_proj_s          512     306  all     0.0594     2701.2      2.00x      1.08x      1.02x      2.36x
+k/v_proj_s          512     306   V3     0.0051    31334.4   (V3 = upper bound only, ptxas CSEs it)
+k/v_proj_s          512    4520  all     0.5746     4124.5      2.47x      1.09x      1.01x      3.47x
+k/v_proj_s          512    4520   V3     0.0369    64284.4   (V3 = upper bound only, ptxas CSEs it)
+ffn_gate_s         2048     306  all     0.1649     3892.5      1.99x      1.08x      1.01x      2.88x
+ffn_gate_s         2048     306   V3     0.0126    51028.0   (V3 = upper bound only, ptxas CSEs it)
+ffn_gate_s         2048    4520  all     2.1699     4368.6      2.59x      1.08x      1.00x      3.64x
+ffn_gate_s         2048    4520   V3     0.1402    67630.8   (V3 = upper bound only, ptxas CSEs it)
+ple_model_proj    12288     306  all     0.9318     4132.0      2.45x      1.09x      1.02x      3.49x
+ple_model_proj    12288     306   V3     0.0665    57903.8   (V3 = upper bound only, ptxas CSEs it)
+ple_model_proj    12288    4520  all    13.1676     4319.3      2.63x      1.02x      0.94x      3.66x
+ple_model_proj    12288    4520   V3     0.9338    60905.2   (V3 = upper bound only, ptxas CSEs it)
+PROBE_VQ_OK
