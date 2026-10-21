@@ -11,7 +11,7 @@ row                 old_r1     old_r2     old_r3     old_r4     new_r1     new_r
 srv_batch_1       11.2924    10.9453    11.1772    11.2254     8.5732     8.7262    1.29x
 srv_batch_2        9.6088     9.3714     9.5059     9.6180     7.1761     7.2315    1.32x
 srv_batch_4        8.8601     8.5800     8.7378     8.7341     6.7148     6.5862    1.31x
-srv_batch_8        8.5083     8.2726     8.4570     8.4492     6.4559     6.3480    1.31x
+srv_batch_8        8.5083     8.2726     8.4570     8.4492     6.4559     6.3480    1.32x
 srv_batch_14       0.5302     0.4842     0.4916     0.4934     0.3859     0.3683    1.33x  (partial, 14 items)
 
 # tokens per second over the corpus
@@ -23,5 +23,5 @@ srv_batch_14       0.5302     0.4842     0.4916     0.4934     0.3859     0.3683
 # new r2   batch 1 9253.414   batch 2 11166.03   batch 4 12259.98   batch 8 12720.11   batch 14 13824.40
 
 # paired, each new run against the old runs measured immediately around it:
-#   new r1 / mean(old r2, old r3) = 8.365 / 6.456 = 1.30x
-#   new r2 / mean(old r3, old r4) = 8.453 / 6.348 = 1.33x
+#   mean(old r2, old r3) / new r1 = 8.365 / 6.456 = 1.30x
+#   mean(old r3, old r4) / new r2 = 8.453 / 6.348 = 1.33x

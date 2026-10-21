@@ -89,7 +89,7 @@
  * shipped kernel (docs/benchmarks/eg2-embedding-2026-10-20/probes/probe-attn.cu,
  * one component removed per variant, every variant register-neutral) put the
  * cost there and nowhere else: the K address made block-uniform -- one line
- * instead of 32, same instruction count -- was 2.05x-2.25x, the K operand taken
+ * instead of 32, same instruction count -- was 1.86x-2.25x, the K operand taken
  * out of memory altogether 2.25x-2.66x, while the exponentials (0.95x-1.05x),
  * the score plane's write side (1.01x-1.07x) and its read side (1.00x-1.08x)
  * each measured free, and pass 1 plus the row max was 1.37x-1.67x of the total.
@@ -107,11 +107,13 @@
  * table): 2.27x and 2.39x at head_dim 256 with LAB=4 (294 and 565 tokens), 2.31x
  * at 1414, 2.06x on an 8x565 packed block, and 2.53x / 2.01x at head_dim 512
  * with LAB=8.  The (8,8) and (16,8) pairings, which trade keys in flight for a
- * shorter butterfly, measured 1.66x-1.76x and 1.50x-1.80x and were rejected.
+ * shorter butterfly, measured 1.37x-1.75x and 1.50x-1.80x and were rejected.
  * The grouped form is not bit-identical to the lane-per-key form: the two agree
  * to cosine 1.000000000 with a maximum element-wise relative difference of
- * 2.4e-06-6.5e-06, inside what the gates bound (`make test-eg2vq-attn` and the
- * gate-7 oracle's declared cos 0.999999950 / rel_rms 3.150e-04).
+ * 2.3e-06-6.5e-06, inside what the gates bound (`make test-eg2vq-attn` allows a
+ * per-head cosine down to 1 - 1e-6 and a relative RMS up to 1e-5; the gate-7
+ * oracle declares cos >= 0.999999 / rel_rms <= 1e-03 and measures 0.999999950 /
+ * 3.149e-04 on this change).
  */
 #pragma once
 #include <cuda_runtime.h>
@@ -272,7 +274,7 @@ __global__ void eg2vq_attn_kernel(
      * what every other shape uses.  The two forms do NOT agree bit for bit --
      * the grouped form sums the head's terms as LAB partial sums reduced by a
      * butterfly instead of as the four chains of eg2vq_attn_dot4 alone -- and
-     * the gates bound that difference (measured 2.4e-06 to 6.5e-06 maximum
+     * the gates bound that difference (measured 2.3e-06 to 6.5e-06 maximum
      * element-wise relative, cosine 1.000000000 against the lane-per-key form).
      */
     float m = -FLT_MAX;

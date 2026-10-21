@@ -39,7 +39,7 @@ is free (V6) and its read side is free (V5), and pass 2 as a whole is free (V7
 vs V8) — the whole softmax structure costs nothing. Pass 1 plus the row max is
 60-73% of the kernel (V7/V8). Inside pass 1 the cost is one thing: the K load's
 address pattern. Making that address block-uniform — same instruction count,
-same FMA count, one 128 B line per warp load instead of 32 — is 2.05x-2.25x
+same FMA count, one 128 B line per warp load instead of 32 — is 1.86x-2.25x
 (V1); removing the K operand from memory entirely is 2.25x-2.66x (V2), i.e. once
 the K access is one line the remaining K cost is a fraction of the whole. V9 is
 an upper bound and is labelled as one: removing every component also removes the
@@ -75,17 +75,23 @@ measured twice in the same run:
 | batch8x565_s | 1.37x | **2.06x** | | | | |
 
 Every row agrees to cosine 1.000000000 with a maximum element-wise relative
-difference of 2.4e-06 to 6.5e-06. The wider pairings (`GS = 16`, i.e. LAB=4 at
+difference of 2.3e-06 to 6.5e-06. The wider pairings (`GS = 16`, i.e. LAB=4 at
 256 and LAB=8 at 512) win on both head dims: more of the key per lane means more
 keys in flight per chunk (KC = 32/LAB is 8 and 4, against 4 and 2), a shorter
 butterfly per key, and one predicated store per chunk instead of one per key.
 The narrow pairings are recorded here because they were measured: 1.37x-1.80x.
+The `xS` column divides each variant by the run's FIRST shipped measurement
+(`S-a`), not by the mean of the two; the mean-based value differs by 1-4% on the
+slower variants (max1414_s's `(8,8)` reads 1.66x this way and 1.62x against the
+mean).
 
 One instrument trap is worth keeping. The first version of this probe strided a
 lane's chunks by `4*GS` instead of `4*LAB`, which happens to be right only when
-`LAB == GS`; it built, ran, and produced a plausible-looking 2.4x-2.6x for the
-wrong (LAB=4) and (LAB=16) pairings with cosine 0.03-0.24 against the shipped
-output. `attn-grouped-probe-spanbug.txt` is that run, kept for the same reason
+`LAB == GS`; it built, ran, and produced plausible-looking speedups for the wrong
+pairings -- (LAB=4, GS=16) at 2.41x-2.60x and (LAB=8, GS=16) at 2.12x-2.59x,
+while the (LAB=16, GS=8) rows read only 1.43x-1.90x -- with cosine 0.02-0.24
+against the shipped output. `attn-grouped-probe-spanbug.txt` is that run, kept
+for the same reason
 the GEMM unit kept its spilling probe: a wrong instrument that looks fast is the
 failure mode, and the cosine column is what caught it. The probe then got the
 `static_assert`s on the header's geometry that `probe-vq.cu` taught the last
@@ -121,7 +127,7 @@ unit to carry.
 The grouped form is not bit-identical to the lane-per-key form: it sums a head's
 terms as `LAB` partial sums reduced by a butterfly, where the shipped form uses
 its four chains alone. The measured difference is cosine 1.000000000 with a
-maximum element-wise relative difference of 2.4e-06-6.5e-06 (probe), and the gate
+maximum element-wise relative difference of 2.3e-06-6.5e-06 (probe), and the gate
 itself reads `rel` 3.31e-07 to 9.73e-07 with `mincos 1.000000000` on all nine
 cases.
 
@@ -155,8 +161,10 @@ old-then-new; both pairings are published because a sweep drifts.
 
 The conservative headline is 1.94x-2.61x (round 1: 1.95x-2.61x; round 2:
 1.94x-2.57x), the floor being `cli115_s`, the smallest shape, where one launch is
-a larger share of the row. Effective rate, from the same table's GFLOP/s column:
-869-1,496 GFLOP/s before, 1,881-3,473 after.
+a larger share of the row. Effective rate, recomputed from the two raw runs'
+own `gflop/s` column (the table above carries milliseconds): 869-1,498 GFLOP/s
+before (the maxima are 1,496.7 in round 1 and 1,498.4 in round 2), 1,881-3,473
+after.
 
 ### 4.2 The corpus, six sweeps interleaved
 
@@ -171,22 +179,34 @@ corpus, and is marked as such.
 | batch 1 | 11.2924 | 10.9453 | 11.1772 | 11.2254 | 8.5732 | 8.7262 | 1.29x |
 | batch 2 | 9.6088 | 9.3714 | 9.5059 | 9.6180 | 7.1761 | 7.2315 | 1.32x |
 | batch 4 | 8.8601 | 8.5800 | 8.7378 | 8.7341 | 6.7148 | 6.5862 | 1.31x |
-| batch 8 | 8.5083 | 8.2726 | 8.4570 | 8.4492 | 6.4559 | 6.3480 | 1.31x |
+| batch 8 | 8.5083 | 8.2726 | 8.4570 | 8.4492 | 6.4559 | 6.3480 | 1.32x |
 | batch 14 (partial) | 0.5302 | 0.4842 | 0.4916 | 0.4934 | 0.3859 | 0.3683 | 1.33x |
 
 Tokens/s over the corpus: 7,150-7,377 (batch 1) to 9,490-9,761 (batch 8) before,
-9,253-9,418 to 12,507-12,720 after. Pairing each new run against the old runs
-measured immediately around it: new r1 / mean(old r2, r3) = 8.365/6.456 = 1.30x,
-new r2 / mean(old r3, r4) = 8.453/6.348 = 1.33x.
+9,253-9,418 to 12,507-12,720 after. The speedup column above is the ratio of the
+four-old-runs mean to the two-new-runs mean, rounded to two decimals (batch 1
+1.29023 -> 1.29x, batch 2 1.32237 -> 1.32x, batch 4 1.31238 -> 1.31x, batch 8
+1.31551 -> 1.32x, batch 14 1.32562 -> 1.33x). Pairing each new run against the
+old runs measured immediately around it:
+mean(old r2, old r3) / new r1 = 8.365/6.456 = 1.30x,
+mean(old r3, old r4) / new r2 = 8.453/6.348 = 1.33x.
 
 Cross-window, and labelled as such: the previous unit's record carries the
 pre-GEMM batch-8 figure of 18.7998 s (4,295 tokens/s) from the attention unit's
-own corpus sweep. Against that, today's 6.40 s / 12,507-12,720 tokens/s is 2.9x,
-and the three units' own interleaved deltas multiply out to 1.63 (attention) x
-1.25 (GEMM) x 1.31 (this one) = 2.7x. The two figures differ because today's
-machine is faster than the window the 18.7998 was taken in — the same reason the
-old build measures 8.42 s here and 8.89 s in the previous unit's record. Neither
-cross-window product is evidence on its own; the interleaved 1.31x is.
+own corpus sweep. Against that, today's 6.40 s / 12,507-12,720 tokens/s is 2.9x.
+The three units' published factors do not reconstruct that number exactly, and
+none of them was measured in one window with the others: the attention unit's
+own factor is 1.61x, recomputed here from the committed CSVs rather than quoted
+(`speed-bench/eg2_embed_vizzio.csv` 18.799776866 s at batch 8 against 11.654060797
+/ 11.717910747 / 11.658361879 s in its three `eg2_embed_vizzio_attn-vec4` runs,
+i.e. 1.6131 / 1.6044 / 1.6126); the GEMM's is 1.20x-1.25x pooled, 1.25x at the top
+of that range; this one is 1.32x. 1.61 x 1.25 x 1.32 = 2.66x, against the 2.94x
+the two endpoints give and the 2.7x the previous record published. Every one of
+those products is a cross-window figure and is labelled as one here: the machine's
+own state moved between the windows (today's old build measures 8.42 s at batch 8
+where the previous unit's record carries 8.89 s for the same code), so the only
+number in this section that is evidence on its own is this unit's interleaved
+1.32x.
 
 ### 4.4 Where a whole forward's time goes now
 
@@ -198,8 +218,8 @@ items, 2451 tokens, one request through `ds4-server`), taken after the change:
 |---|---|---|
 | `eg2vq_vq_gemm_kernel` | 139.2 ms (48.4%), 434 launches | 126.9 ms (64.3%), 434 launches |
 | `eg2vq_attn_kernel` (both head dims) | 116.7 ms (40.5%) | 46.0 ms (23.3%): `<(int)4>` 31.9 ms / 40 launches, `<(int)8>` 14.1 ms / 8 launches |
-| the small ops (`rms`, `rms_head`, `proj768`, `add`, `gelu`, `scale`, `rope`, ...) | ~31.9 ms (11.1%) | 24.3 ms (12.3%) |
-| total kernel time | 287.8 ms | 197.3 ms |
+| the small ops (`rms`, `rms_head`, `proj768`, `add`, `gelu`, `scale`, `rope`, ...) | ~31.9 ms (11.1%) | 24.5 ms (12.4%) |
+| total kernel time | 287.8 ms | 197.5 ms |
 
 The GEMM row moved too (139.2 -> 126.9 ms) with its code unchanged, which is the
 same caution the previous record carries: a cross-window profile delta is not
@@ -220,9 +240,13 @@ forward's kernel time and attention 23%, against 48% and 40% before.
   `phase7-ids300.tsv` -> `EG2VQ_GPU_PASS`, `min cos(device, cpu) 0.999999950`,
   `max rel_rms 3.149e-04` against the declared `cos >= 0.999999`,
   `rel_rms <= 1e-03`; device 2,230.5 tokens/s (steady state 2,232.8), 91.8x the
-  in-process `-O0` CPU reference. These are the same numbers the previous unit's
-  record carries (0.999999950 / 3.150e-04), i.e. the attention change moved the
-  tower's output by less than the fifth decimal of that budget.
+  in-process `-O0` CPU reference. The parity figures are the same to three
+  significant figures as the previous unit's record carries (this run
+  0.999999950 / 3.149e-04 against that record's 0.999999950 / 3.150e-04), i.e.
+  the attention change moved the tower's output by less than the fifth decimal
+  of that budget; the tokens/s beside them move with the window (this run's own
+  committed output reads 2,230.5 / 2,232.8, a re-run during the QA pass read
+  2,144.7 / 2,146.5 for the same binary).
 
 ## 5. What this does NOT prove
 
@@ -266,27 +290,20 @@ forward's kernel time and attention 23%, against 48% and 40% before.
 ## 7. Reproduce
 
 ```sh
+# --- from the ENGINE ROOT (ds4-rs/) -----------------------------------------
 # the gate (now 9 arithmetic cases + the edge, packed and refusal cases)
 make test-eg2vq-attn                             # EG2VQ_ATTN_PASS
 /usr/local/cuda/bin/compute-sanitizer --tool memcheck --error-exitcode 7 ./tests/test_eg2vq_attn
 
 # the tower gate (~7 min)
 make tests/parity/eg2vq_embd_gpu_oracle
-./tests/parity/eg2vq_embd_gpu_oracle \
+DS4_LOCK_FILE=/tmp/ds4.lock.attn ./tests/parity/eg2vq_embd_gpu_oracle \
     /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
     /data/embeddinggemma2/out/phase7-ids300.tsv
 
-# the ablation and the candidate probe, as committed
-nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
-     -Xcompiler -march=native -Xcompiler -pthread -I/data/embeddinggemma2/ds4-rs \
-     -o /tmp/probe-attn probes/probe-attn.cu && /tmp/probe-attn 20
-nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
-     -Xcompiler -march=native -Xcompiler -pthread -I/data/embeddinggemma2/ds4-rs \
-     -o /tmp/probe-attn-grp probes/probe-attn-grp.cu && /tmp/probe-attn-grp 20
-
 # the interleaved kernel A/B: the old binary comes from the pre-change header
 mkdir -p /tmp/ab-before/cuda /tmp/ab-before/tests
-cp attn-before.cuh.txt /tmp/ab-before/cuda/eg2vq_attn.cuh
+cp docs/benchmarks/eg2-embedding-2026-10-20/attn-before.cuh.txt /tmp/ab-before/cuda/eg2vq_attn.cuh
 cp tests/bench_eg2vq_attn.cu /tmp/ab-before/tests/
 nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
      -Xcompiler -march=native -Xcompiler -pthread -I. \
@@ -295,25 +312,47 @@ make tests/bench_eg2vq_attn
 /tmp/bench-attn-old 30 > attn-ab-old-r1.txt ; ./tests/bench_eg2vq_attn 30 > attn-ab-new-r1.txt
 /tmp/bench-attn-old 30 > attn-ab-old-r2.txt ; ./tests/bench_eg2vq_attn 30 > attn-ab-new-r2.txt
 
+# --- from the BENCHMARK DIRECTORY (ds4-rs/docs/benchmarks/eg2-embedding-2026-10-20/) ---
+# the ablation and the candidate probe, AS MEASURED: both anchor their baseline
+# to the header on the include path, so they must be built against the PRE-change
+# header -- the same one the A/B stages -- or their own "V0 is not the shipped
+# kernel" check fires and the numbers are of a different kernel.  This is the
+# same requirement vq-gemm-rows.md records for probe-r8.cu and probe-big.cu.
+mkdir -p /tmp/ab-attn/cuda && cp attn-before.cuh.txt /tmp/ab-attn/cuda/eg2vq_attn.cuh
+nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
+     -Xcompiler -march=native -Xcompiler -pthread -I/tmp/ab-attn \
+     -o /tmp/probe-attn probes/probe-attn.cu && /tmp/probe-attn 20
+nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
+     -Xcompiler -march=native -Xcompiler -pthread -I/tmp/ab-attn \
+     -o /tmp/probe-attn-grp probes/probe-attn-grp.cu && /tmp/probe-attn-grp 20
+
 # the interleaved corpus A/B (one fresh server per sweep, ports must be FREE:
 # the sweep's own health probe cannot tell another listener from ds4-server)
 EG2_EMBED_SERVER=/tmp/ab-before/bin/ds4-server EG2_EMBED_CLI=/tmp/ab-before/bin/ds4 \
-  EG2_EMBED_CSV=/tmp/attn-ab-old.csv sh speed-bench/eg2_embed_sweep.sh \
+  EG2_EMBED_CSV=/tmp/attn-ab-old.csv sh ../../speed-bench/eg2_embed_sweep.sh \
   <artifact.gguf> /data/embeddinggemma2/out/live-demo/pages 8121
-EG2_EMBED_SERVER=$PWD/ds4-server EG2_EMBED_CLI=$PWD/ds4 \
-  EG2_EMBED_CSV=/tmp/attn-ab-new.csv sh speed-bench/eg2_embed_sweep.sh \
+EG2_EMBED_SERVER=$PWD/../../ds4-server EG2_EMBED_CLI=$PWD/../../ds4 \
+  EG2_EMBED_CSV=/tmp/attn-ab-new.csv sh ../../speed-bench/eg2_embed_sweep.sh \
   <artifact.gguf> /data/embeddinggemma2/out/live-demo/pages 8120
 ```
+
+Building either probe against the CURRENT header instead compiles and runs but
+fails its own anchor (`V0 IS NOT THE SHIPPED KERNEL`, five shapes, exit 1): the
+shipped launcher runs the grouped form for head_dim 256/512 now, so a probe whose
+baseline is the lane-per-key body can only be the pre-change instrument its
+committed output says it is.
 
 Files: `attn-ablation.txt` (the ablation), `attn-grouped-probe.txt` (the
 candidate) and `attn-grouped-probe-spanbug.txt` (the first version of it, kept as
 the wrong-instrument example), `probes/probe-attn.cu`, `probes/probe-attn-grp.cu`,
 `attn-ab-{old,new}-r{1,2}.txt` (the kernel bench raw), `attn-ab-sweep.txt` (the
 joined corpus table), `speed-bench/eg2_embed_vizzio_attn-ab-{old,new}-r{1,2}.csv`
-plus the `-r{3,4}` old runs and their `_health.json`, `gate7-embd-attn-grouped.txt`,
+plus the `-r{3,4}` old runs and their `_health.json` (all six health readouts are
+the same caps payload, byte for byte — they identify the port and the caps, not
+the build, which is what the sweep writes), `gate7-embd-attn-grouped.txt`,
 `nsys-kern-sum-b8-attn-grouped.txt` (`nsys stats --report cuda_gpu_kern_sum` of one
-batch-8 forward), `attn-before.cuh.txt` (the pre-change header the old binary is
-built from).
+batch-8 forward), `attn-before.cuh.txt` (the pre-change header the old binary and
+both probes are built from).
 
 Two traps this unit paid for, both worth keeping:
 
@@ -327,10 +366,21 @@ Two traps this unit paid for, both worth keeping:
   leftover debug server of my own held the `DS4_LOCK_FILE`, so no server could
   start and the log said `another ds4 process is already running`.
 - **An ablation probe's variant can look fast and be wrong.** The `4*GS` stride
-  bug above produced 2.4x-2.6x on two pairings at cosine 0.03-0.24. Every probe
+  bug above produced 2.41x-2.60x on the `(LAB=4, GS=16)` pairing and 2.12x-2.59x
+  on `(LAB=8, GS=16)`, at cosine 0.02-0.24. Every probe
   here prints its agreement against the shipped kernel for exactly this reason,
   and the grouped probe's `ON=0` is checked byte for byte against the shipped
   launcher.
+- **A probe anchored to the live header stops meaning what its committed output
+  says the moment that header's behaviour changes.** Both probes here anchor
+  their baseline to whatever `cuda/eg2vq_attn.cuh` says at compile time, which
+  is what makes them trustworthy before a change and what makes them fail
+  afterwards: after this unit they must be compiled against the PRE-change
+  header (`attn-before.cuh.txt`, staged into the include path ahead of the
+  repo), exactly as `vq-gemm-rows.md` requires of `probe-r8.cu` and
+  `probe-big.cu`. The QA pass caught this by running section 7's commands as
+  written and getting `PROBE_ATTN_FAIL` / `PROBE_ATTN_GRP_FAIL` with
+  "V0 IS NOT THE SHIPPED KERNEL" on every shape.
 
 ## 8. Rule-19 QA pass
 
