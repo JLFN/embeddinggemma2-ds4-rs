@@ -249,6 +249,49 @@ forward's kernel time and attention 23%, against 48% and 40% before.
   committed output reads 2,230.5 / 2,232.8, a re-run during the QA pass read
   2,144.7 / 2,146.5 for the same binary).
 
+### 4.6 The error the change moved, measured the same way
+
+The gate above says the kernel still agrees with the reference; it does not say
+whether this change moved the error up. Both binaries were built in one sitting
+from the same test source (`tests/test_eg2vq_attn.cu`): the before binary from
+`cuda/eg2vq_attn.cuh` as it stands at `1c9938ba` (`attn-before.cuh.txt`), the
+after one from this tree. `cuobjdump -res-usage` shows one kernel instantiation
+before and five after, and the control is in the table: the two fallback cases
+(head dim 384 and 320, which take no grouped path in either build) print
+IDENTICAL numbers in both runs, so the comparison is the same measurement twice,
+not two different measurements.
+
+| case | maxabs before | maxabs after | rel before | rel after |
+|---|---|---|---|---|
+| 26 tokens (a query) | 6.59e-06 | 3.58e-06 | 5.77e-07 | 3.31e-07 |
+| 184 tokens (mean document) | 1.62e-05 | 1.07e-05 | 9.43e-07 | 6.49e-07 |
+| 513 tokens (window equals item) | 2.20e-05 | 1.16e-05 | 1.05e-06 | 6.27e-07 |
+| 514 tokens (mask starts to bite) | 2.23e-05 | 9.84e-06 | 1.06e-06 | 6.48e-07 |
+| 1414 tokens (longest frozen item) | 1.97e-05 | 1.35e-05 | 1.05e-06 | 6.68e-07 |
+| 349 tokens, head_dim 512 | 3.61e-05 | 1.72e-05 | 1.45e-06 | 6.91e-07 |
+| 1414 tokens, head_dim 512 | 4.21e-05 | 2.29e-05 | 1.78e-06 | 9.73e-07 |
+| two items packed (40 + 1200 rows) | - | - | 1.04e-06 | 6.52e-07 |
+| fallback, head_dim 384 (CONTROL) | 1.62e-05 | 1.62e-05 | 9.62e-07 | 9.62e-07 |
+| fallback, head_dim 320 (CONTROL) | 1.22e-05 | 1.22e-05 | 7.11e-07 | 7.11e-07 |
+
+`mincos` is `1.000000000` in both runs on every case. The change therefore moved
+the error DOWN, by 1.5x to 1.9x, not up: `rel` 5.77e-07-1.78e-06 before against
+3.31e-07-9.73e-07 after. The reason is the shape of the accumulation: the old
+body summed a whole K row into four accumulator chains inside one lane, while the
+grouped body sums 64 products per lane and then reduces four lanes, which is a
+much shorter chain and therefore less rounding. The reduction is not an error
+source; it removes one. Raw: `attn-error-before.txt`, `attn-error-after.txt`.
+
+At the tower and the model, the same question is answered by the two parity
+gates, and neither moved: gate 7 reads `min cos 0.999999950 / max rel_rms
+3.149e-04` here and the pre-optimization phase-7 record carries the same pair
+(`docs/eg2vq-device-gate7.txt:454-455`), i.e. the residual is the 4-bit payload's
+own error, which no kernel change touched; and the kernel-level error above is
+two to three orders below it. The retrieval floor (gate 5) is measured on the
+CPU route (`tools/eg2_phase5_gate.sh` runs the tree's own `-O0` oracle on both
+containers), which none of these three units touch — they are CUDA-only files —
+so its floor stands unchanged and was not re-run at this boundary.
+
 ## 5. What this does NOT prove
 
 - No performance counter was read (`ncu` remains unavailable), so "the K line
@@ -301,6 +344,16 @@ make tests/parity/eg2vq_embd_gpu_oracle
 DS4_LOCK_FILE=/tmp/ds4.lock.attn ./tests/parity/eg2vq_embd_gpu_oracle \
     /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
     /data/embeddinggemma2/out/phase7-ids300.tsv
+
+# the error pair of 4.6: the same test source, twice, one sitting.  The before
+# binary is built in the tree with the pre-change header staged over the live
+# one (the tree is restored afterwards and the test re-run to confirm).
+make tests/test_eg2vq_attn && ./tests/test_eg2vq_attn > /tmp/err-after.txt
+git show 1c9938ba:cuda/eg2vq_attn.cuh > cuda/eg2vq_attn.cuh
+rm -f tests/test_eg2vq_attn && make tests/test_eg2vq_attn
+cuobjdump -res-usage tests/test_eg2vq_attn | grep -c eg2vq_attn_kernel   # 1
+./tests/test_eg2vq_attn > /tmp/err-before.txt
+git checkout cuda/eg2vq_attn.cuh && rm -f tests/test_eg2vq_attn && make tests/test_eg2vq_attn
 
 # the interleaved kernel A/B: the old binary comes from the pre-change header
 mkdir -p /tmp/ab-before/cuda /tmp/ab-before/tests

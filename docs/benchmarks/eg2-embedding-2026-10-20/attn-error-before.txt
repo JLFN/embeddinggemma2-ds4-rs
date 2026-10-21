@@ -1,0 +1,13 @@
+sliding: 26 tokens (a query)                 tok   26 hd 256 kv 2 half   512 | maxabs 6.59e-06 rel 5.77e-07 mincos 1.000000000 | ok
+sliding: 184 tokens (mean document)          tok  184 hd 256 kv 2 half   512 | maxabs 1.62e-05 rel 9.43e-07 mincos 1.000000000 | ok
+sliding: 513 tokens (window equals item)     tok  513 hd 256 kv 2 half   512 | maxabs 2.20e-05 rel 1.05e-06 mincos 1.000000000 | ok
+sliding: 514 tokens (mask starts to bite)    tok  514 hd 256 kv 2 half   512 | maxabs 2.23e-05 rel 1.06e-06 mincos 1.000000000 | ok
+sliding: 1414 tokens (longest frozen item)   tok 1414 hd 256 kv 2 half   512 | maxabs 1.97e-05 rel 1.05e-06 mincos 1.000000000 | ok
+full: 349 tokens, no mask                    tok  349 hd 512 kv 1 half    -1 | maxabs 3.61e-05 rel 1.45e-06 mincos 1.000000000 | ok
+full: 1414 tokens, no mask                   tok 1414 hd 512 kv 1 half    -1 | maxabs 4.21e-05 rel 1.78e-06 mincos 1.000000000 | ok
+fallback: head_dim 384 (grouped off, vector on) tok   40 hd 384 kv 2 half   512 | maxabs 1.62e-05 rel 9.62e-07 mincos 1.000000000 | ok
+fallback: head_dim 320 (grouped off, vector off) tok   33 hd 320 kv 2 half   512 | maxabs 1.22e-05 rel 7.11e-07 mincos 1.000000000 | ok
+mask edge (512 sees / 513 blind)             distance 512 sees row 1100, 513 and beyond blind PASS
+two items packed (40 + 1200 rows)            rel 1.04e-06 mincos 1.000000000 | each row reads its own item PASS
+5 query heads (not the tower's 4)            refused, output untouched PASS
+EG2VQ_ATTN_PASS
