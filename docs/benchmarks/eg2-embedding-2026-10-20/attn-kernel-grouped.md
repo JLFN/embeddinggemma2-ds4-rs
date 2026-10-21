@@ -81,9 +81,10 @@ keys in flight per chunk (KC = 32/LAB is 8 and 4, against 4 and 2), a shorter
 butterfly per key, and one predicated store per chunk instead of one per key.
 The narrow pairings are recorded here because they were measured: 1.37x-1.80x.
 The `xS` column divides each variant by the run's FIRST shipped measurement
-(`S-a`), not by the mean of the two; the mean-based value differs by 1-4% on the
-slower variants (max1414_s's `(8,8)` reads 1.66x this way and 1.62x against the
-mean).
+(`S-a`), not by the mean of the two; against the mean the value differs by under
+0.3% on the two short shapes and by 2% to 6.4% on the long ones (max1414_s's
+`(8,8)` reads 1.66x this way and 1.62x against the mean; batch8x565_s's `(8,8)`
+reads 1.37x and 1.46x).
 
 One instrument trap is worth keeping. The first version of this probe strided a
 lane's chunks by `4*GS` instead of `4*LAB`, which happens to be right only when
@@ -199,9 +200,9 @@ none of them was measured in one window with the others: the attention unit's
 own factor is 1.61x, recomputed here from the committed CSVs rather than quoted
 (`speed-bench/eg2_embed_vizzio.csv` 18.799776866 s at batch 8 against 11.654060797
 / 11.717910747 / 11.658361879 s in its three `eg2_embed_vizzio_attn-vec4` runs,
-i.e. 1.6131 / 1.6044 / 1.6126); the GEMM's is 1.20x-1.25x pooled, 1.25x at the top
+i.e. 1.6132 / 1.6044 / 1.6126); the GEMM's is 1.20x-1.25x pooled, 1.25x at the top
 of that range; this one is 1.32x. 1.61 x 1.25 x 1.32 = 2.66x, against the 2.94x
-the two endpoints give and the 2.7x the previous record published. Every one of
+the two endpoints give and the 2.7x this record's own earlier revision published. Every one of
 those products is a cross-window figure and is labelled as one here: the machine's
 own state moved between the windows (today's old build measures 8.42 s at batch 8
 where the previous unit's record carries 8.89 s for the same code), so the only
@@ -309,8 +310,9 @@ nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
      -Xcompiler -march=native -Xcompiler -pthread -I. \
      -o /tmp/bench-attn-old /tmp/ab-before/tests/bench_eg2vq_attn.cu
 make tests/bench_eg2vq_attn
-/tmp/bench-attn-old 30 > attn-ab-old-r1.txt ; ./tests/bench_eg2vq_attn 30 > attn-ab-new-r1.txt
-/tmp/bench-attn-old 30 > attn-ab-old-r2.txt ; ./tests/bench_eg2vq_attn 30 > attn-ab-new-r2.txt
+R=docs/benchmarks/eg2-embedding-2026-10-20
+/tmp/bench-attn-old 30 > $R/attn-ab-old-r1.txt ; ./tests/bench_eg2vq_attn 30 > $R/attn-ab-new-r1.txt
+/tmp/bench-attn-old 30 > $R/attn-ab-old-r2.txt ; ./tests/bench_eg2vq_attn 30 > $R/attn-ab-new-r2.txt
 
 # --- from the BENCHMARK DIRECTORY (ds4-rs/docs/benchmarks/eg2-embedding-2026-10-20/) ---
 # the ablation and the candidate probe, AS MEASURED: both anchor their baseline
@@ -337,7 +339,9 @@ EG2_EMBED_SERVER=$PWD/../../ds4-server EG2_EMBED_CLI=$PWD/../../ds4 \
 ```
 
 Building either probe against the CURRENT header instead compiles and runs but
-fails its own anchor (`V0 IS NOT THE SHIPPED KERNEL`, five shapes, exit 1): the
+fails its own anchor (probe-attn: `V0 IS NOT THE SHIPPED KERNEL`, five shapes,
+exit 1; probe-attn-grp: `ON=0 IS NOT THE SHIPPED KERNEL`, six shapes, exit 1):
+the
 shipped launcher runs the grouped form for head_dim 256/512 now, so a probe whose
 baseline is the lane-per-key body can only be the pre-change instrument its
 committed output says it is.
@@ -348,8 +352,9 @@ the wrong-instrument example), `probes/probe-attn.cu`, `probes/probe-attn-grp.cu
 `attn-ab-{old,new}-r{1,2}.txt` (the kernel bench raw), `attn-ab-sweep.txt` (the
 joined corpus table), `speed-bench/eg2_embed_vizzio_attn-ab-{old,new}-r{1,2}.csv`
 plus the `-r{3,4}` old runs and their `_health.json` (all six health readouts are
-the same caps payload, byte for byte — they identify the port and the caps, not
-the build, which is what the sweep writes), `gate7-embd-attn-grouped.txt`,
+the same caps payload, byte for byte, and it carries no port and no build field:
+what identifies a run is the CSV beside it and the server's own `listening on`
+line in the sweep log, never this file), `gate7-embd-attn-grouped.txt`,
 `nsys-kern-sum-b8-attn-grouped.txt` (`nsys stats --report cuda_gpu_kern_sum` of one
 batch-8 forward), `attn-before.cuh.txt` (the pre-change header the old binary and
 both probes are built from).
@@ -379,8 +384,9 @@ Two traps this unit paid for, both worth keeping:
   header (`attn-before.cuh.txt`, staged into the include path ahead of the
   repo), exactly as `vq-gemm-rows.md` requires of `probe-r8.cu` and
   `probe-big.cu`. The QA pass caught this by running section 7's commands as
-  written and getting `PROBE_ATTN_FAIL` / `PROBE_ATTN_GRP_FAIL` with
-  "V0 IS NOT THE SHIPPED KERNEL" on every shape.
+  written and getting `PROBE_ATTN_FAIL` with "V0 IS NOT THE SHIPPED KERNEL" on
+  five shapes and `PROBE_ATTN_GRP_FAIL` with "ON=0 IS NOT THE SHIPPED KERNEL" on
+  six.
 
 ## 8. Rule-19 QA pass
 
