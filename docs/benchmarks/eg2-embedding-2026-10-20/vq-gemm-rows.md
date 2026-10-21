@@ -15,7 +15,7 @@ tokens, the same request the attention unit profiled), before and after:
 | kernel | 2026-10-20 19:40 (before) | 2026-10-21 07:34 (after) |
 |---|---|---|
 | `eg2vq_vq_gemm_kernel` | 212.6 ms of 401.2 ms (53.0%), 434 launches, 489.9 us avg | 139.2 ms of 287.8 ms (48.4%), 434 launches, 320.7 us avg |
-| `eg2vq_attn_kernel` | 159.7 ms (39.8%) | 116.7 ms (40.6%) |
+| `eg2vq_attn_kernel` | 159.7 ms (39.8%) | 116.7 ms (40.5%) |
 
 The attention row is the caution in this table: `cuda/eg2vq_attn.cuh` is
 byte-identical between the two builds, and its average per launch still reads
@@ -64,15 +64,19 @@ What that says, in order of how hard it is to argue with:
   2.0x-3.1x) or keeping the instructions and making the addresses block-uniform
   (V5: one 32-byte sector per instruction instead of sixteen: 2.4x-4.2x).
 
-The model behind the fix follows from the same geometry. Per thread per K step
-the kernel loads a `float4` per token — 16 bytes — and spends `T*R*4` scalar
-multiply-adds on it, so it pays **4/R bytes of activation per multiply-add**:
-R=4 pays 4 B, R=8 pays 2 B. The load side is expensive per instruction and not
-per byte: a warp's sixteen `tx` lanes read the same column chunk of sixteen
-different token rows `t_stride` apart, i.e. sixteen 32-byte sectors per
-instruction, and that path costs several times what the FMA path costs per step.
-More rows per thread is the only register-blocking move that reduces it without
-changing what is loaded.
+The model behind the fix follows from the same geometry. Per K step a thread
+loads a `float4` per token — 16 bytes — and spends `T*R*4` scalar multiply-adds on
+it, i.e. `4/R` bytes per scalar multiply-add: 1 B at R=4 and 0.5 B at R=8. (The
+same quantity counted the other way, with the codeword's four-element group as
+one multiply-add, is `16/R` bytes: 4 B then 2 B. This document and the kernel
+comment previously mixed the two conventions; they now name the convention they
+use, and the direction of the argument — doubling R halves the activation bytes
+per unit of arithmetic — holds either way.) The load side is expensive per
+instruction and not per byte: a warp's sixteen `tx` lanes read the same column
+chunk of sixteen different token rows `t_stride` apart, i.e. sixteen 32-byte
+sectors per instruction, and that path costs several times what the FMA path
+costs per step. More rows per thread is the only register-blocking move that
+reduces it without changing what is loaded.
 
 ## 3. What shipped
 
@@ -101,7 +105,7 @@ reports 0 errors.
 
 `probes/probe-r8.cu` is the instrument this change was developed with; it
 compares a templated R=8 kernel against whatever the header says at compile time,
-which on 2026-10-21 07:19 meant the pre-change R=4 kernel (`probe-r8-rows.txt`,
+which at 07:21 on 2026-10-21 meant the pre-change R=4 kernel (`probe-r8-rows.txt`,
 `IDENTITY_OK`) and today means the shipped R=8 kernel, so re-running it now
 checks the transcription, not the change. Section 7 says how to compile it
 against the pre-change header if the historical comparison is wanted.
@@ -136,27 +140,36 @@ pre-change tree was built into `/tmp/eg2-prof/old` (verified `REG:80` against th
 new `REG:128`), and `speed-bench/eg2_embed_sweep.sh` was run against each in turn
 — old, new, old, new — over the 143-page corpus (80,747 tokens):
 
-| row | old r1 / r2 | new r1 / r2 | speedup |
-|---|---|---|---|
-| batch 1 | 14.618 / 14.186 s | 11.710 / 11.828 s | 1.22x |
-| batch 2 | 12.321 / 12.212 s | 10.039 / 10.021 s | 1.22x |
-| batch 4 | 11.383 / 11.368 s | 9.158 / 9.135 s | 1.24x |
-| batch 8 | 11.153 / 11.146 s | 8.893 / 8.903 s | 1.25x |
+| row | old r1 / r2 | new r1 / r2 | pooled | pairing r1 | pairing r2 |
+|---|---|---|---|---|---|
+| batch 1 | 14.618 / 14.186 s | 11.710 / 11.828 s | 1.224x | 1.248x | 1.199x |
+| batch 2 | 12.321 / 12.212 s | 10.039 / 10.021 s | 1.223x | 1.227x | 1.219x |
+| batch 4 | 11.383 / 11.368 s | 9.158 / 9.135 s | 1.244x | 1.243x | 1.244x |
+| batch 8 | 11.153 / 11.146 s | 8.893 / 8.903 s | 1.253x | 1.254x | 1.252x |
 
 (`ab-sweep.txt`; the four CSVs are `speed-bench/eg2_embed_vizzio_vq-ab-{old,new}-r{1,2}.csv`
-with their health payloads, and every ratio here is round-paired and agrees with
-its other pairing to within 1%.) At batch 8 that is 7,240/7,244 -> 9,080/9,070
-tokens/s.
+with their health payloads. "Pooled" is the ratio of the two rounds' summed times,
+which is the figure this document quotes; the two round pairings are beside it
+because they are the honest spread. On every row but batch 1 the pairings agree to
+within 1%; on batch 1 they are 3.9% apart, the same warm-up effect the kernel
+bench shows — the first corpus run of the sitting is the slow one. So the corpus
+claim is 1.20x-1.25x with batch 1 at 1.199x in the least favourable pairing, not
+"1.22x-1.25x" as the first draft put it.) At batch 8 that is 7,240/7,244 ->
+9,080/9,070 tokens/s.
 
 **Device tower, gate 7.** `tests/parity/eg2vq_embd_gpu_oracle` on the 300-item /
 8,059-token id set: `EG2VQ_GPU_PASS`, `min cos(device, cpu) 0.999999950` and
 `max rel_rms 3.150e-04` — numerically identical to the previous unit's record,
-which is what bit-identity predicts — device steady state 2,060.9 tokens/s against
-the previous unit's recorded 1,499.6 (attention-occupancy.md:147), same process,
-85.0x over the CPU leg. Three runs of the shipped kernel inside an hour read
-2,048.6 / 2,008.9 / 2,060.9 tokens/s, so the row is quoted as "about 2,000, up
-from about 1,500", and both its sides are cross-window. Raw:
-`gate7-embd-gpu-oracle.txt` (the third run).
+which is what bit-identity predicts — device steady state 2,060.9 tokens/s and
+85.0x over the CPU leg in the run whose raw output is committed
+(`gate7-embd-gpu-oracle.txt`). The "before" side is the phase-7 record's own
+figure, `docs/eg2vq-device-gate7.txt:461`: 1,499.0 tokens/s steady state for the
+unoptimized device tower. Both sides are therefore cross-window, a day apart, and
+this row is corroboration, not the claim: the claim is the interleaved bench and
+the interleaved corpus above. (The attention unit's handoff quoted 1,499.6 for
+its own re-run and two other readings of the shipped kernel were seen while this
+unit was in flight — 2,048.6 and 2,008.9 tokens/s — but neither is backed by a
+committed raw file, so only the cited pair is used here.)
 
 **Cumulative.** With the attention unit's committed CSV as the dev baseline, the
 corpus at batch 8 reads 18.7998 s (2026-10-20, `speed-bench/eg2_embed_vizzio.csv`)
@@ -266,3 +279,27 @@ finding was fixed rather than argued with:
 | F12 the gate-7 corroboration pair had no committed raw output | `gate7-embd-gpu-oracle.txt` is committed and the "before" value is cited to the file that recorded it |
 | F14 two wording imprecisions (the launcher did change; "bytes per FMA" counted a 4-wide group) | fixed in section 3 and section 2 |
 | F16 the rule-19 gate had no fresh report for this unit | `qa-evidence/qa-report.md` and `qa-evidence/qa-findings-vq-r8.md` in the outer repository, written at this boundary, `bash tests/qa-gate.sh` exit 0 |
+
+The second pass re-verified each fix by rebuilding and running rather than by
+reading — it rebuilt the pinned probe (alive, its V0 an R=4 body at REG:80,
+`STACK:4096` on exactly the V6 instantiation), rebuilt and ran the identity
+driver from the committed sources (output byte-identical to the committed
+`output.txt`, 12,492,416 floats, 0 differing, 9 of 9 refusals, sanitizer clean),
+recomputed both bench round pairings from the raw files, and re-read the record
+against every artifact. It returned FAIL a second time, on three one-line
+problems and two cosmetic digits, all fixed in this revision and all of the same
+class as the first round: the corpus paragraph claimed a pairing agreement that
+batch 1 does not have (it is 3.9% apart, so the corpus claim is now stated as
+1.20x-1.25x with the pooled and the paired figures published side by side); the
+gate-7 "before" figure was cited to a line that does not contain it (it is
+`docs/eg2vq-device-gate7.txt:461`, and the record now cites that file and drops
+the two readings that had no committed raw); and the bytes-per-multiply-add
+sentence in both the record and the kernel comment contradicted itself by a
+factor of four (the convention is now named in both). The two digits were the
+attention row's share, 40.6% for 40.5%, and a probe timestamp.
+
+That the same class of defect survived one round of fixes is the part worth
+keeping: a measurement is only as good as the sentence that reports it, and a
+sentence that overstates an agreement is a defect even when every number in it is
+real. The rule this unit now follows: quote the pairing, name the file, state the
+convention.

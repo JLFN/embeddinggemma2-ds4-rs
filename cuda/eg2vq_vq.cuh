@@ -59,15 +59,19 @@
  * gather and index read cut it runs at 1.08x-1.18x; with the four x loads
  * replaced by one reused load it runs 2.0x-3.1x faster, and with the four x
  * loads kept but addressed block-uniformly (one 32-byte sector per instruction
- * instead of sixteen) 2.4x-4.2x faster.  Per thread per K step the kernel loads
- * 16 bytes per token for T*R*4 scalar multiply-adds, so it pays 4/R bytes of
- * activation per multiply-add: R = 4 pays 4 B, R = 8 pays 2 B.  Measured on the
- * tower's shapes, R = 8 is 1.35x-1.66x over the pre-change body; measured as
- * the shipped A/B with the two binaries interleaved, 1.26x-1.79x on one round
- * pairing and 1.23x-1.75x on the other.  It is BIT-IDENTICAL: the committed
- * driver (docs/benchmarks/eg2-embedding-2026-10-20/qa-identity) feeds the same
- * payload and activation bytes to the old and the new kernel in one process and
- * compares 12,492,416 floats over 15 cases, ragged tails included: zero differ. */
+ * instead of sixteen) 2.4x-4.2x faster.  Per K step a thread loads 16 bytes per
+ * token and spends T*R*4 scalar multiply-adds on it, i.e. 4/R bytes of
+ * activation per scalar multiply-add (1 B at R = 4, 0.5 B at R = 8; counted with
+ * the codeword's four-element group as one multiply-add the same quantity is
+ * 16/R, i.e. 4 B then 2 B -- the ratio is what matters, and the convention is
+ * named here because an earlier version of this comment mixed the two).
+ * Measured on the tower's shapes, R = 8 is 1.35x-1.66x over the pre-change body
+ * (probe-bn128.txt, column A); measured as the shipped A/B with the two
+ * binaries interleaved, 1.26x-1.79x on one round pairing and 1.23x-1.75x on the
+ * other.  It is BIT-IDENTICAL: the committed driver
+ * (docs/benchmarks/eg2-embedding-2026-10-20/qa-identity) feeds the same payload
+ * and activation bytes to the old and the new kernel in one process and compares
+ * 12,492,416 floats over 15 cases, ragged tails included: zero differ. */
 enum {
     EG2VQ_BM = 64,          /* tokens per block */
     EG2VQ_BN = 64,          /* output rows per block */
