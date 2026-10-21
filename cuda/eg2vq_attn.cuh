@@ -81,6 +81,37 @@
  * dimension.  The vector path is therefore bit-identical to the scalar one, and
  * the scalar path is retained verbatim as the fallback for a shape or an
  * alignment the vector path does not cover.
+ *
+ * PASS 1'S K ACCESS IS WHAT THIS KERNEL WAS PAYING FOR, AND IT IS NOW GROUPED
+ * (second performance unit, 2026-10-21).  Vectorizing the loads did not fix the
+ * pattern: pass 1 gave each lane a whole K row, so one warp load addressed 32
+ * different rows, touched 32 lines and used 16 B of each.  An ablation of the
+ * shipped kernel (docs/benchmarks/eg2-embedding-2026-10-20/probes/probe-attn.cu,
+ * one component removed per variant, every variant register-neutral) put the
+ * cost there and nowhere else: the K address made block-uniform -- one line
+ * instead of 32, same instruction count -- was 2.05x-2.25x, the K operand taken
+ * out of memory altogether 2.25x-2.66x, while the exponentials (0.95x-1.05x),
+ * the score plane's write side (1.01x-1.07x) and its read side (1.00x-1.08x)
+ * each measured free, and pass 1 plus the row max was 1.37x-1.67x of the total.
+ * So the fix is the assignment, not the arithmetic: LAB lanes cooperate on one
+ * key and each lane owns GRP_GS float4 chunks of it, 4*LAB elements apart, so a
+ * group's lanes read consecutive addresses and one warp load covers whole 128 B
+ * lines; each lane keeps its own 64-float slice of the query row in registers
+ * instead of re-reading the whole row once per key; the group's LAB partial sums
+ * are reduced by a butterfly (log2(LAB) shuffles), which is what lets a lane own
+ * whole keys again; and the score store is one predicated float store per chunk
+ * instead of one per key.
+ *
+ * Measured against the shipped form in one window (probes/probe-attn-grp.cu, the
+ * candidate built as a probe before it was landed; the record has the full
+ * table): 2.27x and 2.39x at head_dim 256 with LAB=4 (294 and 565 tokens), 2.31x
+ * at 1414, 2.06x on an 8x565 packed block, and 2.53x / 2.01x at head_dim 512
+ * with LAB=8.  The (8,8) and (16,8) pairings, which trade keys in flight for a
+ * shorter butterfly, measured 1.66x-1.76x and 1.50x-1.80x and were rejected.
+ * The grouped form is not bit-identical to the lane-per-key form: the two agree
+ * to cosine 1.000000000 with a maximum element-wise relative difference of
+ * 2.4e-06-6.5e-06, inside what the gates bound (`make test-eg2vq-attn` and the
+ * gate-7 oracle's declared cos 0.999999950 / rel_rms 3.150e-04).
  */
 #pragma once
 #include <cuda_runtime.h>
@@ -98,6 +129,16 @@ enum {
      * pass 3 gives each lane four consecutive output dimensions and walks the
      * warp's 32 lanes over the head in 128-float steps. */
     EG2VQ_ATTN_VEC_STEP = 32 * 4,
+    /* The grouped pass 1 (second performance unit): LAB lanes cooperate on one
+     * key and each lane owns GRP_GS float4 chunks of it, so the lanes of a group
+     * read consecutive addresses and a warp load covers whole 128 B lines
+     * instead of touching one line per key and using 16 B of each.  LAB is
+     * head_dim/64 -- 4 for the tower's sliding layers (head_dim 256) and 8 for
+     * its full layers (512) -- and the chunk count per lane is 16 for every
+     * head_dim this covers, so the lane's query slice is always 64 floats in
+     * registers.  The per-lane loop below is kept for the chunk remainder and
+     * for every other shape. */
+    EG2VQ_ATTN_GRP_GS = 16,
 };
 
 __device__ __forceinline__ static float eg2vq_attn_dot(const float *a, const float *b, uint32_t n) {
@@ -168,6 +209,7 @@ __device__ __forceinline__ static float eg2vq_attn_wsum(float v) {
  * head_dim % EG2VQ_ATTN_VEC_STEP == 0 and 16-byte alignment of all four buffers,
  * and the two paths are numerically identical, so it is a throughput switch and
  * never a behaviour switch. */
+template <int LAB>
 __global__ void eg2vq_attn_kernel(
         float *__restrict__ out,
         const float *__restrict__ q,
@@ -217,10 +259,61 @@ __global__ void eg2vq_attn_kernel(
     const float *kh0 = k + (uint64_t)kvh * head_dim;
     float *scores = plane + (size_t)warp * EG2VQ_ATTN_KEYS_MAX;
 
-    /* pass 1: each lane's keys' scores, into shared, and this lane's maximum */
+    /* pass 1: each lane's keys' scores, into shared, and this lane's maximum.
+     *
+     * Two forms.  LAB > 0 is the grouped form (see the header): LAB lanes
+     * cooperate on ONE key, each owning GRP_GS float4 chunks of it, so the
+     * lanes of a group read 4*LAB consecutive floats and one warp load covers
+     * whole 128 B lines.  The lane keeps its own 64-float slice of the query
+     * row in registers, loaded once per row instead of once per key, and the
+     * group's partial sums are reduced with a butterfly across its LAB lanes.
+     * The window is consumed in chunks of KC = 32/LAB keys, and the remainder
+     * (fewer than KC keys) falls through to the lane-per-key loop, which is also
+     * what every other shape uses.  The two forms do NOT agree bit for bit --
+     * the grouped form sums the head's terms as LAB partial sums reduced by a
+     * butterfly instead of as the four chains of eg2vq_attn_dot4 alone -- and
+     * the gates bound that difference (measured 2.4e-06 to 6.5e-06 maximum
+     * element-wise relative, cosine 1.000000000 against the lane-per-key form).
+     */
     float m = -FLT_MAX;
+    uint32_t kk_grouped = 0;
+    if constexpr (LAB > 0) {
+        constexpr uint32_t KC = 32u / (uint32_t)LAB;
+        /* the lane's chunks are 4*LAB elements apart, so LAB*SPAN == head_dim */
+        constexpr uint32_t SPAN = 4u * (uint32_t)LAB;
+        const uint32_t msub = lane & ((uint32_t)LAB - 1u);   /* this lane's slice of the head */
+        const uint32_t gsub = lane / (uint32_t)LAB;          /* this lane's key inside the chunk */
+        float4 qv[EG2VQ_ATTN_GRP_GS];
+        #pragma unroll
+        for (int j = 0; j < EG2VQ_ATTN_GRP_GS; j++) {
+            qv[j] = *(const float4 *)(qh + 4u * msub + SPAN * (uint32_t)j);
+        }
+        for (; kk_grouped + KC <= nkey; kk_grouped += KC) {
+            const float *krow = kh0 + (uint64_t)(k0 + kk_grouped + gsub) * kv_stride;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < EG2VQ_ATTN_GRP_GS; j++) {
+                const float4 kv = *(const float4 *)(krow + 4u * msub + SPAN * (uint32_t)j);
+                a0 = fmaf(qv[j].x, kv.x, a0);
+                a1 = fmaf(qv[j].y, kv.y, a1);
+                a2 = fmaf(qv[j].z, kv.z, a2);
+                a3 = fmaf(qv[j].w, kv.w, a3);
+            }
+            float acc = (a0 + a1) + (a2 + a3);
+            #pragma unroll
+            for (int o = LAB / 2; o > 0; o >>= 1) {
+                acc += __shfl_xor_sync(0xffffffffu, acc, o);
+            }
+            if (msub == 0u) {
+                scores[kk_grouped + gsub] = acc;
+                m = fmaxf(m, acc);
+            }
+        }
+    }
+    /* the remainder, and the whole window when this instantiation has no
+     * grouped form: the lane-per-key loop */
     if (vec4) {
-        for (uint32_t kk = lane; kk < nkey; kk += 32u) {
+        for (uint32_t kk = kk_grouped + lane; kk < nkey; kk += 32u) {
             const float s = eg2vq_attn_dot4(qh, kh0 + (uint64_t)(k0 + kk) * kv_stride, head_dim);
             scores[kk] = s;
             m = fmaxf(m, s);
@@ -289,8 +382,22 @@ static inline int eg2vq_attn(float *out, const float *q, const float *k, const f
      * 16-byte-aligned operands; anything else keeps the scalar path. */
     const int vec4 = ((head_dim % (uint32_t)EG2VQ_ATTN_VEC_STEP) == 0u &&
                       ((uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)out) % 16u == 0u) ? 1 : 0;
-    eg2vq_attn_kernel<<<n_tok, EG2VQ_ATTN_WARPS * 32>>>(
-        out, q, k, v, pos, len, n_tok, n_head, n_head_kv, head_dim, half_swa, vec4);
+    /* the grouped pass 1 needs head_dim == 64*LAB for a LAB of 2, 4, 8 or 16
+     * (both halves of the tower's head dims, 256 and 512); every other shape
+     * takes the LAB = 0 instantiation, which is the lane-per-key loop alone. */
+    const uint32_t lab = (vec4 && (head_dim % 64u) == 0u) ? (head_dim / 64u) : 0u;
+    const dim3 grid(n_tok), block(EG2VQ_ATTN_WARPS * 32);
+    #define EG2VQ_ATTN_LAUNCH(L) \
+        eg2vq_attn_kernel<L><<<grid, block>>>(out, q, k, v, pos, len, n_tok, n_head, \
+                                              n_head_kv, head_dim, half_swa, vec4)
+    switch (lab) {
+        case  2u: EG2VQ_ATTN_LAUNCH( 2); break;
+        case  4u: EG2VQ_ATTN_LAUNCH( 4); break;
+        case  8u: EG2VQ_ATTN_LAUNCH( 8); break;
+        case 16u: EG2VQ_ATTN_LAUNCH(16); break;
+        default:  EG2VQ_ATTN_LAUNCH( 0); break;
+    }
+    #undef EG2VQ_ATTN_LAUNCH
     return 1;
 }
 

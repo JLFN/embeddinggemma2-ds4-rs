@@ -125,6 +125,17 @@ int main(void) {
         { 1414, 256, 2,  512, "sliding: 1414 tokens (longest frozen item)" },
         {  349, 512, 1,   -1, "full: 349 tokens, no mask" },
         { 1414, 512, 1,   -1, "full: 1414 tokens, no mask" },
+        /* the second performance unit gave pass 1 a grouped form that covers
+         * head_dim == 64*LAB for LAB in {2,4,8,16} only, and the tower's own two
+         * head dims (256, 512) are both in that set -- so without these two
+         * cases the instantiation every other shape takes would be wired into
+         * the launcher and never executed by any gate.  head_dim 384 is a
+         * multiple of 128, so it takes the vectorized lane-per-key path
+         * (LAB = 0, vec4 = 1); head_dim 320 is not, so it takes the scalar
+         * lane-per-key path (LAB = 0, vec4 = 0), which is the only case here
+         * that exercises the scalar bodies at all. */
+        {   40, 384, 2,  512, "fallback: head_dim 384 (grouped off, vector on)" },
+        {   33, 320, 2,  512, "fallback: head_dim 320 (grouped off, vector off)" },
     };
     const uint32_t n_head = 4;
     int fails = 0;
