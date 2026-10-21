@@ -188,7 +188,27 @@ machine is faster than the window the 18.7998 was taken in — the same reason t
 old build measures 8.42 s here and 8.89 s in the previous unit's record. Neither
 cross-window product is evidence on its own; the interleaved 1.31x is.
 
-### 4.3 Gates
+### 4.4 Where a whole forward's time goes now
+
+One `nsys` profile of the same batched forward the previous unit profiled (8
+items, 2451 tokens, one request through `ds4-server`), taken after the change:
+`nsys-kern-sum-b8-attn-grouped.txt`.
+
+| kernel | before (previous unit's profile) | after (this one) |
+|---|---|---|
+| `eg2vq_vq_gemm_kernel` | 139.2 ms (48.4%), 434 launches | 126.9 ms (64.3%), 434 launches |
+| `eg2vq_attn_kernel` (both head dims) | 116.7 ms (40.5%) | 46.0 ms (23.3%): `<(int)4>` 31.9 ms / 40 launches, `<(int)8>` 14.1 ms / 8 launches |
+| the small ops (`rms`, `rms_head`, `proj768`, `add`, `gelu`, `scale`, `rope`, ...) | ~31.9 ms (11.1%) | 24.3 ms (12.3%) |
+| total kernel time | 287.8 ms | 197.3 ms |
+
+The GEMM row moved too (139.2 -> 126.9 ms) with its code unchanged, which is the
+same caution the previous record carries: a cross-window profile delta is not
+evidence. The attention row is not used as the unit's measurement either — the
+interleaved bench (4.1) and the interleaved corpus (4.2) are. What the profile
+is good for is the split, and the split now says the payload GEMM is 64% of a
+forward's kernel time and attention 23%, against 48% and 40% before.
+
+### 4.5 Gates
 
 - `make test-eg2vq-attn` -> `EG2VQ_ATTN_PASS`, 12 lines, all nine arithmetic cases
   `ok` with `mincos 1.000000000` and `rel` 3.31e-07-9.73e-07 against the f64 CPU
@@ -212,10 +232,17 @@ cross-window product is evidence on its own; the interleaved 1.31x is.
 - The corpus rows are wall clock around `curl`, as the sweep documents; the
   server route carries no per-request elapsed field. The kernel rows are the
   kernel alone, one launch each.
-- No fresh `nsys` profile of a whole forward was taken for this unit, so the
-  share of the forward that attention now is has NOT been re-measured; the last
-  profile of that kind (previous unit, 8 items / 2451 tokens) read attention at
-  116.7 ms of 287.8 ms, and that was of the older kernel.
+- The forward-level split in 4.4 is one profile per build, taken in different
+  windows, so its delta is not evidence of this change: the interleaved bench and
+  corpus rows are. The profile's own attention names are per instantiation
+  (`<(int)4>`, `<(int)8>`), which is a direct read of the dispatcher in a live
+  forward.
+- The fast path's gate 25 failed on its first run in this session and passed on
+  the second with the same binaries, because a 12-hour-old `ds4-server` from an
+  earlier session was still holding `/tmp/ds4.lock` and the gate's engine-entry
+  leg could not start its own process. `tests/run.sh` exits 0 on the re-run
+  (gates 23-27 and the QA gate); the first log is not evidence of anything about
+  this unit and is not kept.
 - `V9`'s 15x-22x is an upper bound on removing everything at once, not a
   prediction of what any single change can buy, and it is not used as one.
 - Pass 3's V loads still cost 1.29x-1.48x (V4). Nothing in this unit touched
@@ -284,7 +311,9 @@ the wrong-instrument example), `probes/probe-attn.cu`, `probes/probe-attn-grp.cu
 `attn-ab-{old,new}-r{1,2}.txt` (the kernel bench raw), `attn-ab-sweep.txt` (the
 joined corpus table), `speed-bench/eg2_embed_vizzio_attn-ab-{old,new}-r{1,2}.csv`
 plus the `-r{3,4}` old runs and their `_health.json`, `gate7-embd-attn-grouped.txt`,
-`attn-before.cuh.txt` (the pre-change header the old binary is built from).
+`nsys-kern-sum-b8-attn-grouped.txt` (`nsys stats --report cuda_gpu_kern_sum` of one
+batch-8 forward), `attn-before.cuh.txt` (the pre-change header the old binary is
+built from).
 
 Two traps this unit paid for, both worth keeping:
 
