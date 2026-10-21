@@ -13,6 +13,8 @@
  *       conversions and all 16 FFMA per j)
  *   V2  codebook gather + index read replaced by a constant codeword (keeps
  *       the four x loads and all 16 FFMA per j)
+ *   V6  the whole 256-column activation slab per token hoisted into
+ *       registers (spills; the first probe version shipped this by accident)
  *   V3  FMA only: no loads, a loop-carried scalar keeps FFMA alive.  NOT a
  *       clean ceiling: with the operands identical ptxas CSEs the outer
  *       product, so the reported rate is an upper bound only.
@@ -22,7 +24,8 @@
  *       loads the block's first token row): same instruction count as V0, one
  *       32-byte sector per instruction instead of sixteen
  *
- * usage: probe-vq [repeats]
+ * usage: probe-vq [repeats]  (build it against the PRE-change header: see the
+ *                             PINNED note below the includes)
  */
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -34,6 +37,17 @@
 #include <random>
 
 #include "cuda/eg2vq_vq.cuh"
+
+/* PINNED TO THE PRE-CHANGE TILE (2026-10-21, after the QA pass): this probe's
+ * V0 must stay the R=4 body it was measured against, whatever the shipped
+ * header says today.  Commit 8d618ecb made eg2vq_vq_gemm_kernel 16x8 with 8
+ * rows per thread, so the probe cannot take the tile from the header any more:
+ * a rebuilt probe would silently become an R=8 baseline with a 16x16 launcher
+ * and read past its own tiles (illegal memory access, observed).  The block
+ * shape, EG2VQ_BN, EG2VQ_BM, EG2VQ_BK and the slab layout are unchanged in the
+ * header and are still taken from it. */
+#define PVQ_T 4
+#define PVQ_R 4
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     printf("CUDA %s line %d\n", cudaGetErrorString(e_), __LINE__); exit(2); } } while (0)
@@ -75,8 +89,8 @@ __global__ void vq_probe_kernel(
         uint32_t rows, uint32_t cols, uint32_t n_tok) {
     const uint32_t tx = threadIdx.x, ty = threadIdx.y;
     const uint32_t tid = ty * 16u + tx;
-    const uint32_t r0 = blockIdx.x * (uint32_t)EG2VQ_BN + ty * (uint32_t)EG2VQ_R_PER_THREAD;
-    const uint32_t t0 = blockIdx.y * (uint32_t)EG2VQ_BM + tx * (uint32_t)EG2VQ_T_PER_THREAD;
+    const uint32_t r0 = blockIdx.x * (uint32_t)EG2VQ_BN + ty * (uint32_t)PVQ_R;
+    const uint32_t t0 = blockIdx.y * (uint32_t)EG2VQ_BM + tx * (uint32_t)PVQ_T;
     const eg2vq_vq_mat m = eg2vq_vq_open(pay, rows, cols);
     if (!m.ok) { return; }
 
@@ -91,10 +105,10 @@ __global__ void vq_probe_kernel(
         for (uint32_t i = tid; i < chunks; i += 256u) { dst[i] = src[i]; }
     }
 
-    float acc[EG2VQ_T_PER_THREAD][EG2VQ_R_PER_THREAD];
-    const uint32_t t_ok = (t0 + (uint32_t)EG2VQ_T_PER_THREAD <= n_tok) ? 1u : 0u;
-    for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
-        for (uint32_t b = 0; b < EG2VQ_R_PER_THREAD; b++) { acc[a][b] = 0.0f; }
+    float acc[PVQ_T][PVQ_R];
+    const uint32_t t_ok = (t0 + (uint32_t)PVQ_T <= n_tok) ? 1u : 0u;
+    for (uint32_t a = 0; a < PVQ_T; a++) {
+        for (uint32_t b = 0; b < PVQ_R; b++) { acc[a][b] = 0.0f; }
     }
 
     const uint32_t urow = tid >> 2;
@@ -104,6 +118,22 @@ __global__ void vq_probe_kernel(
 
     float carry = 1.0f;   /* V3 only: keeps the FFMA chain loop-carried */
     float lsum = 0.0f;    /* V4 only: consumes every load */
+
+    /* V6 only: the whole 256-column activation slab of each of this thread's
+     * tokens, held in registers.  This is the variant the FIRST version of this
+     * probe shipped by accident; it spills to local memory and is measured here
+     * so that the record's claim about it has an artifact of its own. */
+    float xh[PVQ_T][EG2VQ_BK];
+    if (V == 6) {
+        for (uint32_t a = 0; a < PVQ_T; a++) {
+            for (uint32_t c = 0; c < (uint32_t)EG2VQ_BK; c += 4u) {
+                const float4 v = (t0 + a < n_tok)
+                                     ? *(const float4 *)(x + (size_t)(t0 + a) * t_stride + c)
+                                     : make_float4(0.f, 0.f, 0.f, 0.f);
+                xh[a][c] = v.x; xh[a][c + 1] = v.y; xh[a][c + 2] = v.z; xh[a][c + 3] = v.w;
+            }
+        }
+    }
 
     const uint32_t n_slab = cols / (uint32_t)EG2VQ_BK;
     for (uint32_t slab = 0; slab < n_slab; slab++) {
@@ -124,25 +154,25 @@ __global__ void vq_probe_kernel(
         #pragma unroll 4
         for (uint32_t j = 0; j < (uint32_t)EG2VQ_CW_PER_SLAB; j++) {
             const uint32_t i = i0 + 4u * j;
-            float cw[EG2VQ_R_PER_THREAD][4];
-            float xv[EG2VQ_T_PER_THREAD][4];
+            float cw[PVQ_R][4];
+            float xv[PVQ_T][4];
 
             if (V == 3) {
                 carry = fmaf(carry, 1.0000001f, 1.0e-9f);
                 #pragma unroll
-                for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
+                for (uint32_t q = 0; q < PVQ_R; q++) {
                     #pragma unroll
                     for (uint32_t c = 0; c < 4u; c++) { cw[q][c] = carry; }
                 }
                 #pragma unroll
-                for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                for (uint32_t a = 0; a < PVQ_T; a++) {
                     #pragma unroll
                     for (uint32_t c = 0; c < 4u; c++) { xv[a][c] = carry; }
                 }
             } else if (V == 4) {
                 #pragma unroll
-                for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
-                    const uint32_t row_local = ty * (uint32_t)EG2VQ_R_PER_THREAD + q;
+                for (uint32_t q = 0; q < PVQ_R; q++) {
+                    const uint32_t row_local = ty * (uint32_t)PVQ_R + q;
                     const uint32_t code = (uint32_t)idx_s[row_local * EG2VQ_IDX_PITCH + j];
                     const uint2 c = cb_s[code];
                     __half2 h0, h1;
@@ -152,7 +182,7 @@ __global__ void vq_probe_kernel(
                     lsum += (f0.x + f0.y) + (f1.x + f1.y);
                 }
                 #pragma unroll
-                for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                for (uint32_t a = 0; a < PVQ_T; a++) {
                     if (t0 + a < n_tok) {
                         const float4 v = *(const float4 *)(x + (size_t)(t0 + a) * t_stride + i);
                         lsum += (v.x + v.y) + (v.z + v.w);
@@ -160,8 +190,8 @@ __global__ void vq_probe_kernel(
                 }
             } else {
                 #pragma unroll
-                for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
-                    const uint32_t row_local = ty * (uint32_t)EG2VQ_R_PER_THREAD + q;
+                for (uint32_t q = 0; q < PVQ_R; q++) {
+                    const uint32_t row_local = ty * (uint32_t)PVQ_R + q;
                     const uint32_t code = (V == 2) ? (uint32_t)(row_local)
                                                    : (uint32_t)idx_s[row_local * EG2VQ_IDX_PITCH + j];
                     const uint2 c = cb_s[code];
@@ -171,32 +201,40 @@ __global__ void vq_probe_kernel(
                     const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
                     cw[q][0] = f0.x; cw[q][1] = f0.y; cw[q][2] = f1.x; cw[q][3] = f1.y;
                 }
-                if (V == 1) {
+                if (V == 6) {
+                    /* every token's slab already in registers: no x load here */
+                    const uint32_t cbase = j * 4u;
+                    #pragma unroll
+                    for (uint32_t a = 0; a < PVQ_T; a++) {
+                        xv[a][0] = xh[a][cbase]; xv[a][1] = xh[a][cbase + 1u];
+                        xv[a][2] = xh[a][cbase + 2u]; xv[a][3] = xh[a][cbase + 3u];
+                    }
+                } else if (V == 1) {
                     /* one load, four tokens: register-neutral, 1/4 the LDG */
                     const float4 v = (t0 < n_tok) ? *(const float4 *)(x + (size_t)t0 * t_stride + i)
                                                   : make_float4(0.f, 0.f, 0.f, 0.f);
                     #pragma unroll
-                    for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                    for (uint32_t a = 0; a < PVQ_T; a++) {
                         xv[a][0] = v.x; xv[a][1] = v.y; xv[a][2] = v.z; xv[a][3] = v.w;
                     }
                 } else if (V == 5) {
                     /* four loads, block-uniform address: 1 sector per instruction */
                     const uint32_t tu = blockIdx.y * (uint32_t)EG2VQ_BM;
                     #pragma unroll
-                    for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                    for (uint32_t a = 0; a < PVQ_T; a++) {
                         const float4 v = (tu < n_tok) ? *(const float4 *)(x + (size_t)tu * t_stride + i)
                                                       : make_float4(0.f, 0.f, 0.f, 0.f);
                         xv[a][0] = v.x; xv[a][1] = v.y; xv[a][2] = v.z; xv[a][3] = v.w;
                     }
                 } else if (t_ok) {
                     #pragma unroll
-                    for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                    for (uint32_t a = 0; a < PVQ_T; a++) {
                         const float4 v = *(const float4 *)(x + (size_t)(t0 + a) * t_stride + i);
                         xv[a][0] = v.x; xv[a][1] = v.y; xv[a][2] = v.z; xv[a][3] = v.w;
                     }
                 } else {
                     #pragma unroll
-                    for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                    for (uint32_t a = 0; a < PVQ_T; a++) {
                         xv[a][0] = xv[a][1] = xv[a][2] = xv[a][3] = 0.0f;
                         if (t0 + a < n_tok) {
                             const float4 v = *(const float4 *)(x + (size_t)(t0 + a) * t_stride + i);
@@ -205,9 +243,9 @@ __global__ void vq_probe_kernel(
                     }
                 }
                 #pragma unroll
-                for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                for (uint32_t a = 0; a < PVQ_T; a++) {
                     #pragma unroll
-                    for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
+                    for (uint32_t q = 0; q < PVQ_R; q++) {
                         acc[a][q] += cw[q][0] * xv[a][0];
                         acc[a][q] += cw[q][1] * xv[a][1];
                         acc[a][q] += cw[q][2] * xv[a][2];
@@ -222,18 +260,18 @@ __global__ void vq_probe_kernel(
     if (V == 3) { acc[0][0] += carry; }
     if (V == 4) { acc[0][0] += lsum; }
 
-    float g[EG2VQ_R_PER_THREAD];
+    float g[PVQ_R];
     #pragma unroll
-    for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
+    for (uint32_t q = 0; q < PVQ_R; q++) {
         __half gh;
         memcpy(&gh, m.gr + (size_t)(r0 + q) * 2u, 2);
         g[q] = __half2float(gh);
     }
     #pragma unroll
-    for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+    for (uint32_t a = 0; a < PVQ_T; a++) {
         if (t0 + a >= n_tok) { continue; }
         #pragma unroll
-        for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
+        for (uint32_t q = 0; q < PVQ_R; q++) {
             out[(size_t)(t0 + a) * rows + r0 + q] = acc[a][q] * g[q];
         }
     }
@@ -286,8 +324,8 @@ int main(int argc, char **argv) {
             CK(cudaFree(dy));
             CK(cudaMalloc(&dy, (size_t)tok * s.rows * 4));
             const double flop = 2.0 * (double)s.rows * (double)s.cols * (double)tok;
-            float md[6];
-            for (int v = 0; v < 6; v++) {
+            float md[7];
+            for (int v = 0; v < 7; v++) {
                 std::vector<float> ms;
                 for (int rep = 0; rep < repeats + 3; rep++) {
                     cudaEvent_t a, b;
@@ -299,7 +337,8 @@ int main(int argc, char **argv) {
                         case 2: run_variant<2>(dy, dx, s.cols, dpay, s.rows, s.cols, tok); break;
                         case 3: run_variant<3>(dy, dx, s.cols, dpay, s.rows, s.cols, tok); break;
                         case 4: run_variant<4>(dy, dx, s.cols, dpay, s.rows, s.cols, tok); break;
-                        default: run_variant<5>(dy, dx, s.cols, dpay, s.rows, s.cols, tok); break;
+                        case 5: run_variant<5>(dy, dx, s.cols, dpay, s.rows, s.cols, tok); break;
+                        default: run_variant<6>(dy, dx, s.cols, dpay, s.rows, s.cols, tok); break;
                     }
                     CK(cudaEventRecord(b));
                     CK(cudaEventSynchronize(b));
@@ -319,6 +358,8 @@ int main(int argc, char **argv) {
             printf("%-16s %6u %7u %4s %10.4f %10.1f %9.2fx %9.2fx %9.2fx %9.2fx\n",
                    s.tag, s.rows, tok, "all", md[0], flop / ((double)md[0] * 1.0e6),
                    md[0] / md[1], md[0] / md[2], md[0] / md[4], md[0] / md[5]);
+            printf("%-16s %6u %7u %4s %10.4f %10.1f %9.2fx\n", s.tag, s.rows, tok, "V6",
+                   md[6], flop / ((double)md[6] * 1.0e6), md[0] / md[6]);
             printf("%-16s %6u %7u %4s %10.4f %10.1f   (V3 = %s)\n", s.tag, s.rows, tok, "V3",
                    md[3], flop / ((double)md[3] * 1.0e6), "upper bound only, ptxas CSEs it");
         }
