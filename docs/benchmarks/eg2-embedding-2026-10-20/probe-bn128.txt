@@ -1,0 +1,13 @@
+# probe-big — BN=128 dynamic vs BN=64 static, both R=8, 15 repeats
+id256x512 tok=1    big<4,8,16> differing: 0 of 256
+id256x512 tok=70   big<4,8,16> differing: 0 of 17920
+id256x512 tok=257  big<4,8,16> differing: 0 of 65792
+IDENTITY_OK
+shape              rows  tokens     base ms        G/s    A<4,8,8>        G/s BIG<4,8,16>        G/s
+k/v_proj_s          512     306      0.0666     2410.3       1.35x     3264.0       0.83x     1993.4
+k/v_proj_s          512    4520      0.6472     3661.8       1.60x     5847.3       1.53x     5603.5
+ffn_gate_s         2048     306      0.1852     3464.8       1.49x     5179.2       1.23x     4273.2
+ffn_gate_s         2048    4520      2.4300     3901.0       1.62x     6305.8       1.63x     6353.4
+ple_model_proj    12288     306      0.9595     4012.9       1.65x     6632.7       1.65x     6619.9
+ple_model_proj    12288    4520     14.5876     3898.8       1.66x     6467.4       1.75x     6839.3
+PROBE_BIG_OK

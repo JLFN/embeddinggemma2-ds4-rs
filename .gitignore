@@ -267,3 +267,5 @@ tests/naive_banks
 /tests/test_eg2vq_vq
 /tests/test_eg2vq_attn
 /tests/test_eg2vq_ops
+/tests/bench_eg2vq_attn
+/tests/bench_eg2vq_vq

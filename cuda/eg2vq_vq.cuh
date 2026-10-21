@@ -31,8 +31,12 @@
  *     on the device that the reference does not have.
  *
  * The shared-memory budget is deliberately under the 48 KB static limit:
- * codebook 32 KB (4096 x 4 f16) + one 256-column index slab 8 KB = 40 KB, no
- * dynamic-shared opt-in, so occupancy is not traded for it.
+ * codebook 32 KB (4096 x 4 f16) + one 64-row index slab 8.5 KB = 41,472 B, no
+ * dynamic-shared opt-in, so occupancy is not traded for it.  A 128-row slab
+ * (50,176 B, 256 threads) was built and measured in the same sitting: it is
+ * equal or 5% better at the largest shapes but 0.83x at 512 x 512 / 306 tokens
+ * (half the blocks of the shipped tile), and it needs the dynamic-shared
+ * opt-in.  It is not carried.
  */
 #pragma once
 #include <cuda_fp16.h>
@@ -41,15 +45,42 @@
 
 #include "../ds41_vq_fmt.h"
 
-/* Tile geometry.  16 x 16 threads; each thread owns 4 tokens (tx) x 4 rows
- * (ty), which is 16 accumulators and 4 tail-codeword groups per K step. */
+/* Tile geometry.  16 x 8 threads; each thread owns 4 tokens (tx) x 8 rows
+ * (ty), which is 32 accumulators and 8 codeword groups per K step.
+ *
+ * WHY 8 ROWS AND NOT 4 (measured, embeddinggemma2 performance unit, 2026-10-21):
+ * the kernel is limited by the ACTIVATION LOAD, not by arithmetic and not by
+ * the codebook gather.  The ablation that says so is committed with this unit
+ * (docs/benchmarks/eg2-embedding-2026-10-20/probes/probe-vq.cu, its output in
+ * probe-ablation.txt, the record in vq-gemm-rows.md); it times the pre-change
+ * body with one component removed at a time on the tower's own shapes: with the
+ * 16 FFMA per j replaced by a handful of FADDs and every load kept, the kernel
+ * runs at 1.00x-1.12x of baseline (the arithmetic is hidden); with the codebook
+ * gather and index read cut it runs at 1.08x-1.18x; with the four x loads
+ * replaced by one reused load it runs 2.0x-3.1x faster, and with the four x
+ * loads kept but addressed block-uniformly (one 32-byte sector per instruction
+ * instead of sixteen) 2.4x-4.2x faster.  Per K step a thread loads 16 bytes per
+ * token and spends T*R*4 scalar multiply-adds on it, i.e. 4/R bytes of
+ * activation per scalar multiply-add (1 B at R = 4, 0.5 B at R = 8; counted with
+ * the codeword's four-element group as one multiply-add the same quantity is
+ * 16/R, i.e. 4 B then 2 B -- the ratio is what matters, and the convention is
+ * named here because an earlier version of this comment mixed the two).
+ * Measured on the tower's shapes, R = 8 is 1.35x-1.66x over the pre-change body
+ * (probe-bn128.txt, column A); measured as the shipped A/B with the two
+ * binaries interleaved, 1.26x-1.79x on one round pairing and 1.23x-1.75x on the
+ * other.  It is BIT-IDENTICAL: the committed driver
+ * (docs/benchmarks/eg2-embedding-2026-10-20/qa-identity) feeds the same payload
+ * and activation bytes to the old and the new kernel in one process and compares
+ * 12,492,416 floats over 15 cases, ragged tails included: zero differ. */
 enum {
     EG2VQ_BM = 64,          /* tokens per block */
     EG2VQ_BN = 64,          /* output rows per block */
     EG2VQ_BK = 256,         /* columns per K slab = 64 codewords */
     EG2VQ_CW_PER_SLAB = EG2VQ_BK / 4,
+    EG2VQ_NTX = 16,         /* token lanes (each owns EG2VQ_T_PER_THREAD tokens) */
+    EG2VQ_NTY = 8,          /* row groups (each owns EG2VQ_R_PER_THREAD rows) */
     EG2VQ_T_PER_THREAD = 4,
-    EG2VQ_R_PER_THREAD = 4,
+    EG2VQ_R_PER_THREAD = 8,
     EG2VQ_IDX_PITCH = EG2VQ_CW_PER_SLAB + 4,   /* uint16 rows: bank decorrelation */
     EG2VQ_NC_MAX = 4096,
     EG2VQ_IDX_BITS = 12,
@@ -125,7 +156,7 @@ __device__ __forceinline__ static uint32_t eg2vq_vq_bits12(const uint32_t *w, ui
 /* The GEMM: out[t][r] = gain[r] * sum_i cb[idx[r][i/4]][i%4] * x[t][i], with
  * x row stride `t_stride` (>= cols) and out row stride exactly `rows`.
  *
- * Grid: x = rows / EG2VQ_BN, y = ceil(n_tok / EG2VQ_BM).  Block: 16 x 16.
+ * Grid: x = rows / EG2VQ_BN, y = ceil(n_tok / EG2VQ_BM).  Block: 16 x 8.
  * `n_tok` may be any positive number: token lanes past the item's last token
  * neither load x nor store out.
  */
@@ -135,8 +166,8 @@ __global__ void eg2vq_vq_gemm_kernel(
         uint32_t t_stride,
         const uint8_t *__restrict__ pay,
         uint32_t rows, uint32_t cols, uint32_t n_tok) {
-    const uint32_t tx = threadIdx.x, ty = threadIdx.y;   /* block: 16 x 16 */
-    const uint32_t tid = ty * 16u + tx;                  /* 0..255, the flat thread id */
+    const uint32_t tx = threadIdx.x, ty = threadIdx.y;   /* block: 16 x 8 */
+    const uint32_t tid = ty * (uint32_t)EG2VQ_NTX + tx;  /* 0..127, the flat thread id */
     const uint32_t r0 = blockIdx.x * (uint32_t)EG2VQ_BN + ty * (uint32_t)EG2VQ_R_PER_THREAD;
     const uint32_t t0 = blockIdx.y * (uint32_t)EG2VQ_BM + tx * (uint32_t)EG2VQ_T_PER_THREAD;
     const eg2vq_vq_mat m = eg2vq_vq_open(pay, rows, cols);
@@ -150,43 +181,47 @@ __global__ void eg2vq_vq_gemm_kernel(
         const uint4 *src = (const uint4 *)m.cb;
         uint4 *dst = (uint4 *)cb_s;
         const uint32_t chunks = nc / 2u;
-        for (uint32_t i = tid; i < chunks; i += 256u) { dst[i] = src[i]; }
+        for (uint32_t i = tid; i < chunks; i += (uint32_t)(EG2VQ_NTX * EG2VQ_NTY)) { dst[i] = src[i]; }
     }
 
     float acc[EG2VQ_T_PER_THREAD][EG2VQ_R_PER_THREAD];
-    const uint32_t t_ok = (t0 + (uint32_t)EG2VQ_T_PER_THREAD <= n_tok) ? 1u : 0u;  /* whole 4-token group in range */
     for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
         for (uint32_t b = 0; b < EG2VQ_R_PER_THREAD; b++) { acc[a][b] = 0.0f; }
     }
 
-    /* This thread's 4 rows' index-stream base pointers, and the K loop over
-     * 256-column slabs.  Within a slab, thread `tid` unpacks 16 codewords of
-     * row (tid / 4), slot (tid % 4): 16 codewords = 192 bits = 24 B, read as
-     * six words through memcpy because the row stream's 4-byte alignment is
-     * not guaranteed by the payload contract (row_bytes = 3 * cols / 8 is a
+    /* This thread's share of the index slab, and the K loop over 256-column
+     * slabs.  Within a slab, thread `tid` unpacks 16 codewords of slab row
+     * (tid / 4), slot (tid % 4): 16 codewords = 192 bits = 24 B, read as six
+     * words through memcpy because the row stream's 4-byte alignment is not
+     * guaranteed by the payload contract (row_bytes = 3 * cols / 8 is a
      * multiple of 4 for every width in this tier, but nothing in the layout
-     * promises it).
+     * promises it).  The block's 128 threads cover 32 rows per pass, so the
+     * slab's EG2VQ_BN rows take EG2VQ_R_PER_THREAD / 4 passes.
      */
-    const uint32_t urow = tid >> 2;             /* slab row this thread unpacks (block local) */
+    const uint32_t urow0 = tid >> 2;            /* 0 .. 32-1 within a pass */
     const uint32_t uslot = tid & 3u;
     /* The stream belongs to the matrix row this block's slab row maps to, which
-     * is block-local only for the first row block: urow is 0..63 in EVERY block,
-     * so the global row must be added here or every later block re-reads the
-     * first block's rows. */
-    const uint32_t grow = blockIdx.x * (uint32_t)EG2VQ_BN + urow;
-    const uint8_t *ustream = m.ix + (size_t)grow * m.row_bytes;
+     * is block-local only for the first row block: urow is 0..EG2VQ_BN-1 in
+     * EVERY block, so the global row must be added here or every later block
+     * re-reads the first block's rows. */
+    const uint32_t grow_base = blockIdx.x * (uint32_t)EG2VQ_BN;
 
     const uint32_t n_slab = cols / (uint32_t)EG2VQ_BK;
     for (uint32_t slab = 0; slab < n_slab; slab++) {
         /* ---- unpack this slab's 64 x 64 indices into shared ---- */
-        uint32_t w[6];
-        memcpy(w, ustream + (size_t)slab * (size_t)EG2VQ_SLAB_BYTES
-                 + (size_t)uslot * (size_t)EG2VQ_SLOT_BYTES, sizeof(w));
-        const uint32_t jbase = uslot * 16u;
-        uint16_t *dstrow = idx_s + urow * EG2VQ_IDX_PITCH;
         #pragma unroll
-        for (uint32_t k = 0; k < 16u; k++) {
-            dstrow[jbase + k] = (uint16_t)eg2vq_vq_bits12(w, 6u, k * 12u);
+        for (uint32_t p = 0; p < (uint32_t)(EG2VQ_R_PER_THREAD / 4); p++) {
+            const uint32_t urow = urow0 + p * (uint32_t)(4 * EG2VQ_NTY);
+            const uint8_t *ustream = m.ix + (size_t)(grow_base + urow) * m.row_bytes;
+            uint32_t w[6];
+            memcpy(w, ustream + (size_t)slab * (size_t)EG2VQ_SLAB_BYTES
+                     + (size_t)uslot * (size_t)EG2VQ_SLOT_BYTES, sizeof(w));
+            const uint32_t jbase = uslot * 16u;
+            uint16_t *dstrow = idx_s + urow * EG2VQ_IDX_PITCH;
+            #pragma unroll
+            for (uint32_t k = 0; k < 16u; k++) {
+                dstrow[jbase + k] = (uint16_t)eg2vq_vq_bits12(w, 6u, k * 12u);
+            }
         }
         __syncthreads();
 
@@ -195,7 +230,7 @@ __global__ void eg2vq_vq_gemm_kernel(
         #pragma unroll 4
         for (uint32_t j = 0; j < (uint32_t)EG2VQ_CW_PER_SLAB; j++) {
             const uint32_t i = i0 + 4u * j;
-            /* this thread's four codewords: rows ty*4 + q */
+            /* this thread's eight codewords: rows ty*8 + q */
             float cw[EG2VQ_R_PER_THREAD][4];
             #pragma unroll
             for (uint32_t q = 0; q < EG2VQ_R_PER_THREAD; q++) {
@@ -208,22 +243,16 @@ __global__ void eg2vq_vq_gemm_kernel(
                 const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
                 cw[q][0] = f0.x; cw[q][1] = f0.y; cw[q][2] = f1.x; cw[q][3] = f1.y;
             }
-            /* this thread's four tokens' four values at this codeword */
+            /* this thread's four tokens' four values at this codeword; the
+             * token predicate does not depend on j, so the compiler hoists it
+             * and predicates the loads. */
             float xv[EG2VQ_T_PER_THREAD][4];
-            if (t_ok) {
-                #pragma unroll
-                for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+            #pragma unroll
+            for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
+                xv[a][0] = xv[a][1] = xv[a][2] = xv[a][3] = 0.0f;
+                if (t0 + a < n_tok) {
                     const float4 v = *(const float4 *)(x + (size_t)(t0 + a) * t_stride + i);
                     xv[a][0] = v.x; xv[a][1] = v.y; xv[a][2] = v.z; xv[a][3] = v.w;
-                }
-            } else {   /* ragged tail: load only the tokens this item has */
-                #pragma unroll
-                for (uint32_t a = 0; a < EG2VQ_T_PER_THREAD; a++) {
-                    xv[a][0] = xv[a][1] = xv[a][2] = xv[a][3] = 0.0f;
-                    if (t0 + a < n_tok) {
-                        const float4 v = *(const float4 *)(x + (size_t)(t0 + a) * t_stride + i);
-                        xv[a][0] = v.x; xv[a][1] = v.y; xv[a][2] = v.z; xv[a][3] = v.w;
-                    }
                 }
             }
             #pragma unroll
@@ -266,7 +295,7 @@ static inline int eg2vq_vq_gemm(float *out, const float *x, uint32_t t_stride,
                                 const uint8_t *pay, uint32_t rows, uint32_t cols, uint32_t n_tok) {
     if (!out || !x || !pay || !n_tok || !rows || !cols) { return 0; }
     if ((rows % EG2VQ_BN) || (cols % EG2VQ_BK) || (t_stride < cols)) { return 0; }
-    dim3 block(16, 16);
+    dim3 block(EG2VQ_NTX, EG2VQ_NTY);
     dim3 grid(rows / EG2VQ_BN, (n_tok + EG2VQ_BM - 1) / EG2VQ_BM);
     eg2vq_vq_gemm_kernel<<<grid, block>>>(out, x, t_stride, pay, rows, cols, n_tok);
     return 1;

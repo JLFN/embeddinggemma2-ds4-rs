@@ -1,0 +1,9 @@
+label,backend,clock,items,tokens,wall_s,tokens_per_s,note
+cli_cold,cuda,wall,1,115,.619423971,185.6563,port_secs=0.034430
+srv_single_p50,cuda,wall,1,115,.034019844,3380.379,20 repeats; min=.026603966 max=.038044443 mean=0.033628
+srv_single_p95,cuda,wall,1,115,.036212028,3175.740,p95
+srv_batch_1,cuda,wall,143,80747,11.828066322,6826.728,corpus=143 pages
+srv_batch_2,cuda,wall,143,80747,10.020896531,8057.861,corpus=143 pages
+srv_batch_4,cuda,wall,143,80747,9.135377320,8838.934,corpus=143 pages
+srv_batch_8,cuda,wall,143,80747,8.903064841,9069.573,corpus=143 pages
+srv_batch_14,cuda,wall,14,5091,.522458476,9744.315,PARTIAL corpus=143 pages; cap refused the next request

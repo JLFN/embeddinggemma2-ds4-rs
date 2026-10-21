@@ -2191,6 +2191,18 @@ tests/test_eg2vq_vq: tests/test_eg2vq_vq.cu cuda/eg2vq_vq.cuh ds41_vq_fmt.h
 test-eg2vq-vq: tests/test_eg2vq_vq
 	./tests/test_eg2vq_vq
 
+# The same kernel, measured across the tower's own matrices and token counts
+# (embeddinggemma2 performance unit): the per-shape GFLOP/s record of the kernel
+# the whole-tower nsys attribution had at 36.5% of a batch forward's kernel time,
+# and the largest single item left after the attention unit.  Takes an optional
+# repeat count as its first argument.
+tests/bench_eg2vq_vq: tests/bench_eg2vq_vq.cu cuda/eg2vq_vq.cuh ds41_vq_fmt.h
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
+
+.PHONY: bench-eg2vq-vq
+bench-eg2vq-vq: tests/bench_eg2vq_vq
+	./tests/bench_eg2vq_vq
+
 # embeddinggemma2 PHASE 7 row P3.2: the device attention (symmetric sliding mask,
 # scale 1.0, non-causal) against the CPU reference's own arithmetic.
 tests/test_eg2vq_attn: tests/test_eg2vq_attn.cu cuda/eg2vq_attn.cuh
@@ -2199,6 +2211,18 @@ tests/test_eg2vq_attn: tests/test_eg2vq_attn.cu cuda/eg2vq_attn.cuh
 .PHONY: test-eg2vq-attn
 test-eg2vq-attn: tests/test_eg2vq_attn
 	./tests/test_eg2vq_attn
+
+# The same kernel, measured across the tower's own shapes (embeddinggemma2
+# performance unit): the per-shape millisecond and GFLOP/s record of the kernel
+# the whole-tower nsys attribution points at, so a change to it is argued
+# against a number instead of a whole-forward difference.  Takes an optional
+# repeat count as its first argument.
+tests/bench_eg2vq_attn: tests/bench_eg2vq_attn.cu cuda/eg2vq_attn.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
+
+.PHONY: bench-eg2vq-attn
+bench-eg2vq-attn: tests/bench_eg2vq_attn
+	./tests/bench_eg2vq_attn
 
 tests/test_glm_vq_kda: tests/test_glm_vq_kda.cu cuda/glm_vq_kda.cuh cuda/glm_vq_ops.cuh
 	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
