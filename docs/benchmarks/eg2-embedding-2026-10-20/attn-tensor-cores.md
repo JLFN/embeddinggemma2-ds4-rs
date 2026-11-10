@@ -245,3 +245,28 @@ shared exchange.
 
     # the batch contract
     (cd .. && sh tools/eg2_embed_batch_gate27.sh)
+
+## 11. The split after this unit — the next unit's baseline (same batch, same window as the boundary)
+
+A second nsys profile of the identical 8-item / 2,451-token request on the build
+that carries this unit (`nsys-kern-sum-b8-attn-tensor-cores.txt`), taken after the
+commit and before the next unit's first edit:
+
+| kernel | before this unit | after |
+|---|---|---|
+| `eg2vq_attn_mma_slide_kernel` (20 launches) | `eg2vq_attn_kernel<(int)4>` 31.5 ms | 3.85 ms |
+| `eg2vq_attn_mma_full_kernel` (4 launches) | `eg2vq_attn_kernel<(int)8>` 12.4 ms | 1.59 ms |
+| attention total | 43.9 ms (50.1%) | 5.44 ms (11.0%) |
+| VQ GEMM (`mma<64>` + `mma<128>`) | 19.4 ms (22.1%) | 19.44 ms (39.4%) |
+| `eg2vq_ops_rms_kernel` | 8.64 ms | 8.64 ms |
+| `eg2vq_ops_proj768_kernel` | 7.13 ms | 7.13 ms |
+| `eg2vq_ops_rms_head_kernel` | 5.43 ms | 5.44 ms |
+| the rest of the small ops | 3.1 ms | 3.06 ms |
+| total kernel time | 87.6 ms | 49.2 ms |
+
+Two readings, both honest: the attention row is an 8.1x kernel gain in this
+window against the bench's interleaved 8.4x-10.0x for the same kernels, and the
+total is 1.78x against the corpus's 1.85x-1.87x. The small ops are now 49.2% of
+the forward and are launch-bound (7.13 ms in ONE launch for proj768, 8.64 ms over
+121 for the row RMS); that is the next unit's subject, and its plan is handoff
+section 3.
