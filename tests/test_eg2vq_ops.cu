@@ -150,10 +150,38 @@ static double rel_rms(const std::vector<float> &a, const std::vector<float> &b, 
 }
 
 static int report(const char *tag, double rel, double maxabs, double bound) {
-    const int bad = rel > bound;
+    // NaN is a failure, not a pass: `rel > bound` is false for NaN, so a NaN
+    // output once printed "ok" here (found at performance unit 7).
+    const int bad = !(rel <= bound);
     printf("%-40s rel RMS %.3e   max abs %.3e   bound %.0e   %s\n", tag, rel, maxabs, bound,
            bad ? "OUT OF BOUND" : "ok");
     return bad ? 1 : 0;
+}
+
+/* f32 bit patterns ordered as the reals are, so a distance between two patterns
+ * is a ULP distance (and -0.0 sits one step from +0.0). */
+static uint32_t ord_f32(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/* The warp reduction (the shipped path) changes only the summation tree, so the
+ * kernel header's claim is that its f32 output is bit-identical to the old
+ * block kernel at every width this tower runs.  That claim is MEASURED here
+ * instead of asserted: both forms run on the same input and the f32 patterns are
+ * compared element by element, printing how many differ and by how many ULPs. */
+static int same_bits(const char *tag, const std::vector<float> &a, const std::vector<float> &b) {
+    size_t ndiff = 0;
+    int64_t worst = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        const int64_t d = (int64_t)ord_f32(a[i]) - (int64_t)ord_f32(b[i]);
+        const int64_t ad = d < 0 ? -d : d;
+        if (ad) { ndiff++; }
+        if (ad > worst) { worst = ad; }
+    }
+    printf("%-40s %zu of %zu differ, max %lld ULP   %s\n", tag, ndiff, a.size(),
+           (long long)worst, worst ? "NOT BIT-IDENTICAL" : "bit-identical");
+    return worst ? 1 : 0;
 }
 
 int main(void) {
@@ -215,6 +243,68 @@ int main(void) {
         snprintf(tag, sizeof(tag), "rms per head, weightless (hd %u)", hd);
         const double r4 = rel_rms(got, want, &ma); fails += report(tag, r4, ma, 1e-6);
         cudaFree(dx); cudaFree(dw);
+    }
+
+    /* ---- the two reduction forms at the tower's widths (performance unit 6):
+     *      the warp kernel that ships against the block kernel it replaced.
+     *      Widths 64/768/64 are the vision tower's (head dim, hidden, head dim),
+     *      256/512 the text tower's, 96 and 1024 the neighbours either side of a
+     *      VM step; 73 rows is not a multiple of the 8 warps in a block, so the
+     *      tail guard is exercised, and one 1-row case covers the short call. */
+    for (uint32_t n : {64u, 96u, 256u, 512u, 768u, 1024u}) {
+        for (uint32_t rows : {1u, 73u}) {
+            if (rows == 1u && n != 512u) { continue; }
+            std::vector<float> x((size_t)rows * n), w(n);
+            for (float &v : x) { v = nd(rng); }
+            for (float &v : w) { v = 1.0f + 0.1f * nd(rng); }
+            float *dx = NULL, *dw = NULL, *db = NULL, *dwp = NULL;
+            CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMalloc(&dw, w.size() * 4));
+            CK(cudaMalloc(&db, x.size() * 4)); CK(cudaMalloc(&dwp, x.size() * 4));
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dw, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
+            std::vector<float> vblock(x.size()), vwarp(x.size());
+            char tag[96];
+            for (int weighted = 1; weighted >= 0; weighted--) {
+                eg2vq_ops_rms_block(db, dx, weighted ? dw : NULL, rows, n, EG2VQ_EPS);
+                eg2vq_ops_rms_warp(dwp, n, dx, n, weighted ? dw : NULL, rows, n, EG2VQ_EPS);
+                CK(cudaDeviceSynchronize());
+                CK(cudaMemcpy(vblock.data(), db, vblock.size() * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(vwarp.data(), dwp, vwarp.size() * 4, cudaMemcpyDeviceToHost));
+                snprintf(tag, sizeof(tag), "rms warp vs block (n %u, rows %u, w %d)",
+                         n, rows, weighted);
+                fails += same_bits(tag, vwarp, vblock);
+            }
+            cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(dwp);
+        }
+    }
+
+    /* The per-head form, same comparison: hd 64 is the vision tower's head, 256
+     * and 512 the text tower's, and 4 heads is what the text tower's q uses. */
+    for (uint32_t hd : {64u, 256u, 512u}) {
+        const uint32_t rows = 73, heads = 4;
+        std::vector<float> x((size_t)rows * heads * hd), w(hd);
+        for (float &v : x) { v = nd(rng); }
+        for (float &v : w) { v = 1.0f + 0.1f * nd(rng); }
+        float *dx = NULL, *dw = NULL, *db = NULL;
+        CK(cudaMalloc(&dx, x.size() * 4)); CK(cudaMalloc(&dw, w.size() * 4));
+        CK(cudaMalloc(&db, x.size() * 4));
+        CK(cudaMemcpy(dw, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<float> vblock(x.size()), vwarp(x.size());
+        char tag[96];
+        for (int weighted = 1; weighted >= 0; weighted--) {
+            const uint32_t nrow = rows * heads;
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            eg2vq_ops_rms_head_block(dx, weighted ? dw : NULL, rows, heads, hd, EG2VQ_EPS);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(vblock.data(), dx, vblock.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+            eg2vq_ops_rms_warp(dx, hd, dx, hd, weighted ? dw : NULL, nrow, hd, EG2VQ_EPS);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(vwarp.data(), dx, vwarp.size() * 4, cudaMemcpyDeviceToHost));
+            snprintf(tag, sizeof(tag), "rms_head warp vs block (hd %u, w %d)", hd, weighted);
+            fails += same_bits(tag, vwarp, vblock);
+        }
+        cudaFree(dx); cudaFree(dw); cudaFree(db);
     }
 
     /* ---- RoPE at both bases, over a full item (the mask layers' base 1e4 and
@@ -401,6 +491,28 @@ int main(void) {
         double ma;
         const double rel = rel_rms(got, want, &ma);
         fails += report("proj768 + mean pool + L2", rel, ma, 1e-5);
+        /* Performance unit 7: the tensor-core form is the shipped one, and the
+         * block form stays as its fallback.  Both are held to the same 1e-5
+         * against the reference, and the distance between the two is reported:
+         * it is the operand split's own cost, and the bound the unit declared
+         * before the change was that BOTH stay inside 1e-5. */
+        std::vector<float> got_block(n_out);
+        if (!eg2vq_ops_proj768_pool_form(dy, dacc, dh, dw, dnw, doff, 1u, n_tok,
+                                         n_embd, n_out, EG2VQ_EPS, 0)) {
+            printf("FAIL: the block projection form refused the shape\n");
+            fails++;
+        } else {
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(got_block.data(), dy, n_out * 4, cudaMemcpyDeviceToHost));
+            double mb;
+            const double relb = rel_rms(got_block, want, &mb);
+            fails += report("proj768 block form (fallback)", relb, mb, 1e-5);
+            double mab;
+            const double relab = rel_rms(got_block, got, &mab);
+            printf("%-44s rel_rms %.2e | %s\n", "tensor-core vs block form", relab,
+                   relab <= 1e-5 ? "ok" : "OUT OF BOUND");
+            if (!(relab <= 1e-5)) { fails++; }
+        }
         // and the pooled vector must be unit length
         double ns = 0.0;
         for (float v : got) { ns += (double)v * (double)v; }
@@ -449,7 +561,13 @@ int main(void) {
             fails++;
             ok = 0;
         }
-        if (ok) {
+        for (int form = 0; ok && form < 2; form++) {
+            if (form == 1) {
+                /* the same packed block through the block form, so the two
+                 * projection kernels are held to the per-item contract too */
+                if (!eg2vq_ops_proj768_pool_form(dy, dacc, dh, dw, dnw, doff, 3u, n_tok,
+                                                 n_embd, n_out, EG2VQ_EPS, 0)) { ok = 0; }
+            }
             CK(cudaDeviceSynchronize());
             std::vector<float> got((size_t)3 * n_out);
             CK(cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost));
@@ -463,7 +581,8 @@ int main(void) {
                                            want, &ma);
                 if (rel > worst) { worst = rel; }
             }
-            printf("%-44s worst rel_rms %.2e | %s\n", "3 items packed (1/349/40 rows)",
+            printf("%-44s worst rel_rms %.2e | %s\n",
+                   form ? "3 items packed (block form)" : "3 items packed (tensor-core)",
                    worst, worst <= 1e-5 ? "ok" : "OUT OF BOUND");
             if (!(worst <= 1e-5)) { fails++; }
         }

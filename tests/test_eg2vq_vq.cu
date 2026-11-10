@@ -221,62 +221,93 @@ int main(void) {
             }
         }
 
-        // ---- the device ------------------------------------------------------
+        // ---- the device: both paths, each against FP64 -----------------------
+        // The scalar path is bit-identical to the reference decode and is held
+        // to the f32 summation bound it always had (1e-5 / 1 - 1e-6). The
+        // tensor-core path is not bit-identical by construction: it rounds the
+        // activation to f16 once and lets the tensor core sum its own k16
+        // groups. Its declared bound below is set from measurement with margin,
+        // and the measured value is printed on every run so a drift is visible
+        // even when the bound still passes. The end-to-end gates (the attention
+        // gate and the corpus retrieval floor) remain the authority on whether
+        // that is acceptable; this bound only catches a broken kernel.
+        struct runpath {
+            int (*fn)(float *, const float *, uint32_t, const uint8_t *, uint32_t, uint32_t, uint32_t);
+            const char *name;
+            double rel_bound;
+            double cos_flip;      /* fails when min_cos < 1 - cos_flip */
+        };
+        const runpath paths[5] = {
+            { eg2vq_vq_gemm_scalar, "scalar",  1e-5, 1e-6 },
+            /* Both token tiles are checked on every case: the dispatcher only
+             * picks the 128-token tile for calls of 512+ tokens whose grid
+             * fills a wave, and no case above reaches that, so naming the two
+             * instantiations here is what keeps the wide tile gated. The two
+             * WMMA tiles are the other gemma4's form (staged f16 tile), and
+             * they are held to the same bound as the register-direct form. */
+            { eg2vq_vq_gemm_mma64,  "mma-f16-64",  3e-4, 1e-7 },
+            { eg2vq_vq_gemm_mma128, "mma-f16-128", 3e-4, 1e-7 },
+            { eg2vq_vq_gemm_wmma32, "wmma-f16-32", 3e-4, 1e-7 },
+            { eg2vq_vq_gemm_wmma64, "wmma-f16-64", 3e-4, 1e-7 },
+        };
         float *dp = NULL, *dx = NULL, *dy = NULL;
         CK(cudaMalloc(&dp, pay.size()));
         CK(cudaMalloc(&dx, x.size() * 4));
         CK(cudaMalloc(&dy, (size_t)c.tokens * c.rows * 4));
         CK(cudaMemcpy(dp, pay.data(), pay.size(), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
-        CK(cudaMemset(dy, 0, (size_t)c.tokens * c.rows * 4));
-        if (!eg2vq_vq_gemm(dy, dx, c.cols, (const uint8_t *)dp, c.rows, c.cols, c.tokens)) {
-            printf("FAIL %s: the launcher refused the shape\n", c.tag);
-            fails++;
-            cudaFree(dp); cudaFree(dx); cudaFree(dy);
-            continue;
-        }
-        CK(cudaDeviceSynchronize());
-        std::vector<float> ydev((size_t)c.tokens * c.rows);
-        CK(cudaMemcpy(ydev.data(), dy, ydev.size() * 4, cudaMemcpyDeviceToHost));
-
-        // ---- compare ---------------------------------------------------------
-        double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0, min_cos = 1.0;
-        for (uint32_t t = 0; t < ref_tokens; t++) {
-            double dot = 0.0, na = 0.0, nb = 0.0;
-            for (uint32_t r = 0; r < ref_rows; r++) {
-                const double a = yref[(size_t)t * ref_rows + r];
-                const double b = ydev[(size_t)t * c.rows + r];
-                const double d = b - a;
-                if (fabs(d) > max_abs) { max_abs = fabs(d); }
-                sum_sq += d * d;
-                ref_sq += a * a;
-                dot += a * b; na += a * a; nb += b * b;
-            }
-            const double cos = (na > 0.0 && nb > 0.0) ? dot / sqrt(na * nb) : 1.0;
-            if (cos < min_cos) { min_cos = cos; }
-        }
-        const double rel = (ref_sq > 0.0) ? sqrt(sum_sq / ref_sq) : 0.0;
-
-        // ---- timing (one matrix, best of 3 warm launches) --------------------
         cudaEvent_t e0, e1;
         CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-        float ms = 0.0f, best = 1e30f;
-        for (int rep = 0; rep < 4; rep++) {
-            CK(cudaEventRecord(e0));
-            eg2vq_vq_gemm(dy, dx, c.cols, (const uint8_t *)dp, c.rows, c.cols, c.tokens);
-            CK(cudaEventRecord(e1));
-            CK(cudaEventSynchronize(e1));
-            CK(cudaEventElapsedTime(&ms, e0, e1));
-            if (rep && ms < best) { best = ms; }
-        }
-        const double flop = 2.0 * (double)c.rows * (double)c.cols * (double)c.tokens;
-        const double gflops = flop / (best * 1e6);
-        const double gbs = (double)pay.size() * ((c.tokens + 63) / 64) / (best * 1e6);
+        for (const runpath &p : paths) {
+            CK(cudaMemset(dy, 0, (size_t)c.tokens * c.rows * 4));
+            if (!p.fn(dy, dx, c.cols, (const uint8_t *)dp, c.rows, c.cols, c.tokens)) {
+                printf("%-34s rows %5u cols %4u tok %4u | %-7s not applicable to this shape\n",
+                       c.tag, c.rows, c.cols, c.tokens, p.name);
+                continue;
+            }
+            CK(cudaDeviceSynchronize());
+            std::vector<float> ydev((size_t)c.tokens * c.rows);
+            CK(cudaMemcpy(ydev.data(), dy, ydev.size() * 4, cudaMemcpyDeviceToHost));
 
-        printf("%-34s rows %5u cols %4u tok %4u | ref %ux%u | maxabs %.2e rel %.2e mincos %.9f | %7.3f ms %6.1f GFLOP/s %6.1f GB/s%s\n",
-               c.tag, c.rows, c.cols, c.tokens, ref_rows, ref_tokens, max_abs, rel, min_cos,
-               best, gflops, gbs, (rel > 1e-5 || min_cos < 1.0 - 1e-6) ? "  <-- OUT OF BOUND" : "");
-        if (rel > 1e-5 || min_cos < 1.0 - 1e-6) { fails++; }
+            // ---- compare -----------------------------------------------------
+            double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0, min_cos = 1.0;
+            for (uint32_t t = 0; t < ref_tokens; t++) {
+                double dot = 0.0, na = 0.0, nb = 0.0;
+                for (uint32_t r = 0; r < ref_rows; r++) {
+                    const double a = yref[(size_t)t * ref_rows + r];
+                    const double b = ydev[(size_t)t * c.rows + r];
+                    const double d = b - a;
+                    if (fabs(d) > max_abs) { max_abs = fabs(d); }
+                    sum_sq += d * d;
+                    ref_sq += a * a;
+                    dot += a * b; na += a * a; nb += b * b;
+                }
+                const double cos = (na > 0.0 && nb > 0.0) ? dot / sqrt(na * nb) : 1.0;
+                if (cos < min_cos) { min_cos = cos; }
+            }
+            const double rel = (ref_sq > 0.0) ? sqrt(sum_sq / ref_sq) : 0.0;
+
+            // ---- timing (one matrix, best of 3 warm launches) ----------------
+            float ms = 0.0f, best = 1e30f;
+            for (int rep = 0; rep < 4; rep++) {
+                CK(cudaEventRecord(e0));
+                p.fn(dy, dx, c.cols, (const uint8_t *)dp, c.rows, c.cols, c.tokens);
+                CK(cudaEventRecord(e1));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                if (rep && ms < best) { best = ms; }
+            }
+            const double flop = 2.0 * (double)c.rows * (double)c.cols * (double)c.tokens;
+            const double gflops = flop / (best * 1e6);
+            const double gbs = (double)pay.size() * ((c.tokens + 63) / 64) / (best * 1e6);
+            const bool bad = (rel > p.rel_bound || min_cos < 1.0 - p.cos_flip);
+
+            printf("%-34s rows %5u cols %4u tok %4u | %-7s ref %ux%u | maxabs %.2e rel %.2e mincos %.10f | %7.3f ms %6.1f GFLOP/s %6.1f GB/s%s\n",
+                   c.tag, c.rows, c.cols, c.tokens, p.name, ref_rows, ref_tokens,
+                   max_abs, rel, min_cos, best, gflops, gbs,
+                   bad ? "  <-- OUT OF BOUND" : "");
+            if (bad) { fails++; }
+        }
         cudaEventDestroy(e0); cudaEventDestroy(e1);
         cudaFree(dp); cudaFree(dx); cudaFree(dy);
     }

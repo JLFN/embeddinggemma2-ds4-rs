@@ -1,0 +1,1 @@
+{"status":"ok","model":"eg2-embed-sweep","backend":"cuda","family":"gemma_vq","embedding":true,"embed":{"item_tokens_max":2048,"batch_rows_max":8192,"image":{"soft_tokens_min":70,"soft_tokens_max":1120,"pixels_min":161280,"pixels_max":2580480,"embd":512,"per_item_max":1,"serial":true}}}

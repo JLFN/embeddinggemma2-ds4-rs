@@ -1,0 +1,14 @@
+# bench_eg2vq_ops — 200 repeats per row per form, median; both forms interleaved
+shape                                rows   ms_block    ms_warp  speedup block GB/s  warp GB/s
+rms 512 x 2451 (8 pages)             2451     0.0553     0.0181     3.05      181.6      553.3
+rms 512 x 58824 (PLE)               58824     1.2732     0.5571     2.29      189.2      432.5
+rms 512 x 294 (1 page)                294     0.0092     0.0058     1.58      130.7      206.8
+rms 512 x 27 (short item)              27     0.0041     0.0052     0.80       27.0       21.5
+rms 768 x 1120 (vision)              1120     0.0287     0.0155     1.85      240.0      444.3
+rms_head 256 x 4 (q, swa)            9804     0.1044     0.0397     2.63      192.2      505.6
+rms_head 256 x 2 (k,v swa)           4902     0.0532     0.0212     2.51      188.5      473.9
+rms_head 512 x 4 (q, full)           9804     0.1235     0.0584     2.12      325.3      688.0
+rms_head 512 x 1 (k,v full)          2451     0.0328     0.0181     1.81      306.4      554.3
+rms_head 256 x 4 (q, 1 page)         1176     0.0151     0.0072     2.10      159.8      336.0
+rms_head 64 x 12 (vision)           13440     0.1229     0.0345     3.57       56.0      199.7
+BENCH_EG2VQ_OPS_OK

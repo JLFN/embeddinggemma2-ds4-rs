@@ -56,8 +56,9 @@
  * WHAT THE DEVICE ADDS, named rather than hidden (the gate measures both):
  *  - the accumulations that the CPU leg runs in double (the GEMM's dots, the
  *    attention scores, the pool's 9-term sum) accumulate in their own order
- *    here: f32 for the GEMM and the attention (the tree's own choice in
- *    cuda/eg2vq_attn.cuh:57-69), double for the pool's nine terms.
+ *    here: f32 for the GEMM and the attention (eg2vq_attn.cuh:102-140, the
+ *    scalar and vectorized four-partial-sum dots), double for the pool's nine
+ *    terms.
  *  - the softmax is ONLINE (a running max and sum rescaled per KV tile) instead
  *    of the CPU leg's two-pass max-then-exp; the two are the same function up to
  *    rounding, and the online form is the one the reference's own flash kernel
@@ -387,7 +388,7 @@ static inline int eg2vq_vis_f16_round(float *x, uint64_t n) {
  * item (no mask, no window: graph:344-381).  Per KV tile the warp computes the
  * scores, updates the running max, rescales the running denominator and output
  * by exp(m_old - m_new) and accumulates this tile's weighted V.  The score and
- * output accumulations are f32 with four partial sums (cuda/eg2vq_attn.cuh:57-69
+ * output accumulations are f32 with four partial sums (eg2vq_attn.cuh:102-140
  * for the same choice, measured there); the probabilities are cached in shared
  * and read back by the output pass, so each (query, key) dot is computed once. */
 __device__ __forceinline__ static float eg2vq_vis_attn_wmax(float v) {

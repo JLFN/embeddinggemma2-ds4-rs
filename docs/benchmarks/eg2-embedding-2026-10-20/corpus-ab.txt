@@ -1,0 +1,23 @@
+# Corpus A/B, 143 pages / 80,747 tokens, one fresh server per run, interleaved
+# old = 7cafa2a2 (before this unit), new = the working tree of this unit.
+# Both on the same artifact, card and pages; the sweep's own wall clock.
+
+round 1                     old                     new             ratio
+batch 1   8.256871279 s  9,779.4 tok/s   5.306240535 s 15,217.4 tok/s   1.56x
+batch 2   6.888394337 s 11,722.2 tok/s   4.014663072 s 20,113.0 tok/s   1.72x
+batch 4   6.279703159 s 12,858.4 tok/s   3.565050447 s 22,649.6 tok/s   1.76x
+batch 8   6.049494264 s 13,347.7 tok/s   3.364767848 s 23,997.8 tok/s   1.80x
+
+round 2                     old                     new             ratio
+batch 1   8.264781677 s  9,770.0 tok/s   5.249102954 s 15,383.0 tok/s   1.57x
+batch 2   6.888394337 s 11,722.2 tok/s   4.014663072 s 20,113.0 tok/s   1.72x
+batch 4   6.253721176 s 12,911.8 tok/s   3.552714608 s 22,728.3 tok/s   1.76x
+batch 8   6.077053162 s 13,287.2 tok/s   3.363439952 s 24,007.3 tok/s   1.81x
+
+The batch-14 row is PARTIAL in every run by the model's own 8192-token request
+budget (the sweep refuses at item 14 and records it); it is not comparable.
+
+single-item p50 (20 repeats, wall): round 1 old 24.85 ms / new 24.59 ms;
+round 2 old 24.87 ms / new 15.94 ms. One item per request is dominated by the
+server's per-request cost, and the two rounds disagree; the corpus rows above
+are the end-to-end number this unit claims.

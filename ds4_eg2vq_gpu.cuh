@@ -612,7 +612,10 @@ static int eg2vq_gpu_embed_core(ds4_eg2vq_gpu_ctx *ctx, const int32_t *ids,
         /* e. attention, scale 1.0, non-causal, the symmetric +-512 window inside
          * each row's OWN item (graph:279-288; `pos`/`len` carry the item bounds,
          * which is what keeps the batch's items apart) */
-        if (!eg2vq_attn(attn, q, k, v, pos, len, n_ids, DS4_EG2VQ_N_HEAD, nkv, hd, half_swa)) { return 0; }
+        /* the tensor-core path needs the call's own span table (one CTA is one
+         * item's tile): `item_off` is the host array this call validated above. */
+        if (!eg2vq_attn(attn, q, k, v, pos, len, n_ids, DS4_EG2VQ_N_HEAD, nkv, hd, half_swa,
+                        item_off, n_items)) { return 0; }
         /* f. o_proj (graph:290-291) */
         if (!eg2vq_vq_gemm(a, attn, qw, eg2vq_gpu_pay(g, rec + DS4_EG2VQ_REC_L_O), E, qw, n_ids)) { return 0; }
         /* g. h += attn_post_norm(o) (graph:293-300) */

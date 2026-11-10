@@ -1,0 +1,12 @@
+# bench_eg2vq_attn — 20 repeats per row per path, one kernel launch per measurement
+shape               rows    keys   ms_scalar      ms_mma  speedup mma_gflop/s
+cli115_s             115   13225      0.0319      0.0314     1.02     1727.3
+page294_s            294   86436      0.1352      0.0594     2.27     5957.9
+page565_s            565  316469      0.4694      0.0991     4.74    13079.8
+max1414_s           1414 1186694      1.6353      0.1768     9.25    27487.7
+page294_f            294   86436      0.2638      0.0765     3.45     9250.7
+max1414_f           1414 1999396      5.2470      0.6214     8.44    26359.3
+batch8x306_s        2448  749088      1.0216      0.1352     7.56    22699.6
+batch8x565_s        4520 2531752      3.5860      0.3293    10.89    31490.1
+batch8x565_f        4520 2553800      7.2581      0.7657     9.48    27323.6
+BENCH_EG2VQ_ATTN_OK
