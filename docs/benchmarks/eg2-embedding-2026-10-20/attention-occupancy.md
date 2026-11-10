@@ -113,7 +113,7 @@ CSVs carry no timestamp of their own.
 
 | | build | corpus artifact (`speed-bench/`) | batch 8 (80,747 tokens) |
 |---|---|---|---|
-| baseline policy | `dev` (scalar, static plane) | `eg2_embed_vizzio.csv` | 18.7998 s, 4,295 tok/s |
+| baseline policy | `dev` (scalar, static plane) | `eg2_embed_bench.csv` | 18.7998 s, 4,295 tok/s |
 | item-sized plane | vectorized, dynamic | `..._attn-itemplane.csv` | 13.0896 s, 6,168.8 tok/s |
 | fixed ceiling plane | vectorized, dynamic | `..._attn-plane2048{,_r2}.csv` | 11.0454 / 10.5965 s, 7,310.5 / 7,620.2 tok/s |
 | fixed 1536 plane | vectorized, dynamic | `..._attn-plane1536{,_r2}.csv` | 10.5544 / 10.8699 s, 7,650.5 / 7,428.5 tok/s |
@@ -189,12 +189,12 @@ shipped one end to end; the nsys report was taken before the plane was reverted.
 
 The raw rows are committed beside this record, one file per policy, each holding
 the 143-page corpus sweep it is named for (the `srv_batch_8` row identifies each
-one): `speed-bench/eg2_embed_vizzio_attn-itemplane.csv` (the rejected item-sized
+one): `speed-bench/eg2_embed_bench_attn-itemplane.csv` (the rejected item-sized
 plane, 13.0896 s / 6,168.8 tok/s), `-plane2048.csv` and `-plane2048_r2.csv` (the
 fixed ceiling plane, 11.0454 / 10.5965 s), `-plane1536.csv` and `-plane1536_r2.csv`
 (the fixed 1536 plane, 10.5544 / 10.8699 s), and `-vec4.csv` with `_r2.csv` and
 `_r3.csv` (the shipped build, 11.6541 / 11.7179 / 11.6584 s), under the single
-`speed-bench/eg2_embed_vizzio_attn_health.json` the shipped build served. The
+`speed-bench/eg2_embed_bench_attn_health.json` the shipped build served. The
 harness's own output either side of the change is `bench-attn-before.txt` and
 `bench-attn-after.txt`. The before column was taken from the `dev` tip 10e73aa0
 with the bench harness built against that kernel, and the QA pass rebuilt the
@@ -212,11 +212,11 @@ make ds4 ds4-server tests/bench_eg2vq_attn tests/test_eg2vq_attn
 make test-eg2vq-attn                       # EG2VQ_ATTN_PASS
 make bench-eg2vq-attn                      # the per-shape table above
 ./tests/parity/eg2vq_embd_gpu_oracle \
-  /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
-  /data/embeddinggemma2/out/phase7-ids300.tsv
+  <root>/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
+  <root>/embeddinggemma2/out/phase7-ids300.tsv
 # the attribution and the end-to-end rows: nsys profile -o /tmp/x ./ds4-server ... ,
 # then nsys stats --report cuda_gpu_kern_sum /tmp/x.nsys-rep
 sh speed-bench/eg2_embed_sweep.sh \
-  /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
-  /data/embeddinggemma2/out/live-demo/pages 8098
+  <root>/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
+  <root>/embeddinggemma2/out/live-demo/pages 8098
 ```

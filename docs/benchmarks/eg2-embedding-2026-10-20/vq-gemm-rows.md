@@ -147,7 +147,7 @@ new `REG:128`), and `speed-bench/eg2_embed_sweep.sh` was run against each in tur
 | batch 4 | 11.383 / 11.368 s | 9.158 / 9.135 s | 1.244x | 1.243x | 1.244x |
 | batch 8 | 11.153 / 11.146 s | 8.893 / 8.903 s | 1.253x | 1.254x | 1.252x |
 
-(`ab-sweep.txt`; the four CSVs are `speed-bench/eg2_embed_vizzio_vq-ab-{old,new}-r{1,2}.csv`
+(`ab-sweep.txt`; the four CSVs are `speed-bench/eg2_embed_bench_vq-ab-{old,new}-r{1,2}.csv`
 with their health payloads. "Pooled" is the ratio of the two rounds' summed times,
 which is the figure this document quotes; the two round pairings are beside it
 because they are the honest spread. On every row but batch 1 the pairings agree to
@@ -172,7 +172,7 @@ unit was in flight — 2,048.6 and 2,008.9 tokens/s — but neither is backed by
 committed raw file, so only the cited pair is used here.)
 
 **Cumulative.** With the attention unit's committed CSV as the dev baseline, the
-corpus at batch 8 reads 18.7998 s (2026-10-20, `speed-bench/eg2_embed_vizzio.csv`)
+corpus at batch 8 reads 18.7998 s (2026-10-20, `speed-bench/eg2_embed_bench.csv`)
 -> 8.903 s (2026-10-21): 2.11x over the two units, 4,295 -> 9,070 tokens/s.
 
 ## 5. What this does NOT prove
@@ -215,15 +215,15 @@ corpus at batch 8 reads 18.7998 s (2026-10-20, `speed-bench/eg2_embed_vizzio.csv
 # the kernel gate and the tower gate (~7 min for the second one)
 make test-eg2vq-vq                                  # EG2VQ_VQ_PASS
 ./tests/parity/eg2vq_embd_gpu_oracle \
-    /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
-    /data/embeddinggemma2/out/phase7-ids300.tsv
+    <root>/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
+    <root>/embeddinggemma2/out/phase7-ids300.tsv
 
 # the bit-identity driver (needs the pre-change header beside it; see build.sh)
 cd docs/benchmarks/eg2-embedding-2026-10-20/qa-identity && bash build.sh && ./qa-identity
 
 # the ablation, as committed (the probe pins its own R=4 tile; see its PINNED note)
 nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
-     -Xcompiler -march=native -Xcompiler -pthread -I/data/embeddinggemma2/ds4-rs \
+     -Xcompiler -march=native -Xcompiler -pthread -I<root>/embeddinggemma2/ds4-rs \
      -o /tmp/probe-vq probes/probe-vq.cu && /tmp/probe-vq 15
 
 # the interleaved bench A/B

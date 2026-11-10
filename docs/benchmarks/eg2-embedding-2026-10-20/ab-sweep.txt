@@ -1,5 +1,5 @@
 # the embedding corpus (143 pages, 80,747 tokens) old vs new, 2026-10-21 07:39-07:42, interleaved (old, new, old, new)
-# source: speed-bench/eg2_embed_vizzio_vq-ab-{old,new}-r{1,2}.csv
+# source: speed-bench/eg2_embed_bench_vq-ab-{old,new}-r{1,2}.csv
 
 row              old_r1_s     old_r2_s ratio_old     new_r1_s     new_r2_s ratio_new  speedup
 srv_batch_1       14.6184      14.1858    1.030      11.7096      11.8281    0.990    1.22x
