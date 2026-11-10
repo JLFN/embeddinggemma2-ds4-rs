@@ -157,6 +157,102 @@ int main(int argc, char **argv) {
                s.tag, nrow, mb, mw, mb / mw, gb / ((double)mb * 1e-3), gb / ((double)mw * 1e-3));
         cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(dv);
     }
+    /* ---- the 768 projection: block-per-row vs tensor-core (unit 7) ---------
+     * The same 512 x 768 weight matrix (bf16, the artifact's own type) against
+     * the tower's three row counts.  The two forms do NOT compute the same
+     * arithmetic: the tensor-core form splits the f32 activation into a bf16 hi
+     * and a bf16 residue lo and runs both products, so its useful FLOPs are
+     * rows x 512 x 768 and its mma FLOPs are twice that; both columns are
+     * printed.  The accuracy of the pair belongs to tests/test_eg2vq_ops.cu. */
+    {
+        const uint32_t n_embd = 512u, n_out = 768u;
+        const uint32_t rows3[3] = { 2451u, 294u, 27u };
+        const char *tags[3] = {
+            "proj768 512x768, 2451 rows (8 pages)",
+            "proj768 512x768, 294 rows (1 page)",
+            "proj768 512x768, 27 rows (short item)",
+        };
+        printf("#\n# the 768 projection, both forms interleaved in one process\n");
+        printf("%-38s %6s %10s %10s %8s %12s %12s\n",
+               "shape", "rows", "ms_block", "ms_mma", "speedup", "block GFLOP/s", "mma GFLOP/s");
+        for (uint32_t si = 0; si < 3u; si++) {
+            const uint32_t nrow = rows3[si];
+            std::vector<float> hx((size_t)nrow * n_embd), hw(n_embd);
+            std::vector<uint16_t> hwt((size_t)n_out * n_embd);
+            for (float &v : hx) { v = rnd_unit(); }
+            for (float &v : hw) { v = 1.0f + 0.1f * rnd_unit(); }
+            for (uint16_t &v : hwt) {
+                __nv_bfloat16 b = __float2bfloat16(0.02f * rnd_unit());
+                memcpy(&v, &b, 2);
+            }
+            float *dh = NULL, *dnw = NULL, *dacc = NULL, *dout = NULL;
+            uint16_t *dw = NULL;
+            uint32_t *doff = NULL;
+            CK(cudaMalloc(&dh, hx.size() * 4)); CK(cudaMalloc(&dnw, n_embd * 4));
+            CK(cudaMalloc(&dw, hwt.size() * 2));
+            CK(cudaMalloc(&dacc, (size_t)nrow * n_out * 4));
+            CK(cudaMalloc(&dout, (size_t)n_out * 4));
+            CK(cudaMalloc(&doff, 2 * sizeof(uint32_t)));
+            CK(cudaMemcpy(dh, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dnw, hw.data(), n_embd * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dw, hwt.data(), hwt.size() * 2, cudaMemcpyHostToDevice));
+            const uint32_t off_h[2] = { 0u, nrow };
+            CK(cudaMemcpy(doff, off_h, sizeof(off_h), cudaMemcpyHostToDevice));
+
+            auto run = [&](int form) -> int {
+                return eg2vq_ops_proj768_pool_form(dout, dacc, dh, dw, dnw, doff, 1u,
+                                                   nrow, n_embd, n_out, eps, form);
+            };
+            /* the pair's agreement before any timing: the split's cost, measured
+             * against the block form on the same input */
+            std::vector<float> v0(n_out), v1(n_out);
+            run(0); CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(v0.data(), dout, n_out * 4, cudaMemcpyDeviceToHost));
+            run(1); CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(v1.data(), dout, n_out * 4, cudaMemcpyDeviceToHost));
+            double num = 0.0, den = 0.0;
+            for (uint32_t o = 0; o < n_out; o++) {
+                const double d = (double)v1[o] - (double)v0[o];
+                num += d * d;
+                den += (double)v0[o] * (double)v0[o];
+            }
+            const double rel = den > 0.0 ? sqrt(num / den) : 0.0;
+            if (!(rel <= 1e-5)) {
+                printf("%-38s FORMS DISAGREE rel_rms %.2e\n", tags[si], rel);
+                fail = 1;
+            }
+
+            auto time = [&](int form) -> float {
+                std::vector<float> ms;
+                for (int rep = 0; rep < repeats + 20; rep++) {
+                    cudaEvent_t a, b;
+                    CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+                    CK(cudaEventRecord(a));
+                    if (!run(form)) { printf("launch refused\n"); exit(2); }
+                    CK(cudaEventRecord(b));
+                    CK(cudaEventSynchronize(b));
+                    float msec = 0.0f;
+                    CK(cudaEventElapsedTime(&msec, a, b));
+                    if (rep >= 20) { ms.push_back(msec); }
+                    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+                }
+                for (size_t i = 0; i + 1 < ms.size(); i++) {
+                    for (size_t j = i + 1; j < ms.size(); j++) {
+                        if (ms[j] < ms[i]) { const float t = ms[i]; ms[i] = ms[j]; ms[j] = t; }
+                    }
+                }
+                return ms[ms.size() / 2];
+            };
+            const float mb = time(0);
+            const float mm = time(1);
+            const double gflop = 2.0 * (double)nrow * n_embd * (double)n_out / 1.0e9;
+            printf("%-38s %6u %10.4f %10.4f %8.2f %12.1f %12.1f\n",
+                   tags[si], nrow, mb, mm, mb / mm,
+                   gflop / ((double)mb * 1e-3), gflop / ((double)mm * 1e-3));
+            cudaFree(dh); cudaFree(dnw); cudaFree(dw); cudaFree(dacc);
+            cudaFree(dout); cudaFree(doff);
+        }
+    }
     printf("%s\n", fail ? "BENCH_EG2VQ_OPS_FAIL" : "BENCH_EG2VQ_OPS_OK");
     return fail;
 }

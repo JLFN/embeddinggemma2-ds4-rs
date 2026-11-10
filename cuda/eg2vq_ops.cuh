@@ -53,6 +53,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 
 /* tanh GELU, ggml's coefficients (graph:35-41; ggml-cpu/vec.h:963-969). */
@@ -434,7 +435,9 @@ static inline int eg2vq_ops_gelu_mul(float *gate, const float *up, uint64_t n) {
  * accumulator, whose sum order was the atomics' own).  The pool below then reads
  * those rows in order, which is the CPU reference's own sum order
  * (ds4_eg2vq_graph.inc:363-365: `out768[o] += ref_row_dot(...)` per token). */
-__global__ void eg2vq_ops_proj768_kernel(
+/* The original form, kept for the A/B and as the fallback for any shape the
+ * tensor-core tile cannot cover. */
+__global__ void eg2vq_ops_proj768_block_kernel(
         float *__restrict__ acc, const float *__restrict__ h,
         const uint16_t *__restrict__ w, const float *__restrict__ norm_w,
         uint32_t n_embd, uint32_t n_out, float eps) {
@@ -469,6 +472,213 @@ __global__ void eg2vq_ops_proj768_kernel(
             a += v * e_s[i];
         }
         accrow[o] = a;
+    }
+}
+
+/* ------------------------------------------------------------------------- *
+ * The same projection on the tensor cores (performance unit 7, 2026-11-10).
+ *
+ * WHY, measured before the change: an nsys profile of the same 8-item /
+ * 2,451-token batch read 7.13 ms in ONE launch of the kernel above, 2,451 rows
+ * x 512 x 768 = 1.93 GFLOP at 271 GFLOP/s, i.e. one hundredth of what this card
+ * (RTX 4070 SUPER, sm_89) does on the payload GEMM. The kernel is not
+ * launch-bound (one launch) and not bandwidth-bound (the 786 KB weight matrix is
+ * L2-resident); it is scalar: one block of 256 threads per row, each thread
+ * walking 512 bf16 weights per output with a widening memcpy in the inner loop.
+ *
+ * WHAT CHANGES: the dot moves to mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+ * (sm_80+; the bf16 sibling of the f16 instruction this project's payload GEMM
+ * and attention lane already use, cuda/eg2vq_vq.cuh:350-359 and
+ * cuda/eg2vq_attn.cuh:474-477). The B operand is the weight matrix EXACTLY as
+ * the file stores it: bf16, so the mma's widening is exact and B needs no
+ * conversion at all -- W is [n_out][n_embd] row-major, which is the column-major
+ * [k][n] the instruction wants, one uint32 load per fragment register.
+ *
+ * THE A OPERAND, AND WHY IT IS SPLIT (measured, /tmp/prec_proj.cu at this
+ * boundary, reported in the unit's record section 2): the projection's A is the
+ * f32 output_norm row, and an mma operand cannot be f32. Rounding it to one bf16
+ * moves the pooled, L2-normalized 768-vector by rel_rms 1.65e-03 and rounding it
+ * to f16/tf32 by 2.00e-04, both far outside the 1e-5 this kernel's own gate
+ * (tests/test_eg2vq_ops.cu, "proj768 + mean pool + L2") has declared since phase
+ * 7. Splitting A into hi = bf16(e) and lo = bf16(e - hi) and accumulating BOTH
+ * products into the same f32 accumulators carries e to 16 significand bits and
+ * puts the pooled vector at rel_rms 2.50e-06, inside the declared bound, at 2x
+ * the mma work. The split is the only operand change; the k-reduction's order
+ * is the tensor core's, which the unit measures against gate 7's declared bound
+ * (min cos >= 0.999999, rel_rms <= 1e-03) rather than assumes.
+ *
+ * THE SHAPE OF THE WORK: a block owns TM = 64 tokens x TN = 64 outputs and runs
+ * all K one 64-wide chunk at a time; 8 warps are 4 row groups x 2 column groups,
+ * each warp 16 rows x 32 outputs (four n8 tiles). The row's own output_norm RMS
+ * is the prologue (4 threads per row, double sum, the same reduction the block
+ * kernel ran with 256), and the epilogue writes each row to ITS OWN plane
+ * (acc + row * n_out), which is unit 27's contract: an item's numbers cannot
+ * depend on which items share the call. Padding rows compute zeros and store
+ * nothing.
+ */
+constexpr uint32_t EG2VQ_P768_TM = 64u;      /* tokens per block */
+constexpr uint32_t EG2VQ_P768_TN = 64u;      /* outputs per block */
+constexpr uint32_t EG2VQ_P768_BK = 64u;      /* k per shared-memory chunk */
+constexpr uint32_t EG2VQ_P768_THREADS = 256u;
+constexpr uint32_t EG2VQ_P768_PAD = 8u;      /* shared row pad: 4 banks a row */
+
+/* m16n8k16, A row-major bf16, B column-major bf16, f32 accumulate. The bf16
+ * form of the instruction cuda/eg2vq_vq.cuh:350-359 uses for its payload GEMM. */
+__device__ __forceinline__ void eg2vq_ops_mma_bf16(float *d, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/* The split pair as the two bf16 the A fragment wants: .x low, .y high. */
+__device__ __forceinline__ uint32_t eg2vq_ops_bf16_pair(float lo, float hi) {
+    const __nv_bfloat162 b = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t *>(&b);
+}
+
+__global__ void __launch_bounds__(EG2VQ_P768_THREADS, 2) eg2vq_ops_proj768_mma_kernel(
+        float *__restrict__ acc, const float *__restrict__ h,
+        const uint16_t *__restrict__ w, const float *__restrict__ norm_w,
+        uint32_t n_embd, uint32_t n_out, float eps, uint32_t n_tokens) {
+    constexpr uint32_t TM = EG2VQ_P768_TM, TN = EG2VQ_P768_TN, BK = EG2VQ_P768_BK;
+    constexpr uint32_t P = BK + EG2VQ_P768_PAD;
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t g = lane >> 2u, q = lane & 3u;
+    const uint32_t t0 = blockIdx.x * TM, o0 = blockIdx.y * TN;
+    const uint32_t trow = tid >> 2u, tpart = tid & 3u;
+
+    __shared__ float scale_s[TM];
+    __shared__ __align__(16) uint16_t as_hi[TM * P];
+    __shared__ __align__(16) uint16_t as_lo[TM * P];
+    __shared__ __align__(16) uint16_t ws[TN * P];
+
+    /* The row's output_norm RMS (graph:339-345, graph:47-53): double sum, the
+     * eps added before the cast, the reciprocal root in f32 -- the block form's
+     * own constants, four threads per row instead of 256 per row. */
+    const uint32_t rt = t0 + trow;
+    double ss = 0.0;
+    if (rt < n_tokens) {
+        const float *hr = h + (size_t)rt * n_embd;
+        for (uint32_t i = tpart; i < n_embd; i += 4u) {
+            const double v = (double)hr[i];
+            ss += v * v;
+        }
+    }
+    ss += __shfl_down_sync(0xffffffffu, ss, 1);
+    ss += __shfl_down_sync(0xffffffffu, ss, 2);
+    if (tpart == 0u) {
+        scale_s[trow] = (rt < n_tokens)
+                ? 1.0f / sqrtf((float)(ss / (double)n_embd) + eps) : 0.0f;
+    }
+    __syncthreads();
+
+    /* The warp's own 16 rows x 32 columns of the output. */
+    const uint32_t m0 = (warp >> 1u) * 16u;
+    const uint32_t n0 = (warp & 1u) * 32u;
+    float ac[4][4] = {};
+    ac[0][0] = ac[0][1] = ac[0][2] = ac[0][3] = 0.0f;
+    ac[1][0] = ac[1][1] = ac[1][2] = ac[1][3] = 0.0f;
+    ac[2][0] = ac[2][1] = ac[2][2] = ac[2][3] = 0.0f;
+    ac[3][0] = ac[3][1] = ac[3][2] = ac[3][3] = 0.0f;
+
+    for (uint32_t kc = 0; kc < n_embd / BK; kc++) {
+        const uint32_t cbase = kc * BK + tpart * 16u;
+        /* A: this thread's 16 columns of its row, e = h * scale * norm_w in f32
+         * (graph:346-348), split into the exact bf16 hi and the residue lo. */
+        uint16_t *ah = as_hi + trow * P + tpart * 16u;
+        uint16_t *al = as_lo + trow * P + tpart * 16u;
+        if (rt < n_tokens) {
+            const float *hr = h + (size_t)rt * n_embd + cbase;
+            const float sc = scale_s[trow];
+            #pragma unroll
+            for (uint32_t c = 0; c < 16u; c += 8u) {
+                const float4 v0 = *(const float4 *)(hr + c);
+                const float4 v1 = *(const float4 *)(hr + c + 4u);
+                const float e0 = v0.x * sc * norm_w[cbase + c + 0u];
+                const float e1 = v0.y * sc * norm_w[cbase + c + 1u];
+                const float e2 = v0.z * sc * norm_w[cbase + c + 2u];
+                const float e3 = v0.w * sc * norm_w[cbase + c + 3u];
+                const float e4 = v1.x * sc * norm_w[cbase + c + 4u];
+                const float e5 = v1.y * sc * norm_w[cbase + c + 5u];
+                const float e6 = v1.z * sc * norm_w[cbase + c + 6u];
+                const float e7 = v1.w * sc * norm_w[cbase + c + 7u];
+                const float ev[8] = { e0, e1, e2, e3, e4, e5, e6, e7 };
+                uint32_t hi4[4], lo4[4];
+                #pragma unroll
+                for (uint32_t p = 0; p < 4u; p++) {
+                    const __nv_bfloat162 hb = __floats2bfloat162_rn(ev[2u * p], ev[2u * p + 1u]);
+                    const float h0 = __bfloat162float(hb.x), h1 = __bfloat162float(hb.y);
+                    hi4[p] = *reinterpret_cast<const uint32_t *>(&hb);
+                    const __nv_bfloat162 lb =
+                        __floats2bfloat162_rn(ev[2u * p] - h0, ev[2u * p + 1u] - h1);
+                    lo4[p] = *reinterpret_cast<const uint32_t *>(&lb);
+                }
+                *(uint4 *)(ah + c) = make_uint4(hi4[0], hi4[1], hi4[2], hi4[3]);
+                *(uint4 *)(al + c) = make_uint4(lo4[0], lo4[1], lo4[2], lo4[3]);
+            }
+        } else {
+            *(uint4 *)ah = make_uint4(0u, 0u, 0u, 0u);
+            *(uint4 *)(ah + 8u) = make_uint4(0u, 0u, 0u, 0u);
+            *(uint4 *)al = make_uint4(0u, 0u, 0u, 0u);
+            *(uint4 *)(al + 8u) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        /* B: this thread's 16 columns of its output row, the file's bf16 as-is. */
+        const uint32_t o = o0 + trow;
+        uint16_t *wb = ws + trow * P + tpart * 16u;
+        if (o < n_out) {
+            const uint4 *src = (const uint4 *)(w + (size_t)o * n_embd + cbase);
+            *(uint4 *)wb = src[0];
+            *(uint4 *)(wb + 8u) = src[1];
+        } else {
+            *(uint4 *)wb = make_uint4(0u, 0u, 0u, 0u);
+            *(uint4 *)(wb + 8u) = make_uint4(0u, 0u, 0u, 0u);
+        }
+        __syncthreads();
+
+        /* A fragment order [row g, row g + 8] x [col, col + 8], the order
+         * cuda/eg2vq_attn.cuh:554-575 builds for its own Q tile; B is one
+         * uint32 per (k pair, output) at the same [col, col + 8] offsets. */
+        #pragma unroll
+        for (uint32_t kk = 0; kk < BK / 16u; kk++) {
+            const uint32_t col = kk * 16u + 2u * q;
+            uint32_t ahi[4], alo[4];
+            ahi[0] = *(const uint32_t *)(as_hi + (m0 + g) * P + col);
+            ahi[1] = *(const uint32_t *)(as_hi + (m0 + g + 8u) * P + col);
+            ahi[2] = *(const uint32_t *)(as_hi + (m0 + g) * P + col + 8u);
+            ahi[3] = *(const uint32_t *)(as_hi + (m0 + g + 8u) * P + col + 8u);
+            alo[0] = *(const uint32_t *)(as_lo + (m0 + g) * P + col);
+            alo[1] = *(const uint32_t *)(as_lo + (m0 + g + 8u) * P + col);
+            alo[2] = *(const uint32_t *)(as_lo + (m0 + g) * P + col + 8u);
+            alo[3] = *(const uint32_t *)(as_lo + (m0 + g + 8u) * P + col + 8u);
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) {
+                const uint16_t *wp = ws + (n0 + j * 8u + g) * P + col;
+                const uint32_t b0 = *(const uint32_t *)wp;
+                const uint32_t b1 = *(const uint32_t *)(wp + 8u);
+                eg2vq_ops_mma_bf16(ac[j], ahi, b0, b1);
+                eg2vq_ops_mma_bf16(ac[j], alo, b0, b1);
+            }
+        }
+        __syncthreads();
+    }
+
+    /* The row's own plane (unit 27): C fragment c0,c1 = row g's columns 2q,2q+1,
+     * c2,c3 = row g + 8's (cuda/eg2vq_attn.cuh:611-633 reads the same pair). */
+    const uint32_t rlo = t0 + m0 + g, rhi = rlo + 8u;
+    #pragma unroll
+    for (uint32_t j = 0; j < 4u; j++) {
+        const uint32_t ocol = o0 + n0 + j * 8u + 2u * q;
+        if (ocol + 1u < n_out) {
+            if (rlo < n_tokens) {
+                acc[(size_t)rlo * n_out + ocol] = ac[j][0];
+                acc[(size_t)rlo * n_out + ocol + 1u] = ac[j][1];
+            }
+            if (rhi < n_tokens) {
+                acc[(size_t)rhi * n_out + ocol] = ac[j][2];
+                acc[(size_t)rhi * n_out + ocol + 1u] = ac[j][3];
+            }
+        }
     }
 }
 
@@ -514,18 +724,42 @@ __global__ void eg2vq_ops_pool_item_kernel(float *__restrict__ out, const float 
 /* The projection + pool of a whole call: `n_tokens` rows (the batch's items
  * packed contiguously), `n_items` spans in `off` (off[0] == 0, off[n_items] ==
  * n_tokens, every span non-empty -- the core refuses anything else), and
- * `out768` takes n_items * n_out floats, item i's vector at i * n_out. */
+ * `out768` takes n_items * n_out floats, item i's vector at i * n_out.
+ *
+ * `form` selects the projection kernel: 0 is the block-per-row form, 1 the
+ * tensor-core form, and -1 the shipped dispatch (the tensor-core form when the
+ * shape fits its tile -- n_embd a multiple of 64 and n_out a multiple of 8, which
+ * every text-tower shape is -- and the block form otherwise). The pool stage is
+ * the same kernel in every case. */
+static inline int eg2vq_ops_proj768_pool_form(float *out768, float *acc, const float *h,
+                                              const uint16_t *w, const float *norm_w,
+                                              const uint32_t *off, uint32_t n_items,
+                                              uint32_t n_tokens, uint32_t n_embd,
+                                              uint32_t n_out, float eps, int form) {
+    if (!out768 || !acc || !h || !w || !norm_w || !off || !n_items || !n_tokens ||
+        !n_embd || !n_out) { return 0; }
+    const int mma_ok = (n_embd % EG2VQ_P768_BK == 0u) && (n_out % 8u == 0u);
+    if (form == 1 || (form < 0 && mma_ok)) {
+        if (!mma_ok) { return 0; }
+        const dim3 grid((n_tokens + EG2VQ_P768_TM - 1u) / EG2VQ_P768_TM,
+                        (n_out + EG2VQ_P768_TN - 1u) / EG2VQ_P768_TN);
+        eg2vq_ops_proj768_mma_kernel<<<grid, EG2VQ_P768_THREADS>>>(
+            acc, h, w, norm_w, n_embd, n_out, eps, n_tokens);
+    } else {
+        eg2vq_ops_proj768_block_kernel<<<n_tokens, 256, (size_t)n_embd * sizeof(float)>>>(
+            acc, h, w, norm_w, n_embd, n_out, eps);
+    }
+    eg2vq_ops_pool_item_kernel<<<n_items, 256>>>(out768, acc, n_out, off, n_items);
+    return 1;
+}
+
 static inline int eg2vq_ops_proj768_pool_batch(float *out768, float *acc, const float *h,
                                                const uint16_t *w, const float *norm_w,
                                                const uint32_t *off, uint32_t n_items,
                                                uint32_t n_tokens, uint32_t n_embd,
                                                uint32_t n_out, float eps) {
-    if (!out768 || !acc || !h || !w || !norm_w || !off || !n_items || !n_tokens ||
-        !n_embd || !n_out) { return 0; }
-    eg2vq_ops_proj768_kernel<<<n_tokens, 256, (size_t)n_embd * sizeof(float)>>>(
-        acc, h, w, norm_w, n_embd, n_out, eps);
-    eg2vq_ops_pool_item_kernel<<<n_items, 256>>>(out768, acc, n_out, off, n_items);
-    return 1;
+    return eg2vq_ops_proj768_pool_form(out768, acc, h, w, norm_w, off, n_items,
+                                       n_tokens, n_embd, n_out, eps, -1);
 }
 
 /* ---- whole-row scale and add, and the strided PLE gelu-mul ----------------- */

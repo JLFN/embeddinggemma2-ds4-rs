@@ -150,7 +150,9 @@ static double rel_rms(const std::vector<float> &a, const std::vector<float> &b, 
 }
 
 static int report(const char *tag, double rel, double maxabs, double bound) {
-    const int bad = rel > bound;
+    // NaN is a failure, not a pass: `rel > bound` is false for NaN, so a NaN
+    // output once printed "ok" here (found at performance unit 7).
+    const int bad = !(rel <= bound);
     printf("%-40s rel RMS %.3e   max abs %.3e   bound %.0e   %s\n", tag, rel, maxabs, bound,
            bad ? "OUT OF BOUND" : "ok");
     return bad ? 1 : 0;
@@ -489,6 +491,28 @@ int main(void) {
         double ma;
         const double rel = rel_rms(got, want, &ma);
         fails += report("proj768 + mean pool + L2", rel, ma, 1e-5);
+        /* Performance unit 7: the tensor-core form is the shipped one, and the
+         * block form stays as its fallback.  Both are held to the same 1e-5
+         * against the reference, and the distance between the two is reported:
+         * it is the operand split's own cost, and the bound the unit declared
+         * before the change was that BOTH stay inside 1e-5. */
+        std::vector<float> got_block(n_out);
+        if (!eg2vq_ops_proj768_pool_form(dy, dacc, dh, dw, dnw, doff, 1u, n_tok,
+                                         n_embd, n_out, EG2VQ_EPS, 0)) {
+            printf("FAIL: the block projection form refused the shape\n");
+            fails++;
+        } else {
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(got_block.data(), dy, n_out * 4, cudaMemcpyDeviceToHost));
+            double mb;
+            const double relb = rel_rms(got_block, want, &mb);
+            fails += report("proj768 block form (fallback)", relb, mb, 1e-5);
+            double mab;
+            const double relab = rel_rms(got_block, got, &mab);
+            printf("%-44s rel_rms %.2e | %s\n", "tensor-core vs block form", relab,
+                   relab <= 1e-5 ? "ok" : "OUT OF BOUND");
+            if (!(relab <= 1e-5)) { fails++; }
+        }
         // and the pooled vector must be unit length
         double ns = 0.0;
         for (float v : got) { ns += (double)v * (double)v; }
@@ -537,7 +561,13 @@ int main(void) {
             fails++;
             ok = 0;
         }
-        if (ok) {
+        for (int form = 0; ok && form < 2; form++) {
+            if (form == 1) {
+                /* the same packed block through the block form, so the two
+                 * projection kernels are held to the per-item contract too */
+                if (!eg2vq_ops_proj768_pool_form(dy, dacc, dh, dw, dnw, doff, 3u, n_tok,
+                                                 n_embd, n_out, EG2VQ_EPS, 0)) { ok = 0; }
+            }
             CK(cudaDeviceSynchronize());
             std::vector<float> got((size_t)3 * n_out);
             CK(cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost));
@@ -551,7 +581,8 @@ int main(void) {
                                            want, &ma);
                 if (rel > worst) { worst = rel; }
             }
-            printf("%-44s worst rel_rms %.2e | %s\n", "3 items packed (1/349/40 rows)",
+            printf("%-44s worst rel_rms %.2e | %s\n",
+                   form ? "3 items packed (block form)" : "3 items packed (tensor-core)",
                    worst, worst <= 1e-5 ? "ok" : "OUT OF BOUND");
             if (!(worst <= 1e-5)) { fails++; }
         }
