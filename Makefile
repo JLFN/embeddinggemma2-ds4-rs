@@ -2224,6 +2224,16 @@ tests/bench_eg2vq_attn: tests/bench_eg2vq_attn.cu cuda/eg2vq_attn.cuh
 bench-eg2vq-attn: tests/bench_eg2vq_attn
 	./tests/bench_eg2vq_attn
 
+# The norm primitives' own per-shape record (performance unit 6): the two
+# reduction forms timed back to back on the tower's widths, so a change to a
+# norm is argued against a number instead of a whole-forward difference.
+tests/bench_eg2vq_ops: tests/bench_eg2vq_ops.cu cuda/eg2vq_ops.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
+
+.PHONY: bench-eg2vq-ops
+bench-eg2vq-ops: tests/bench_eg2vq_ops
+	./tests/bench_eg2vq_ops
+
 tests/test_glm_vq_kda: tests/test_glm_vq_kda.cu cuda/glm_vq_kda.cuh cuda/glm_vq_ops.cuh
 	$(NVCC) $(NVCCFLAGS) -I. -o $@ $<
 

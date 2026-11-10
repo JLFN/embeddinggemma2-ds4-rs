@@ -11,7 +11,8 @@
  *                     (graph:196-208; gemma-embedding2.cpp:86)
  *   eg2vq_ops_rms     RMS over a row with an optional weight, eps inside the
  *                     square root, the sum accumulated in double (graph:47-53,
- *                     ggml ops.cpp:4224-4231)
+ *                     ggml ops.cpp:4224-4231); one warp per row since
+ *                     performance unit 6, see "THE REDUCTION" below
  *   eg2vq_ops_rms_head  the same over each head vector (graph:264-277; the q and
  *                     k norms carry a weight, the v norm is weightless)
  *   eg2vq_ops_rope    NeoX rotation over the whole head, pairs (i, i + hd/2),
@@ -188,10 +189,43 @@ static inline int eg2vq_ops_embed_image(float *out, const int32_t *ids, const ui
 
 /* ---- RMS, row-wise and per head ------------------------------------------ */
 
-/* out[r][i] = x[r][i] * (1/sqrt(mean_sq + eps)) * (w ? w[i] : 1); the mean over
- * n and the cast are done exactly as the graph does them (double sum, divided in
- * double, cast to float before the eps is added). */
-__global__ void eg2vq_ops_rms_kernel(
+/* THE REDUCTION (performance unit 6, 2026-11-10).
+ *
+ * The arithmetic is the graph's and does not change: out[r][i] = x[r][i] *
+ * (1/sqrt(mean_sq + eps)) * (w ? w[i] : 1), the sum of squares accumulated in
+ * double, divided in double, cast to float before the eps is added
+ * (ds4_eg2vq_graph.inc:44-53; ggml/src/ggml-cpu/ops.cpp:4224-4231).
+ *
+ * What changed is HOW the row is reduced, because an nsys profile of one
+ * 2,451-token batch showed the two norms costing 8.64 ms (121 launches) and
+ * 5.44 ms (72 launches) in a 49.2 ms forward while an elementwise add of the
+ * same 5 MB took 11 us -- i.e. the row kernel was ~6x slower than a plain pass
+ * over the same bytes.  The old form is one 256-thread block per row, a
+ * 2 KB shared double array and a nine-barrier tree: for a 512-wide row every
+ * thread owns two values, so the barriers and the shared round-trip dominate
+ * the two loads.
+ *
+ * The form below is one WARP per row: 32 lanes each read their own strided
+ * slice into registers once, the sum is reduced with __shfl_xor_sync (five
+ * shuffle-adds, no shared memory, no barrier), every lane computes the same
+ * scale, and the registers already held are scaled on the way out -- so the row
+ * is read once instead of twice.  VM is the per-lane value count, a compile-time
+ * constant so the slice stays in registers (`#pragma unroll`), and the eight
+ * warps of a block are eight independent rows.
+ *
+ * Only the summation TREE changes: the old kernel summed lanes 0..255 pairwise
+ * over the row's (i, i+256) pairs, this one sums lane l's own strided slice then
+ * folds the lanes by xor.  Both accumulate in double, so the two orders differ by
+ * ~1e-16 relative -- and on every width this tower runs (512 for the hidden,
+ * 256/512 per head, 768 and 64 in the vision tower) the f32 output is
+ * BIT-IDENTICAL to the old kernel, which tests/test_eg2vq_ops.cu asserts and
+ * tests/bench_eg2vq_ops reports.  Widths above 1024 values still take the old
+ * block kernel (`eg2vq_ops_rms_block`), which is kept as the general fallback.
+ */
+
+/* The general form: one block per row, a double shared tree.  Kept as the
+ * fallback for rows wider than the warp kernel's register budget. */
+__global__ void eg2vq_ops_rms_block_kernel(
         float *__restrict__ out, const float *__restrict__ x,
         const float *__restrict__ w, uint32_t rows, uint32_t n, float eps) {
     const uint32_t r = blockIdx.x;
@@ -216,16 +250,85 @@ __global__ void eg2vq_ops_rms_kernel(
     }
 }
 
-static inline int eg2vq_ops_rms(float *out, const float *x, const float *w,
-                                uint32_t rows, uint32_t n, float eps) {
-    if (!out || !x || !rows || !n) { return 0; }
-    eg2vq_ops_rms_kernel<<<rows, 256>>>(out, x, w, rows, n, eps);
+/* The general form's launcher (kept public so the gate can compare the two forms
+ * on the same input; tests/test_eg2vq_ops.cu). */
+static inline int eg2vq_ops_rms_block(float *out, const float *x, const float *w,
+                                      uint32_t rows, uint32_t n, float eps) {
+    eg2vq_ops_rms_block_kernel<<<rows, 256>>>(out, x, w, rows, n, eps);
     return 1;
 }
 
-/* One block per (row, head) pair; the weight vector is the head's own, so q and
+/* One warp per row, the row's values held in registers between the sum and the
+ * scale.  `nrow` is the number of vectors of `n` values: (rows) for the row
+ * norm, (rows * heads) for the per-head one, whose vectors are the heads of a
+ * row and therefore strided by `hd` rather than packed. */
+template <uint32_t VM>
+__global__ void eg2vq_ops_rms_warp_kernel(
+        float *__restrict__ out, uint64_t out_stride,
+        const float *__restrict__ x, uint64_t in_stride,
+        const float *__restrict__ w, uint32_t nrow, uint32_t n, float eps) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t r = blockIdx.x * (blockDim.x >> 5u) + warp;
+    if (r >= nrow) { return; }
+    const float *xr = x + (size_t)r * in_stride;
+    float *orow = out + (size_t)r * out_stride;
+    float v[VM];
+    double local = 0.0;
+    #pragma unroll
+    for (uint32_t j = 0; j < VM; j++) {
+        const uint32_t i = lane + j * 32u;
+        v[j] = (i < n) ? xr[i] : 0.0f;             /* no read past the vector */
+        local += (double)v[j] * (double)v[j];
+    }
+    #pragma unroll
+    for (uint32_t off = 16u; off; off >>= 1u) {    /* butterfly: every lane ends with the total */
+        local += __shfl_xor_sync(0xffffffffu, local, off);
+    }
+    const float scale = 1.0f / sqrtf((float)(local / (double)n) + eps);
+    #pragma unroll
+    for (uint32_t j = 0; j < VM; j++) {
+        const uint32_t i = lane + j * 32u;
+        if (i < n) { orow[i] = v[j] * scale * (w ? w[i] : 1.0f); }
+    }
+}
+
+/* 8 warps per block; nothing shared, so the block size only trades grid size
+ * against the scheduler's tail. */
+static inline int eg2vq_ops_rms_warp(float *out, uint64_t out_stride,
+                                     const float *x, uint64_t in_stride,
+                                     const float *w, uint32_t nrow, uint32_t n, float eps) {
+    const uint32_t warps = 8u;
+    const uint32_t blocks = (nrow + warps - 1u) / warps;
+    const uint32_t vm = (n + 31u) / 32u;
+    const dim3 grid(blocks), blk(warps * 32u);
+    if (vm <= 2u) {
+        eg2vq_ops_rms_warp_kernel<2><<<grid, blk>>>(out, out_stride, x, in_stride, w, nrow, n, eps);
+    } else if (vm <= 4u) {
+        eg2vq_ops_rms_warp_kernel<4><<<grid, blk>>>(out, out_stride, x, in_stride, w, nrow, n, eps);
+    } else if (vm <= 8u) {
+        eg2vq_ops_rms_warp_kernel<8><<<grid, blk>>>(out, out_stride, x, in_stride, w, nrow, n, eps);
+    } else if (vm <= 16u) {
+        eg2vq_ops_rms_warp_kernel<16><<<grid, blk>>>(out, out_stride, x, in_stride, w, nrow, n, eps);
+    } else if (vm <= 32u) {
+        eg2vq_ops_rms_warp_kernel<32><<<grid, blk>>>(out, out_stride, x, in_stride, w, nrow, n, eps);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* The row norm (graph:47-53), rows of `n` values, optional weight. */
+static inline int eg2vq_ops_rms(float *out, const float *x, const float *w,
+                                uint32_t rows, uint32_t n, float eps) {
+    if (!out || !x || !rows || !n) { return 0; }
+    if (eg2vq_ops_rms_warp(out, n, x, n, w, rows, n, eps)) { return 1; }
+    return eg2vq_ops_rms_block(out, x, w, rows, n, eps);
+}
+
+/* One vector per (row, head) pair; the weight vector is the head's own, so q and
  * k are normalized with their learned per-head weight and v without one. */
-__global__ void eg2vq_ops_rms_head_kernel(
+__global__ void eg2vq_ops_rms_head_block_kernel(
         float *__restrict__ x, const float *__restrict__ w,
         uint32_t rows, uint32_t heads, uint32_t hd, float eps) {
     const uint32_t idx = blockIdx.x;
@@ -250,11 +353,21 @@ __global__ void eg2vq_ops_rms_head_kernel(
     }
 }
 
+static inline int eg2vq_ops_rms_head_block(float *x, const float *w, uint32_t rows,
+                                           uint32_t heads, uint32_t hd, float eps) {
+    if (!x || !rows || !heads || !hd) { return 0; }
+    eg2vq_ops_rms_head_block_kernel<<<rows * heads, 128>>>(x, w, rows, heads, hd, eps);
+    return 1;
+}
+
+/* The shared kernel again, in place: one head vector of `hd` values per logical
+ * row, consecutive heads of a row adjacent (stride `hd`). */
 static inline int eg2vq_ops_rms_head(float *x, const float *w, uint32_t rows,
                                      uint32_t heads, uint32_t hd, float eps) {
     if (!x || !rows || !heads || !hd) { return 0; }
-    eg2vq_ops_rms_head_kernel<<<rows * heads, 128>>>(x, w, rows, heads, hd, eps);
-    return 1;
+    const uint32_t nrow = rows * heads;            /* the tower's 24 x 4 x 2451 stays far below 2^32 */
+    if (eg2vq_ops_rms_warp(x, hd, x, hd, w, nrow, hd, eps)) { return 1; }
+    return eg2vq_ops_rms_head_block(x, w, rows, heads, hd, eps);
 }
 
 /* ---- NeoX RoPE over the whole head --------------------------------------- */
