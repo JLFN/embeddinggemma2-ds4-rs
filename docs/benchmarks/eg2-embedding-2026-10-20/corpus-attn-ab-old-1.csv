@@ -1,0 +1,7 @@
+label,backend,clock,items,tokens,wall_s,tokens_per_s,note
+cli_cold,cuda,wall,0,0,0,0,FAILED rc=127: speed-bench/eg2_embed_sweep.sh: 104: /tmp/ab-attn-old/ds4: n
+srv_single_p50,cuda,wall,1,115,.014590086,7882.064,3 repeats; min=.014251306 max=.016084558 mean=0.014975
+srv_single_p95,cuda,wall,1,115,.016084558,7149.714,p95
+srv_batch_1,cuda,wall,143,80747,5.248347844,15385.22,corpus=143 pages
+srv_batch_4,cuda,wall,143,80747,3.518525811,22949.09,corpus=143 pages
+srv_batch_8,cuda,wall,143,80747,3.332888922,24227.33,corpus=143 pages

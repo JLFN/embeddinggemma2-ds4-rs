@@ -141,20 +141,28 @@ int main(int argc, char **argv) {
     const uint32_t n_head = 4;
 
     const shape shapes[] = {
+        { "single27_s",  {  27 }, 256, 2, 512 },
         { "cli115_s",   { 115 }, 256, 2, 512 },
+        { "single184_s", { 184 }, 256, 2, 512 },
         { "page294_s",  { 294 }, 256, 2, 512 },
         { "page565_s",  { 565 }, 256, 2, 512 },
         { "max1414_s",  { 1414 }, 256, 2, 512 },
+        { "single27_f",  {  27 }, 512, 1, -1 },
         { "page294_f",  { 294 }, 512, 1, -1 },
         { "max1414_f",  { 1414 }, 512, 1, -1 },
         { "batch8x306_s", { 306, 306, 306, 306, 306, 306, 306, 306 }, 256, 2, 512 },
+        { "batch8x115_s", { 115, 115, 115, 115, 115, 115, 115, 115 }, 256, 2, 512 },
         { "batch8x565_s", { 565, 565, 565, 565, 565, 565, 565, 565 }, 256, 2, 512 },
         { "batch8x565_f", { 565, 565, 565, 565, 565, 565, 565, 565 }, 512, 1, -1 },
+        { "batch64x20_s", { 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+                            20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+                            20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
+                            20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20 }, 256, 2, 512 },
     };
 
-    printf("# bench_eg2vq_attn — %d repeats per row, one kernel launch per measurement\n", repeats);
-    printf("%-16s %7s %7s %12s %12s %12s %10s\n",
-           "shape", "rows", "keys", "ms_min", "ms_med", "ms_max", "gflop/s");
+    printf("# bench_eg2vq_attn — %d repeats per row per path, one kernel launch per measurement\n", repeats);
+    printf("%-16s %7s %7s %11s %11s %8s %10s\n",
+           "shape", "rows", "keys", "ms_scalar", "ms_mma", "speedup", "mma_gflop/s");
     int fail = 0;
     for (const shape &s : shapes) {
         /* build the packed row block and its metadata */
@@ -194,7 +202,7 @@ int main(int argc, char **argv) {
             keys += keys_of((uint32_t)pos[r], (uint32_t)len[r], s.half_swa);
         }
 
-        if (!eg2vq_attn(dy, dq, dk, dv, dpos, dlen, n_tok, n_head, s.n_head_kv,
+        if (!eg2vq_attn_scalar(dy, dq, dk, dv, dpos, dlen, n_tok, n_head, s.n_head_kv,
                         s.head_dim, s.half_swa)) {
             printf("%-16s REFUSED by the launcher\n", s.tag);
             fail = 1;
@@ -214,34 +222,52 @@ int main(int argc, char **argv) {
             }
         }
 
-        std::vector<float> ms;
-        for (int rep = 0; rep < repeats + 3; rep++) {
-            cudaEvent_t a, b;
-            CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
-            CK(cudaEventRecord(a));
-            if (!eg2vq_attn(dy, dq, dk, dv, dpos, dlen, n_tok, n_head, s.n_head_kv,
-                            s.head_dim, s.half_swa)) {
-                printf("%-16s refused mid-run\n", s.tag);
-                fail = 1;
-                break;
+        /* the call's span table, the same one the device core builds */
+        std::vector<uint32_t> off(1, 0u);
+        for (uint32_t l : s.item_len) { off.push_back(off.back() + l); }
+
+        /* One timing pass over one path, in the same process and back to back, so
+         * the scalar and tensor-core columns are an interleaved A/B and not two
+         * windows (this machine's per-window drift is the record's own caution). */
+        auto time_path = [&](int mma) -> std::vector<float> {
+            std::vector<float> ms;
+            for (int rep = 0; rep < repeats + 3; rep++) {
+                cudaEvent_t a, b;
+                CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+                CK(cudaEventRecord(a));
+                const int ok = mma
+                    ? eg2vq_attn_mma(dy, dq, dk, dv, dpos, dlen, off.data(), (uint32_t)s.item_len.size(),
+                                     n_tok, n_head, s.n_head_kv, s.head_dim, s.half_swa)
+                    : eg2vq_attn_scalar(dy, dq, dk, dv, dpos, dlen, n_tok, n_head, s.n_head_kv,
+                                        s.head_dim, s.half_swa);
+                if (!ok) {
+                    printf("%-16s refused mid-run (%s)\n", s.tag, mma ? "tensor cores" : "scalar");
+                    fail = 1;
+                    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+                    break;
+                }
+                CK(cudaEventRecord(b));
+                CK(cudaEventSynchronize(b));
+                float msec = 0.0f;
+                CK(cudaEventElapsedTime(&msec, a, b));
+                if (rep >= 3) { ms.push_back(msec); }
+                CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
             }
-            CK(cudaEventRecord(b));
-            CK(cudaEventSynchronize(b));
-            float msec = 0.0f;
-            CK(cudaEventElapsedTime(&msec, a, b));
-            if (rep >= 3) { ms.push_back(msec); }
-            CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
-        }
-        if (ms.empty()) { continue; }
-        std::vector<float> sorted = ms;
-        for (size_t i = 0; i + 1 < sorted.size(); i++) {
-            for (size_t j = i + 1; j < sorted.size(); j++) {
-                if (sorted[j] < sorted[i]) { const float t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t; }
+            for (size_t i = 0; i + 1 < ms.size(); i++) {
+                for (size_t j = i + 1; j < ms.size(); j++) {
+                    if (ms[j] < ms[i]) { const float t = ms[i]; ms[i] = ms[j]; ms[j] = t; }
+                }
             }
-        }
-        const float mn = sorted.front(), mx = sorted.back(), md = sorted[sorted.size() / 2];
-        printf("%-16s %7u %7llu %12.4f %12.4f %12.4f %10.1f\n",
-               s.tag, n_tok, (unsigned long long)keys, mn, md, mx, flop / ((double)md * 1.0e6));
+            return ms;
+        };
+
+        const std::vector<float> msc = time_path(0);
+        const std::vector<float> msm = time_path(1);
+        if (msc.empty() || msm.empty()) { continue; }
+        const float mdsc = msc[msc.size() / 2], mdmm = msm[msm.size() / 2];
+        printf("%-16s %7u %7llu %11.4f %11.4f %8.2f %10.1f\n",
+               s.tag, n_tok, (unsigned long long)keys, mdsc, mdmm, mdsc / mdmm,
+               flop / ((double)mdmm * 1.0e6));
 
         cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dy);
         cudaFree(dpos); cudaFree(dlen);

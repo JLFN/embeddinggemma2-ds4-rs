@@ -2862,7 +2862,7 @@ test-eg2vq-ops: tests/test_eg2vq_ops
 # census/residency stubs under DS4_NO_GPU and ds4_cuda.o defines the real ones,
 # so a -DDS4_NO_GPU harness cannot link against the device object.  Nothing in
 # ds4.c reaches the GPU until the harness calls ds4_gpu_init and the adapter.
-tests/parity/eg2vq_embd_gpu_oracle.o: tests/parity/eg2vq_embd_gpu_oracle.c ds4.c ds4.h ds4_eg2vq.h ds4_eg2vq_bind.inc ds4_eg2vq_graph.inc native/bridge/ds4_host_load.h
+tests/parity/eg2vq_embd_gpu_oracle.o: tests/parity/eg2vq_embd_gpu_oracle.c ds4.c ds4.h ds4_eg2vq.h ds4_eg2vq_bind.inc ds4_eg2vq_graph.inc ds4_eg2vq_gpu.cuh cuda/eg2vq_attn.cuh cuda/eg2vq_ops.cuh cuda/eg2vq_vq.cuh native/bridge/ds4_host_load.h
 	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
 	-Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
 

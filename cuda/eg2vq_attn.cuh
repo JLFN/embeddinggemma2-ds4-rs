@@ -117,6 +117,7 @@
  */
 #pragma once
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <cfloat>
 
@@ -367,16 +368,600 @@ __global__ void eg2vq_attn_kernel(
     }
 }
 
-/* Returns 0 (and touches nothing) for a shape this kernel does not cover:
- * anything but 4 query heads, no rows, or a group-unbalanced head count.  The
- * ROW count is not bounded here -- a batch's block is as long as its items add up
- * to, and each ITEM's ceiling is DS4_EG2VQ_MAX_TOKENS, which the caller checks
- * before the ids are even uploaded (ds4_eg2vq_gpu.cuh) and the kernel's own guard
- * re-checks against the plane. */
-static inline int eg2vq_attn(float *out, const float *q, const float *k, const float *v,
-                             const int32_t *pos, const int32_t *len,
-                             uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv,
-                             uint32_t head_dim, int32_t half_swa) {
+/* ---------------------------------------------------------------------------
+ * THE TENSOR-CORE FORM (performance unit, 2026-11-10)
+ *
+ * WHY THIS UNIT, measured and not assumed: with the payload GEMM on f16 tensor
+ * cores, attention is the largest item left.  One nsys profile of the same
+ * 8-item / 2,451-token forward the previous three units profiled reads
+ * `eg2vq_attn_kernel` 43.9 ms of 87.6 ms of kernel time (50.1%): the head_dim
+ * 256 instantiation 31.5 ms over 20 launches, the 512 one 12.4 ms over 4.  The
+ * GEMM is 19.4 ms (22.1%) and the small ops 24.3 ms.  Raw:
+ * docs/benchmarks/eg2-embedding-2026-10-20/nsys-kern-sum-b8-mma-vq.txt.
+ *
+ * THE FORM, from two references read first-hand on their own branches.  The
+ * dense one is the closer model, and it is the one this unit follows:
+ *
+ *   THE DENSE FAMILY (the shape this tower is).  PR 142, branch
+ *   feat/spark2_5-family in /data/ds4-dfm-rs, cuda/spark2_5.cuh:
+ *   spark_attn_mma_fp8_kernel (:887-1044) is one CTA per (KV head, row tile),
+ *   8 warps, 32-key tiles, Q kept in registers, K and V both staged per tile,
+ *   the swizzle at :835-837, ldmatrix at :839-848, m16n8k16 at :855-860, the
+ *   f32 pair to one f16 word at :850-853, f32 online softmax and P rounded to
+ *   f16.  It serves that dense model's 27 sliding AND 9 full layers with ONE
+ *   kernel -- a `window` of 0 means full, because its full layers are also 256
+ *   wide.  This unit's sliding kernel is that kernel's walk, tile for tile.
+ *
+ *   THE D=512 GEOMETRY, which the dense branch does not have.  PR 143, branch
+ *   feat/gemma4-tensor-core-fp8, cuda/gemma4_attn_mma.cuh:344-583 splits the
+ *   512 output dims into two 256-wide halves, one per warp of a pair, and the
+ *   pair exchanges its partial 16x32 scores in shared at :450-468.  This
+ *   unit's full kernel is that split, on this tower's rows.
+ *
+ * WHY ONE KERNEL IS NOT ENOUGH HERE, unlike the dense reference: this tower's
+ * full layers differ in head_dim (512 against 256), not only in the mask, so
+ * one 256-wide walk cannot cover them; and its tiles are symmetric rather than
+ * trailing, so the key loop's bounds differ even where the shape does not.
+ *
+ * WHAT ELSE CHANGES FROM THE REFERENCES IS THE GEOMETRY, NOT THE ARITHMETIC:
+ *   sliding <256, 2>  group 2: 8 tokens x 2 query heads per warp, RTILE 64,
+ *                     both K and V resident (32 KiB).
+ *   full    <512, 4>  one KV head and 4 query heads, so 16 M rows are 4 tokens
+ *                     x 4 heads; K then V share one 32 KiB tile, 48 KiB total
+ *                     with the exchange.
+ * and the four things this port needs that neither reference does:
+ *   - THE MASK IS SYMMETRIC, theirs are trailing-causal.  A CTA's key loop runs
+ *     from the minimum begin over its rows to the maximum last (rounded to
+ *     32-key tiles), and each row applies its own |pos - key_pos| <= half_swa
+ *     inside the tile -- the scalar kernel's union-plus-per-row-bound shape, so
+ *     the mask edge is the same gate.
+ *   - THE KEY RANGE IS ITEM-RELATIVE (unit 27's batch).  A CTA's rows must all
+ *     belong to ONE item, so the tile ordinal is mapped to (item, tile) by
+ *     walking the item lengths (`len[t]`, the table the scalar kernel's guard
+ *     already reads) instead of by dividing the row index.  The grid is the
+ *     exact total tile count, which the launcher computes from the caller's
+ *     spans -- the dense reference's one-sequence-per-call gets this for free.
+ *   - K AND V ARE f32 IN THIS PORT'S CACHE (the dense reference's are FP8 with
+ *     per-row scales, gemma4's bf16 through cp.async); staging converts f32 to
+ *     f16 on the way into shared, which is also why the shared element type is
+ *     __half and not bf16: this tower's tensors are f16, and bf16 would drop
+ *     three significand bits (the reason the VQ unit took f16:
+ *     ds41_vq_prefill_mma.cuh:24).
+ *   - Q IS f32 ON ENTRY (gemma4's arrives pre-rounded to bf16, so its
+ *     conversion is 0 ULP; the dense reference's is f32 and it rounds too).
+ *     This is a real new rounding of the query, and the parity gate bounds it.
+ * The scale is exactly 1.0f (gemma-embedding2.cpp:8), so no scale is folded
+ * into the score tree -- there is nothing to fold in.
+ *
+ * GATE: a parity gate, not bit identity.  Both paths are compared against the
+ * same f64 CPU oracle at every tower shape, and gate 7's declared bounds
+ * (cos >= 0.999999, rel_rms <= 1e-03) are unchanged; the measured numbers are
+ * in tests/test_eg2vq_attn.cu's own output and in the unit's record.
+ * ------------------------------------------------------------------------- */
+
+enum {
+    EG2VQ_ATTN_TC_THREADS = 256u,   /* 8 warps, as both references use */
+    EG2VQ_ATTN_TC_TK = 32u,         /* keys per tile, the reference's G4_MMA_TK */
+    EG2VQ_ATTN_TC_RTILE_S = 64u,    /* sliding: 8 warps x 8 tokens */
+    EG2VQ_ATTN_TC_RTILE_F = 16u,    /* full: 4 warps x 4 tokens, two per pair */
+    EG2VQ_ATTN_TC_SMEM_S = 2u * EG2VQ_ATTN_TC_TK * 256u * 2u,                     /* K + V */
+    EG2VQ_ATTN_TC_SMEM_F = EG2VQ_ATTN_TC_TK * 512u * 2u + 4u * 2u * 16u * 32u * 4u /* K/V + exchange */
+};
+
+/* The reference's swizzle (gemma4_attn_mma.cuh:43-51), unchanged: a 16-byte
+ * chunk's row position XORed with the key index, so the eight rows one
+ * ldmatrix reads land on eight distinct 128-byte bank groups. */
+__device__ __forceinline__ static uint32_t eg2vq_attn_mma_swz(uint32_t key, uint32_t chunk, uint32_t dim) {
+    return key * dim + ((chunk ^ (key & 7u)) << 3);
+}
+
+/* ldmatrix.x4 (gemma4_attn_mma.cuh:52-61): four 8x8 b16 matrices into 4 words,
+ * the non-transposed form for the QK^T operand and .trans for the P*V one. */
+__device__ __forceinline__ static void eg2vq_attn_mma_ldsm4(uint32_t *r, const void *p, bool trans) {
+    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+    if (trans) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    } else {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    }
+}
+
+/* m16n8k16, f16 operands and an f32 accumulator (gemma4_attn_mma.cuh:63-68,
+ * :87-92 for its f16 lane).  Four D registers, four A words, two B words. */
+__device__ __forceinline__ static void eg2vq_attn_mma_f16(float *d, const uint32_t *a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/* Two f32 to one packed f16 pair (gemma4_attn_mma.cuh:82-85's f16 arm). */
+__device__ __forceinline__ static uint32_t eg2vq_attn_mma_pack(float lo, float hi) {
+    const __half2 v = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t *>(&v);
+}
+
+/* Eight f32 to the 16-byte shared slot: the reference's cp.async of a ready
+ * bf16 chunk (gemma4_attn_mma.cuh:47-50) becomes a convert-and-store here,
+ * because this port's K/V cache is f32.  `valid` is false for a key outside
+ * the CTA's own range: the row is read anyway from a clamped (in-bounds) slot
+ * and stored as zeros, and the per-row mask keeps it out of every score. */
+__device__ __forceinline__ static void eg2vq_attn_mma_stage8(__half *dst, const float *src, bool valid) {
+    const float4 x0 = *(const float4 *)src;
+    const float4 x1 = *(const float4 *)(src + 4);
+    uint4 o;
+    const __half2 h0 = __floats2half2_rn(valid ? x0.x : 0.0f, valid ? x0.y : 0.0f);
+    const __half2 h1 = __floats2half2_rn(valid ? x0.z : 0.0f, valid ? x0.w : 0.0f);
+    const __half2 h2 = __floats2half2_rn(valid ? x1.x : 0.0f, valid ? x1.y : 0.0f);
+    const __half2 h3 = __floats2half2_rn(valid ? x1.z : 0.0f, valid ? x1.w : 0.0f);
+    o.x = *reinterpret_cast<const uint32_t *>(&h0);
+    o.y = *reinterpret_cast<const uint32_t *>(&h1);
+    o.z = *reinterpret_cast<const uint32_t *>(&h2);
+    o.w = *reinterpret_cast<const uint32_t *>(&h3);
+    *(uint4 *)dst = o;
+}
+
+/* The tile ordinal to (item, tile) map.  Items are contiguous and `len[t]` is
+ * the row count of t's item, so walking t0 += len[t0] visits exactly the item
+ * starts; every thread of the CTA runs it and reads the same two words, which
+ * the 32-wide broadcast makes free.  Returns 0 past the last tile. */
+template <uint32_t RTILE>
+__device__ __forceinline__ static int eg2vq_attn_mma_tile_map(const int32_t *__restrict__ len,
+        uint32_t n_tok, uint32_t ord, uint32_t *item_base, uint32_t *item_len, uint32_t *tile) {
+    uint32_t t0 = 0;
+    while (t0 < n_tok) {
+        const uint32_t l = (uint32_t)len[t0];
+        if (!l) { return 0; }
+        const uint32_t nt = (l + RTILE - 1u) / RTILE;
+        if (ord < nt) { *item_base = t0; *item_len = l; *tile = ord; return 1; }
+        ord -= nt;
+        t0 += l;
+    }
+    return 0;
+}
+
+/* The sliding geometry on tensor cores: D = 256, group 2, 2 KV heads.
+ * grid = (n_head_kv, tiles), block = 256, dynamic shared = K + V tiles. */
+__global__ void __launch_bounds__(EG2VQ_ATTN_TC_THREADS, 1) eg2vq_attn_mma_slide_kernel(
+        float *__restrict__ out, const float *__restrict__ q,
+        const float *__restrict__ k, const float *__restrict__ v,
+        const int32_t *__restrict__ len, uint32_t n_tok, int32_t half_swa) {
+    constexpr uint32_t D = 256u, GROUP = 2u, RTILE = EG2VQ_ATTN_TC_RTILE_S, TK = EG2VQ_ATTN_TC_TK;
+    constexpr uint32_t NHEAD = 4u;
+    extern __shared__ __align__(16) uint8_t smem[];
+    __half *ks = (__half *)smem;
+    __half *vs = ks + TK * D;
+
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t g = lane >> 2u, qq = lane & 3u;
+    const uint32_t kv_head = blockIdx.x;
+
+    uint32_t item_base, item_len, tile;
+    if (!eg2vq_attn_mma_tile_map<RTILE>(len, n_tok, blockIdx.y, &item_base, &item_len, &tile)) { return; }
+    const uint32_t r0 = item_base + tile * RTILE;
+    const uint32_t r1 = (item_base + item_len < r0 + RTILE) ? item_base + item_len : r0 + RTILE;
+    const uint32_t pos_first = r0 - item_base;
+    const uint32_t pos_last = r1 - 1u - item_base;
+    const uint32_t half = (half_swa > 0) ? (uint32_t)half_swa : 0x7fffffffu;
+    const uint32_t begin_all = (pos_first > half) ? pos_first - half : 0u;
+    const uint32_t last_all = (pos_last + half < item_len - 1u) ? pos_last + half : item_len - 1u;
+    if (begin_all > last_all) { return; }
+    const uint32_t base_start = (begin_all / TK) * TK;
+    const uint64_t kv_stride = (uint64_t)2u * D;
+
+    /* Q fragments: 16 M rows (8 tokens x 2 heads) x 16 k16 chunks of D, the
+     * A-fragment order [row g, row g+8] x [col, col+8] (gemma4_attn_mma.cuh:
+     * 179-207), with the M rows this port's own (token, head) map. */
+    uint32_t qa[16][4];
+    #pragma unroll
+    for (uint32_t kk = 0; kk < 16u; kk++) {
+        const uint32_t col = kk * 16u + 2u * qq;
+        #pragma unroll
+        for (uint32_t m = 0; m < 2u; m++) {
+            const uint32_t row_g = g + 8u * m;
+            const uint32_t token = r0 + warp * 8u + (row_g >> 1);
+            const bool valid = (token < r1);
+            const uint32_t head = kv_head * GROUP + (row_g & 1u);
+            const float *qr = q + ((uint64_t)token * NHEAD + head) * D;
+            const float lo = valid ? qr[col] : 0.0f;
+            const float hi = valid ? qr[col + 1u] : 0.0f;
+            const float lo8 = valid ? qr[col + 8u] : 0.0f;
+            const float hi8 = valid ? qr[col + 9u] : 0.0f;
+            if (m == 0u) {
+                qa[kk][0] = eg2vq_attn_mma_pack(lo, hi);
+                qa[kk][2] = eg2vq_attn_mma_pack(lo8, hi8);
+            } else {
+                qa[kk][1] = eg2vq_attn_mma_pack(lo, hi);
+                qa[kk][3] = eg2vq_attn_mma_pack(lo8, hi8);
+            }
+        }
+    }
+
+    float o[32][4] = {};
+    float mrun[2] = {-INFINITY, -INFINITY}, lrun[2] = {0.0f, 0.0f};
+
+    for (uint32_t base = base_start; base <= last_all; base += TK) {
+        /* K and V for this KV head's 32 keys: each warp stages four keys, each
+         * lane one 16-byte chunk of each (D/8 = 32 chunks). */
+        for (uint32_t t = warp * 4u; t < warp * 4u + 4u; t++) {
+            const uint32_t k_abs = base + t;
+            const bool valid = (k_abs >= begin_all && k_abs <= last_all);
+            const uint32_t slot = valid ? (item_base + k_abs) : item_base;
+            const float *src = k + (uint64_t)slot * kv_stride + (uint64_t)kv_head * D;
+            const float *vsrc = v + (uint64_t)slot * kv_stride + (uint64_t)kv_head * D;
+            const uint32_t chunk = lane;
+            eg2vq_attn_mma_stage8(ks + eg2vq_attn_mma_swz(t, chunk, D), src + chunk * 8u, valid);
+            eg2vq_attn_mma_stage8(vs + eg2vq_attn_mma_swz(t, chunk, D), vsrc + chunk * 8u, valid);
+        }
+        __syncthreads();
+
+        /* S = Q K^T over the 32-key tile: four n8 tiles, 16 k16 steps. */
+        float s[4][4] = {};
+        #pragma unroll
+        for (uint32_t kk = 0; kk < 16u; kk++) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j += 2u) {
+                uint32_t b[4];
+                const uint32_t mat = lane >> 3;
+                const uint32_t krow = (j + (mat >> 1)) * 8u + (lane & 7u);
+                const uint32_t chunk = kk * 2u + (mat & 1u);
+                eg2vq_attn_mma_ldsm4(b, ks + eg2vq_attn_mma_swz(krow, chunk, D), false);
+                eg2vq_attn_mma_f16(s[j], qa[kk], b[0], b[1]);
+                eg2vq_attn_mma_f16(s[j + 1u], qa[kk], b[2], b[3]);
+            }
+        }
+
+        /* The symmetric mask and the online softmax, per row h = 0 (g) and
+         * h = 1 (g + 8): the score set is this row's own item window. */
+        #pragma unroll
+        for (uint32_t h = 0; h < 2u; h++) {
+            const uint32_t row_g = g + 8u * h;
+            const uint32_t token = r0 + warp * 8u + (row_g >> 1);
+            const bool rv = (token < r1);
+            const uint32_t pos = token - item_base;
+            const uint32_t rb = (pos > half) ? pos - half : 0u;
+            const uint32_t rl = (pos + half < item_len - 1u) ? pos + half : item_len - 1u;
+            float peak = -INFINITY;
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                #pragma unroll
+                for (uint32_t e = 0; e < 2u; e++) {
+                    const uint32_t kk = base + nt * 8u + 2u * qq + e;
+                    if (!rv || kk < rb || kk > rl) { s[nt][h * 2u + e] = -INFINITY; }
+                    peak = fmaxf(peak, s[nt][h * 2u + e]);
+                }
+            }
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, 1));
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, 2));
+            const bool tv = (peak > -INFINITY);
+            const float mn = tv ? fmaxf(mrun[h], peak) : mrun[h];
+            const float alpha = tv ? (mrun[h] == -INFINITY ? 0.0f : expf(mrun[h] - mn)) : 1.0f;
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                #pragma unroll
+                for (uint32_t e = 0; e < 2u; e++) {
+                    const float p = tv ? expf(s[nt][h * 2u + e] - mn) : 0.0f;
+                    s[nt][h * 2u + e] = p;
+                    sum += p;
+                }
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+            lrun[h] = lrun[h] * alpha + sum;
+            mrun[h] = mn;
+            #pragma unroll
+            for (uint32_t t = 0; t < 32u; t++) {
+                o[t][h * 2u + 0u] *= alpha;
+                o[t][h * 2u + 1u] *= alpha;
+            }
+        }
+
+        /* O += P V over the same 32 keys: two k16 steps, 32 n8 output tiles. */
+        #pragma unroll
+        for (uint32_t kk = 0; kk < 2u; kk++) {
+            const uint32_t pa[4] = {
+                eg2vq_attn_mma_pack(s[2u * kk][0], s[2u * kk][1]),
+                eg2vq_attn_mma_pack(s[2u * kk][2], s[2u * kk][3]),
+                eg2vq_attn_mma_pack(s[2u * kk + 1u][0], s[2u * kk + 1u][1]),
+                eg2vq_attn_mma_pack(s[2u * kk + 1u][2], s[2u * kk + 1u][3])};
+            #pragma unroll
+            for (uint32_t t = 0; t < 32u; t += 2u) {
+                uint32_t b[4];
+                const uint32_t mat = lane >> 3;
+                const uint32_t krow = kk * 16u + (mat & 1u) * 8u + (lane & 7u);
+                const uint32_t chunk = t + (mat >> 1);
+                eg2vq_attn_mma_ldsm4(b, vs + eg2vq_attn_mma_swz(krow, chunk, D), true);
+                eg2vq_attn_mma_f16(o[t], pa, b[0], b[1]);
+                eg2vq_attn_mma_f16(o[t + 1u], pa, b[2], b[3]);
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv[2] = {lrun[0] > 0.0f ? 1.0f / lrun[0] : 0.0f,
+                          lrun[1] > 0.0f ? 1.0f / lrun[1] : 0.0f};
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t row_g = g + 8u * h;
+        const uint32_t token = r0 + warp * 8u + (row_g >> 1);
+        if (token >= r1) { continue; }
+        const uint32_t head = kv_head * GROUP + (row_g & 1u);
+        float *dst = out + ((uint64_t)token * NHEAD + head) * D;
+        #pragma unroll
+        for (uint32_t t = 0; t < 32u; t++) {
+            const uint32_t d = t * 8u + 2u * qq;
+            dst[d] = o[t][h * 2u + 0u] * inv[h];
+            dst[d + 1u] = o[t][h * 2u + 1u] * inv[h];
+        }
+    }
+}
+
+/* The full geometry on tensor cores: D = 512, group 4, 1 KV head.
+ * Each warp owns 4 tokens x 4 query heads (16 M rows) and ONE 256-dim half;
+ * the two warps of an mgroup exchange their partial 16x32 scores in shared
+ * before the softmax, exactly as gemma4_attn_mma.cuh:450-468 does.
+ * grid = (1, tiles), block = 256, dynamic shared = K/V tile + exchange. */
+__global__ void __launch_bounds__(EG2VQ_ATTN_TC_THREADS, 1) eg2vq_attn_mma_full_kernel(
+        float *__restrict__ out, const float *__restrict__ q,
+        const float *__restrict__ k, const float *__restrict__ v,
+        const int32_t *__restrict__ len, uint32_t n_tok, int32_t half_swa) {
+    constexpr uint32_t D = 512u, RTILE = EG2VQ_ATTN_TC_RTILE_F, TK = EG2VQ_ATTN_TC_TK;
+    constexpr uint32_t HALF = 256u, NHEAD = 4u;
+    extern __shared__ __align__(16) uint8_t smem[];
+    __half *kv = (__half *)smem;
+    float *exchange = (float *)(kv + TK * D);
+
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t g = lane >> 2u, qq = lane & 3u;
+
+    uint32_t item_base, item_len, tile;
+    if (!eg2vq_attn_mma_tile_map<RTILE>(len, n_tok, blockIdx.x, &item_base, &item_len, &tile)) { return; }
+    const uint32_t r0 = item_base + tile * RTILE;
+    const uint32_t r1 = (item_base + item_len < r0 + RTILE) ? item_base + item_len : r0 + RTILE;
+    const uint32_t pos_first = r0 - item_base;
+    const uint32_t pos_last = r1 - 1u - item_base;
+    const uint32_t half = (half_swa > 0) ? (uint32_t)half_swa : 0x7fffffffu;
+    const uint32_t begin_all = (pos_first > half) ? pos_first - half : 0u;
+    const uint32_t last_all = (pos_last + half < item_len - 1u) ? pos_last + half : item_len - 1u;
+    if (begin_all > last_all) { return; }
+    const uint32_t base_start = (begin_all / TK) * TK;
+    const uint64_t kv_stride = (uint64_t)D;          /* one KV head */
+    const uint32_t mgroup = warp >> 1u, halfd = warp & 1u;
+
+    /* Q fragments for this 256-dim half; M row = 4 tokens x 4 heads. */
+    uint32_t qa[16][4];
+    #pragma unroll
+    for (uint32_t kk = 0; kk < 16u; kk++) {
+        const uint32_t col = halfd * HALF + kk * 16u + 2u * qq;
+        #pragma unroll
+        for (uint32_t m = 0; m < 2u; m++) {
+            const uint32_t row_g = g + 8u * m;
+            const uint32_t token = r0 + mgroup * 4u + (row_g >> 2);
+            const bool valid = (token < r1);
+            const uint32_t head = row_g & 3u;
+            const float *qr = q + ((uint64_t)token * NHEAD + head) * D;
+            const float lo = valid ? qr[col] : 0.0f;
+            const float hi = valid ? qr[col + 1u] : 0.0f;
+            const float lo8 = valid ? qr[col + 8u] : 0.0f;
+            const float hi8 = valid ? qr[col + 9u] : 0.0f;
+            if (m == 0u) {
+                qa[kk][0] = eg2vq_attn_mma_pack(lo, hi);
+                qa[kk][2] = eg2vq_attn_mma_pack(lo8, hi8);
+            } else {
+                qa[kk][1] = eg2vq_attn_mma_pack(lo, hi);
+                qa[kk][3] = eg2vq_attn_mma_pack(lo8, hi8);
+            }
+        }
+    }
+
+    float o[32][4] = {};
+    float mrun[2] = {-INFINITY, -INFINITY}, lrun[2] = {0.0f, 0.0f};
+
+    for (uint32_t base = base_start; base <= last_all; base += TK) {
+        /* K for the tile: each warp four keys, each lane two 16-byte chunks
+         * (D/8 = 64 chunks). */
+        for (uint32_t t = warp * 4u; t < warp * 4u + 4u; t++) {
+            const uint32_t k_abs = base + t;
+            const bool valid = (k_abs >= begin_all && k_abs <= last_all);
+            const uint32_t slot = valid ? (item_base + k_abs) : item_base;
+            const float *src = k + (uint64_t)slot * kv_stride;
+            for (uint32_t c = lane; c < D / 8u; c += 32u) {
+                eg2vq_attn_mma_stage8(kv + eg2vq_attn_mma_swz(t, c, D), src + c * 8u, valid);
+            }
+        }
+        __syncthreads();
+
+        /* Partial S over this warp's half: four n8 tiles, 16 k16 steps. */
+        float s[4][4] = {};
+        #pragma unroll
+        for (uint32_t kk = 0; kk < 16u; kk++) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j += 2u) {
+                uint32_t b[4];
+                const uint32_t mat = lane >> 3;
+                const uint32_t krow = (j + (mat >> 1)) * 8u + (lane & 7u);
+                const uint32_t chunk = halfd * 32u + kk * 2u + (mat & 1u);
+                eg2vq_attn_mma_ldsm4(b, kv + eg2vq_attn_mma_swz(krow, chunk, D), false);
+                eg2vq_attn_mma_f16(s[j], qa[kk], b[0], b[1]);
+                eg2vq_attn_mma_f16(s[j + 1u], qa[kk], b[2], b[3]);
+            }
+        }
+
+        /* Publish the half's scores and add both halves in half order
+         * (gemma4_attn_mma.cuh:450-468). */
+        float *mine = exchange + (mgroup * 2u + halfd) * 16u * 32u;
+        #pragma unroll
+        for (uint32_t nt = 0; nt < 4u; nt++) {
+            *(float2 *)(mine + g * 32u + nt * 8u + 2u * qq) = make_float2(s[nt][0], s[nt][1]);
+            *(float2 *)(mine + (g + 8u) * 32u + nt * 8u + 2u * qq) = make_float2(s[nt][2], s[nt][3]);
+        }
+        __syncthreads();
+        const float *ex0 = exchange + (mgroup * 2u + 0u) * 16u * 32u;
+        const float *ex1 = exchange + (mgroup * 2u + 1u) * 16u * 32u;
+        #pragma unroll
+        for (uint32_t nt = 0; nt < 4u; nt++) {
+            const float2 a0 = *(const float2 *)(ex0 + g * 32u + nt * 8u + 2u * qq);
+            const float2 b0 = *(const float2 *)(ex1 + g * 32u + nt * 8u + 2u * qq);
+            const float2 a1 = *(const float2 *)(ex0 + (g + 8u) * 32u + nt * 8u + 2u * qq);
+            const float2 b1 = *(const float2 *)(ex1 + (g + 8u) * 32u + nt * 8u + 2u * qq);
+            s[nt][0] = a0.x + b0.x; s[nt][1] = a0.y + b0.y;
+            s[nt][2] = a1.x + b1.x; s[nt][3] = a1.y + b1.y;
+        }
+
+        /* The symmetric mask and the online softmax, per row. */
+        #pragma unroll
+        for (uint32_t h = 0; h < 2u; h++) {
+            const uint32_t row_g = g + 8u * h;
+            const uint32_t token = r0 + mgroup * 4u + (row_g >> 2);
+            const bool rv = (token < r1);
+            const uint32_t pos = token - item_base;
+            const uint32_t rb = (pos > half) ? pos - half : 0u;
+            const uint32_t rl = (pos + half < item_len - 1u) ? pos + half : item_len - 1u;
+            float peak = -INFINITY;
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                #pragma unroll
+                for (uint32_t e = 0; e < 2u; e++) {
+                    const uint32_t kk = base + nt * 8u + 2u * qq + e;
+                    if (!rv || kk < rb || kk > rl) { s[nt][h * 2u + e] = -INFINITY; }
+                    peak = fmaxf(peak, s[nt][h * 2u + e]);
+                }
+            }
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, 1));
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, 2));
+            const bool tv = (peak > -INFINITY);
+            const float mn = tv ? fmaxf(mrun[h], peak) : mrun[h];
+            const float alpha = tv ? (mrun[h] == -INFINITY ? 0.0f : expf(mrun[h] - mn)) : 1.0f;
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                #pragma unroll
+                for (uint32_t e = 0; e < 2u; e++) {
+                    const float p = tv ? expf(s[nt][h * 2u + e] - mn) : 0.0f;
+                    s[nt][h * 2u + e] = p;
+                    sum += p;
+                }
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+            lrun[h] = lrun[h] * alpha + sum;
+            mrun[h] = mn;
+            #pragma unroll
+            for (uint32_t t = 0; t < 32u; t++) {
+                o[t][h * 2u + 0u] *= alpha;
+                o[t][h * 2u + 1u] *= alpha;
+            }
+        }
+
+        /* V over the same tile (K is dead after the score barrier), then
+         * O += P V over this warp's 256 output dims. */
+        __syncthreads();
+        for (uint32_t t = warp * 4u; t < warp * 4u + 4u; t++) {
+            const uint32_t k_abs = base + t;
+            const bool valid = (k_abs >= begin_all && k_abs <= last_all);
+            const uint32_t slot = valid ? (item_base + k_abs) : item_base;
+            const float *src = v + (uint64_t)slot * kv_stride;
+            for (uint32_t c = lane; c < D / 8u; c += 32u) {
+                eg2vq_attn_mma_stage8(kv + eg2vq_attn_mma_swz(t, c, D), src + c * 8u, valid);
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (uint32_t kk = 0; kk < 2u; kk++) {
+            const uint32_t pa[4] = {
+                eg2vq_attn_mma_pack(s[2u * kk][0], s[2u * kk][1]),
+                eg2vq_attn_mma_pack(s[2u * kk][2], s[2u * kk][3]),
+                eg2vq_attn_mma_pack(s[2u * kk + 1u][0], s[2u * kk + 1u][1]),
+                eg2vq_attn_mma_pack(s[2u * kk + 1u][2], s[2u * kk + 1u][3])};
+            #pragma unroll
+            for (uint32_t t = 0; t < 32u; t += 2u) {
+                uint32_t b[4];
+                const uint32_t mat = lane >> 3;
+                const uint32_t krow = kk * 16u + (mat & 1u) * 8u + (lane & 7u);
+                const uint32_t chunk = halfd * 32u + t + (mat >> 1);
+                eg2vq_attn_mma_ldsm4(b, kv + eg2vq_attn_mma_swz(krow, chunk, D), true);
+                eg2vq_attn_mma_f16(o[t], pa, b[0], b[1]);
+                eg2vq_attn_mma_f16(o[t + 1u], pa, b[2], b[3]);
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv[2] = {lrun[0] > 0.0f ? 1.0f / lrun[0] : 0.0f,
+                          lrun[1] > 0.0f ? 1.0f / lrun[1] : 0.0f};
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t row_g = g + 8u * h;
+        const uint32_t token = r0 + mgroup * 4u + (row_g >> 2);
+        if (token >= r1) { continue; }
+        const uint32_t head = row_g & 3u;
+        float *dst = out + ((uint64_t)token * NHEAD + head) * D + halfd * HALF;
+        #pragma unroll
+        for (uint32_t t = 0; t < 32u; t++) {
+            const uint32_t d = t * 8u + 2u * qq;
+            dst[d] = o[t][h * 2u + 0u] * inv[h];
+            dst[d + 1u] = o[t][h * 2u + 1u] * inv[h];
+        }
+    }
+}
+
+/* The tensor-core launcher.  Returns 0 for a shape it does not cover, and the
+ * caller (eg2vq_attn below) then takes the scalar path; `off` is the caller's
+ * own span table (n_items + 1 entries) and is used only to size the grid,
+ * while the kernels derive the same mapping from `len` on the device. */
+static inline int eg2vq_attn_mma(float *out, const float *q, const float *k, const float *v,
+                                 const int32_t *pos, const int32_t *len,
+                                 const uint32_t *off, uint32_t n_items,
+                                 uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv,
+                                 uint32_t head_dim, int32_t half_swa) {
+    if (!out || !q || !k || !v || !pos || !len || !off || !n_items || !n_tok || !head_dim) { return 0; }
+    if (n_head != 4u || n_head_kv > 2u) { return 0; }
+    int slide = (n_head_kv == 2u && head_dim == 256u);
+    const int full = (n_head_kv == 1u && head_dim == 512u);
+    if (!slide && !full) { return 0; }
+    /* Half the window on the sliding layers; the full layers read the item.
+     * A negative half_swa on the sliding geometry is accepted as "no mask"
+     * only because the kernel's bound then covers the item, which is what the
+     * scalar kernel does too. */
+    uint64_t tiles = 0;
+    const uint32_t rtile = slide ? EG2VQ_ATTN_TC_RTILE_S : EG2VQ_ATTN_TC_RTILE_F;
+    for (uint32_t i = 0; i < n_items; i++) {
+        const uint32_t l = off[i + 1u] - off[i];
+        tiles += (l + rtile - 1u) / rtile;
+    }
+    if (!tiles || tiles > 0x7fffffffull) { return 0; }
+    if (slide) {
+        static int smem_set = 0;
+        if (!smem_set) {
+            if (cudaFuncSetAttribute(eg2vq_attn_mma_slide_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)EG2VQ_ATTN_TC_SMEM_S) != cudaSuccess) { return 0; }
+            smem_set = 1;
+        }
+        const dim3 grid(2u, (unsigned)tiles), block(EG2VQ_ATTN_TC_THREADS);
+        eg2vq_attn_mma_slide_kernel<<<grid, block, EG2VQ_ATTN_TC_SMEM_S>>>(out, q, k, v, len, n_tok, half_swa);
+    } else {
+        static int smem_set = 0;
+        if (!smem_set) {
+            if (cudaFuncSetAttribute(eg2vq_attn_mma_full_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)EG2VQ_ATTN_TC_SMEM_F) != cudaSuccess) { return 0; }
+            smem_set = 1;
+        }
+        const dim3 grid((unsigned)tiles), block(EG2VQ_ATTN_TC_THREADS);
+        eg2vq_attn_mma_full_kernel<<<grid, block, EG2VQ_ATTN_TC_SMEM_F>>>(out, q, k, v, len, n_tok, half_swa);
+    }
+    return 1;
+}
+
+/* The scalar launcher: this kernel's original body, unchanged, kept as the
+ * fallback for every shape the tensor-core path does not cover. */
+static inline int eg2vq_attn_scalar(float *out, const float *q, const float *k, const float *v,
+                                    const int32_t *pos, const int32_t *len,
+                                    uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv,
+                                    uint32_t head_dim, int32_t half_swa) {
     if (!out || !q || !k || !v || !pos || !len || !n_tok || !head_dim) { return 0; }
     if (n_head != EG2VQ_ATTN_WARPS || n_head > EG2VQ_ATTN_MAX_HEAD) { return 0; }
     if (!n_head_kv || (n_head % n_head_kv)) { return 0; }
@@ -401,6 +986,45 @@ static inline int eg2vq_attn(float *out, const float *q, const float *k, const f
     }
     #undef EG2VQ_ATTN_LAUNCH
     return 1;
+}
+
+/* The public entry: the tensor-core path when the shape and the span table fit
+ * it, the scalar kernel otherwise.  `off` is the caller's span table (n_items +
+ * 1 rows), the same table the caller already derives `pos` and `len` from; it
+ * reaches this launcher only to size the grid exactly, and passing it NULL (or
+ * zero items) keeps the scalar path, which is what a shape the tensor-core
+ * kernels do not cover needs anyway.  A batch must pass its real table: the
+ * tensor-core kernels map a CTA to exactly one item, so the tile count they are
+ * launched with is that table's, not n_tok's. */
+/* THE DISPATCH HAS A ROW THRESHOLD ONLY IN THE BENCH'S MEASUREMENTS, NOT IN THE
+ * CODE, and this is deliberate.  Measured (bench_eg2vq_attn, scalar against
+ * tensor cores in one process, 20 repeats a row): 27 rows 0.97x, 115 rows
+ * 1.01x, 184 rows 1.88x, 294 rows 2.26x, 565 rows 4.74x, 1,414 rows 9.26x; a
+ * 64-item block of 20-token items (1,280 rows) 1.56x and an 8-item block of
+ * 115-token items (920 rows) 4.26x -- so a call below ~184 rows gains nothing
+ * and loses at most 3%, and the axis is the call's ROW count, not the item
+ * length.  A threshold on it CANNOT be shipped: unit 27's contract is that a
+ * batched item's vector is its single-item vector BYTE FOR BYTE, and a
+ * call-sized threshold picks the arithmetic from the whole call's length, so a
+ * 20-token item would take the scalar path alone and the tensor-core one inside
+ * a 64-item batch.  One arithmetic per shape, call-independent, is worth more
+ * than the 3% the smallest single item would save. */
+static inline int eg2vq_attn(float *out, const float *q, const float *k, const float *v,
+                             const int32_t *pos, const int32_t *len,
+                             uint32_t n_tok, uint32_t n_head, uint32_t n_head_kv,
+                             uint32_t head_dim, int32_t half_swa,
+                             const uint32_t *off, uint32_t n_items) {
+    if (!out || !q || !k || !v || !pos || !len || !n_tok || !head_dim) { return 0; }
+    if (n_head != EG2VQ_ATTN_WARPS || n_head > EG2VQ_ATTN_MAX_HEAD) { return 0; }
+    if (!n_head_kv || (n_head % n_head_kv)) { return 0; }
+    /* The tensor-core kernels are built for this tower's two geometries and
+     * 16-byte-aligned operands (their fragment loads are float4). */
+    if (((uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)out) % 16u == 0u &&
+        eg2vq_attn_mma(out, q, k, v, pos, len, off, n_items, n_tok, n_head, n_head_kv,
+                       head_dim, half_swa)) {
+        return 1;
+    }
+    return eg2vq_attn_scalar(out, q, k, v, pos, len, n_tok, n_head, n_head_kv, head_dim, half_swa);
 }
 
 /* MEASUREMENT NOTE, for whoever tunes this next (read the record in
