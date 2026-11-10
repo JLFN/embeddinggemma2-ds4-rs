@@ -198,8 +198,8 @@ own corpus sweep. Against that, today's 6.40 s / 12,507-12,720 tokens/s is 2.9x.
 The three units' published factors do not reconstruct that number exactly, and
 none of them was measured in one window with the others: the attention unit's
 own factor is 1.61x, recomputed here from the committed CSVs rather than quoted
-(`speed-bench/eg2_embed_vizzio.csv` 18.799776866 s at batch 8 against 11.654060797
-/ 11.717910747 / 11.658361879 s in its three `eg2_embed_vizzio_attn-vec4` runs,
+(`speed-bench/eg2_embed_bench.csv` 18.799776866 s at batch 8 against 11.654060797
+/ 11.717910747 / 11.658361879 s in its three `eg2_embed_bench_attn-vec4` runs,
 i.e. 1.6132 / 1.6044 / 1.6126); the GEMM's is 1.20x-1.25x pooled, 1.25x at the top
 of that range; this one is 1.32x. 1.61 x 1.25 x 1.32 = 2.66x, against the 2.94x
 the two endpoints give and the 2.7x this record's own earlier revision published. Every one of
@@ -342,8 +342,8 @@ make test-eg2vq-attn                             # EG2VQ_ATTN_PASS
 # the tower gate (~7 min)
 make tests/parity/eg2vq_embd_gpu_oracle
 DS4_LOCK_FILE=/tmp/ds4.lock.attn ./tests/parity/eg2vq_embd_gpu_oracle \
-    /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
-    /data/embeddinggemma2/out/phase7-ids300.tsv
+    <root>/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
+    <root>/embeddinggemma2/out/phase7-ids300.tsv
 
 # the error pair of 4.6: the same test source, twice, one sitting.  The before
 # binary is built in the tree with the pre-change header staged over the live
@@ -385,10 +385,10 @@ nvcc -O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_89 \
 # the sweep's own health probe cannot tell another listener from ds4-server)
 EG2_EMBED_SERVER=/tmp/ab-before/bin/ds4-server EG2_EMBED_CLI=/tmp/ab-before/bin/ds4 \
   EG2_EMBED_CSV=/tmp/attn-ab-old.csv sh ../../speed-bench/eg2_embed_sweep.sh \
-  <artifact.gguf> /data/embeddinggemma2/out/live-demo/pages 8121
+  <artifact.gguf> <root>/embeddinggemma2/out/live-demo/pages 8121
 EG2_EMBED_SERVER=$PWD/../../ds4-server EG2_EMBED_CLI=$PWD/../../ds4 \
   EG2_EMBED_CSV=/tmp/attn-ab-new.csv sh ../../speed-bench/eg2_embed_sweep.sh \
-  <artifact.gguf> /data/embeddinggemma2/out/live-demo/pages 8120
+  <artifact.gguf> <root>/embeddinggemma2/out/live-demo/pages 8120
 ```
 
 Building either probe against the CURRENT header instead compiles and runs but
@@ -402,7 +402,7 @@ Files: `attn-ablation.txt` (the ablation), `attn-grouped-probe.txt` (the
 candidate) and `attn-grouped-probe-spanbug.txt` (the first version of it, kept as
 the wrong-instrument example), `probes/probe-attn.cu`, `probes/probe-attn-grp.cu`,
 `attn-ab-{old,new}-r{1,2}.txt` (the kernel bench raw), `attn-ab-sweep.txt` (the
-joined corpus table), `speed-bench/eg2_embed_vizzio_attn-ab-{old,new}-r{1,2}.csv`
+joined corpus table), `speed-bench/eg2_embed_bench_attn-ab-{old,new}-r{1,2}.csv`
 plus the `-r{3,4}` old runs and their `_health.json` (all six health readouts are
 the same caps payload, byte for byte, and it carries no port and no build field:
 what identifies a run is the CSV beside it and the server's own `listening on`
