@@ -63,6 +63,59 @@ static void free_meta(attn_meta m) {
     if (m.len) { cudaFree(m.len); }
 }
 
+// One comparison, used by every leg below: the maximum element-wise error, the
+// relative L2 of the whole tensor, and the worst per-(query, head) cosine.  The
+// cosine is per head because a whole-tensor one hides a single bad head.
+struct a_cmp { double max_abs; double rel; double min_cos; };
+
+static a_cmp a_compare(const std::vector<float> &yref, const std::vector<float> &ydev,
+                       uint32_t tokens, uint32_t n_head, uint32_t head_dim) {
+    const uint64_t q_stride = (uint64_t)n_head * head_dim;
+    double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0, min_cos = 1.0;
+    for (size_t i = 0; i < yref.size(); i++) {
+        const double d = (double)ydev[i] - (double)yref[i];
+        if (fabs(d) > max_abs) { max_abs = fabs(d); }
+        sum_sq += d * d;
+        ref_sq += (double)yref[i] * (double)yref[i];
+    }
+    for (uint32_t p = 0; p < tokens; p++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            double dot = 0.0, na = 0.0, nb = 0.0;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                const double a = yref[(size_t)p * q_stride + (size_t)h * head_dim + d];
+                const double b = ydev[(size_t)p * q_stride + (size_t)h * head_dim + d];
+                dot += a * b; na += a * a; nb += b * b;
+            }
+            if (na > 0.0 && nb > 0.0) {
+                const double cos = dot / sqrt(na * nb);
+                if (cos < min_cos) { min_cos = cos; }
+            }
+        }
+    }
+    a_cmp r;
+    r.max_abs = max_abs;
+    r.rel = ref_sq > 0.0 ? sqrt(sum_sq / ref_sq) : 0.0;
+    r.min_cos = min_cos;
+    return r;
+}
+
+// The tensor-core legs' declared bounds.  MEASURED FIRST, declared with margin:
+// the f16 Q/K rounding and the m16n8k16 k16 tree are a different arithmetic from
+// the scalar kernel's f32 four-chain dot, so this is a parity bound and not the
+// scalar path's 1e-5 / 1-1e-6.  The reason it is looser than the VQ unit's
+// (3e-4 / 1-1e-7) is this model's own arithmetic: attention scale is exactly
+// 1.0, so scores run to ~16 sigma over 256 or 512 dims and the softmax is sharp,
+// and a 6e-3 absolute score error (the f16 rounding of the operands) moves the
+// weights by ~1%.  Measured here: rel 1.06e-3 to 1.50e-3, min cos 0.999942612 to
+// 0.999961871 on the sliding geometry and 0.999869621 to 0.999877946 on the full
+// one (D=512 sums twice the terms, so it is the worse of the two).  What makes
+// that acceptable is the TOWER, not this bound: gate 7 with this kernel measures
+// min cos 0.999999768 and max rel_rms 6.813e-04 against its unchanged
+// declaration (cos >= 0.999999, rel_rms <= 1e-03), i.e. the per-token error
+// averages out in the pooled vector.
+static const double kMmaRelBound = 2e-3;
+static const double kMmaCosBound = 1.0 - 2e-4;
+
 static std::mt19937 rng(20261019u);
 
 // The reference arithmetic, one (query, head) at a time.
@@ -125,6 +178,17 @@ int main(void) {
         { 1414, 256, 2,  512, "sliding: 1414 tokens (longest frozen item)" },
         {  349, 512, 1,   -1, "full: 349 tokens, no mask" },
         { 1414, 512, 1,   -1, "full: 1414 tokens, no mask" },
+        /* the second performance unit gave pass 1 a grouped form that covers
+         * head_dim == 64*LAB for LAB in {2,4,8,16} only, and the tower's own two
+         * head dims (256, 512) are both in that set -- so without these two
+         * cases the instantiation every other shape takes would be wired into
+         * the launcher and never executed by any gate.  head_dim 384 is a
+         * multiple of 128, so it takes the vectorized lane-per-key path
+         * (LAB = 0, vec4 = 1); head_dim 320 is not, so it takes the scalar
+         * lane-per-key path (LAB = 0, vec4 = 0), which is the only case here
+         * that exercises the scalar bodies at all. */
+        {   40, 384, 2,  512, "fallback: head_dim 384 (grouped off, vector on)" },
+        {   33, 320, 2,  512, "fallback: head_dim 320 (grouped off, vector off)" },
     };
     const uint32_t n_head = 4;
     int fails = 0;
@@ -148,7 +212,7 @@ int main(void) {
         CK(cudaMemcpy(dk, k.data(), k.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dv, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemset(dy, 0, yref.size() * 4));
-        if (!eg2vq_attn(dy, dq, dk, dv, meta.pos, meta.len, c.tokens, n_head, c.n_head_kv, c.head_dim, c.half_swa)) {
+        if (!eg2vq_attn_scalar(dy, dq, dk, dv, meta.pos, meta.len, c.tokens, n_head, c.n_head_kv, c.head_dim, c.half_swa)) {
             printf("FAIL %s: the launcher refused the shape\n", c.tag);
             fails++;
             free_meta(meta);
@@ -159,37 +223,54 @@ int main(void) {
         std::vector<float> ydev(yref.size());
         CK(cudaMemcpy(ydev.data(), dy, ydev.size() * 4, cudaMemcpyDeviceToHost));
 
-        double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0, min_cos = 1.0, scale = 0.0;
-        for (size_t i = 0; i < yref.size(); i++) {
-            const double d = (double)ydev[i] - (double)yref[i];
-            if (fabs(d) > max_abs) { max_abs = fabs(d); }
-            sum_sq += d * d;
-            ref_sq += (double)yref[i] * (double)yref[i];
-            if (fabs((double)yref[i]) > scale) { scale = fabs((double)yref[i]); }
-        }
-        // per (query, head) cosine, because a whole-tensor cosine hides a head
-        std::vector<float> hv((size_t)c.head_dim), hr((size_t)c.head_dim);
-        for (uint32_t p = 0; p < c.tokens; p++) {
-            for (uint32_t h = 0; h < n_head; h++) {
-                double dot = 0.0, na = 0.0, nb = 0.0;
-                for (uint32_t d = 0; d < c.head_dim; d++) {
-                    const double a = yref[(size_t)p * q_stride + (size_t)h * c.head_dim + d];
-                    const double b = ydev[(size_t)p * q_stride + (size_t)h * c.head_dim + d];
-                    dot += a * b; na += a * a; nb += b * b;
-                }
-                if (na > 0.0 && nb > 0.0) {
-                    const double cos = dot / sqrt(na * nb);
-                    if (cos < min_cos) { min_cos = cos; }
-                }
-            }
-        }
-        (void)hv; (void)hr;
-        const double rel = ref_sq > 0.0 ? sqrt(sum_sq / ref_sq) : 0.0;
-        const int bad = (rel > 1e-5 || min_cos < 1.0 - 1e-6);
-        printf("%-44s tok %4u hd %3u kv %u half %5d | maxabs %.2e rel %.2e mincos %.9f | %s\n",
-               c.tag, c.tokens, c.head_dim, c.n_head_kv, c.half_swa, max_abs, rel, min_cos,
+        const a_cmp cs = a_compare(yref, ydev, c.tokens, n_head, c.head_dim);
+        const int bad = (cs.rel > 1e-5 || cs.min_cos < 1.0 - 1e-6);
+        printf("%-44s tok %4u hd %3u kv %u half %5d | scalar maxabs %.2e rel %.2e mincos %.9f | %s\n",
+               c.tag, c.tokens, c.head_dim, c.n_head_kv, c.half_swa, cs.max_abs, cs.rel, cs.min_cos,
                bad ? "OUT OF BOUND" : "ok");
         if (bad) { fails++; }
+
+        /* The tensor-core leg on the same inputs and the same oracle.  A shape
+         * its two built geometries do not cover (the 384 and 320 fallbacks) is
+         * reported, not silently skipped. */
+        CK(cudaMemset(dy, 0, yref.size() * 4));
+        const uint32_t off1[2] = { 0u, c.tokens };
+        std::vector<float> ymma;
+        const int mma_ran = eg2vq_attn_mma(dy, dq, dk, dv, meta.pos, meta.len, off1, 1u, c.tokens,
+                                           n_head, c.n_head_kv, c.head_dim, c.half_swa);
+        if (mma_ran) {
+            CK(cudaDeviceSynchronize());
+            ymma.assign(yref.size(), 0.0f);
+            CK(cudaMemcpy(ymma.data(), dy, ymma.size() * 4, cudaMemcpyDeviceToHost));
+            const a_cmp cm = a_compare(yref, ymma, c.tokens, n_head, c.head_dim);
+            const int badm = (cm.rel > kMmaRelBound || cm.min_cos < kMmaCosBound);
+            printf("%-44s tok %4u hd %3u kv %u half %5d | mma    maxabs %.2e rel %.2e mincos %.9f | %s\n",
+                   c.tag, c.tokens, c.head_dim, c.n_head_kv, c.half_swa, cm.max_abs, cm.rel, cm.min_cos,
+                   badm ? "OUT OF BOUND" : "ok");
+            if (badm) { fails++; }
+        } else {
+            printf("%-44s tok %4u hd %3u kv %u half %5d | mma    not covered by the tensor-core geometry\n",
+                   c.tag, c.tokens, c.head_dim, c.n_head_kv, c.half_swa);
+        }
+
+        /* The DISPATCH, not just the kernels: eg2vq_attn must send every shape
+         * the tensor-core geometry covers to the tensor-core kernel and every
+         * other shape to the scalar one, and "the same kernel" means the output
+         * is bit for bit that path's.  No row threshold is involved -- unit 27's
+         * byte-identical batch contract requires one arithmetic per shape
+         * regardless of how many items share the call (see the header). */
+        if (mma_ran) {
+            CK(cudaMemset(dy, 0, yref.size() * 4));
+            eg2vq_attn(dy, dq, dk, dv, meta.pos, meta.len, c.tokens, n_head, c.n_head_kv,
+                       c.head_dim, c.half_swa, off1, 1u);
+            CK(cudaDeviceSynchronize());
+            std::vector<float> ydisp(yref.size());
+            CK(cudaMemcpy(ydisp.data(), dy, ydisp.size() * 4, cudaMemcpyDeviceToHost));
+            const int same = (memcmp(ydisp.data(), ymma.data(), ydisp.size() * 4) == 0);
+            printf("%-44s tok %4u | dispatch chose the tensor-core path | %s\n", c.tag, c.tokens,
+                   same ? "bit-identical PASS" : "DIFFERENT FAIL");
+            if (!same) { fails++; }
+        }
         free_meta(meta);
         cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dy);
     }
@@ -215,7 +296,7 @@ int main(void) {
         CK(cudaMemcpy(dk, k.data(), k.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dv, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMemset(dy, 0, yref.size() * 4));
-        eg2vq_attn(dy, dq, dk, dv, meta.pos, meta.len, tok, n_head, nkv, hd, half);
+        eg2vq_attn_scalar(dy, dq, dk, dv, meta.pos, meta.len, tok, n_head, nkv, hd, half);
         CK(cudaDeviceSynchronize());
         std::vector<float> ydev(yref.size());
         CK(cudaMemcpy(ydev.data(), dy, ydev.size() * 4, cudaMemcpyDeviceToHost));
@@ -250,6 +331,43 @@ int main(void) {
         printf("%-44s %s\n", "mask edge (512 sees / 513 blind)",
                (edge_ok && blind_ok) ? "distance 512 sees row 1100, 513 and beyond blind PASS" : "FAIL");
         if (!(edge_ok && blind_ok)) { fails++; }
+
+        /* The same edge on the tensor-core path.  The blind side is structural
+         * (a fully masked tile leaves the accumulator at zero and the f16
+         * rounding of nothing is nothing), so it must still be EXACTLY zero;
+         * the inside side is a parity comparison at the tensor-core bound. */
+        CK(cudaMemset(dy, 0, yref.size() * 4));
+        const uint32_t off1[2] = { 0u, tok };
+        int mma_ok = 1;
+        if (!eg2vq_attn_mma(dy, dq, dk, dv, meta.pos, meta.len, off1, 1u, tok, n_head, nkv, hd, half)) {
+            printf("%-44s the tensor-core launcher refused the mask-edge shape\n", "mask edge, tensor cores");
+            mma_ok = 0;
+        }
+        if (mma_ok) {
+            CK(cudaDeviceSynchronize());
+            std::vector<float> ymma(yref.size());
+            CK(cudaMemcpy(ymma.data(), dy, ymma.size() * 4, cudaMemcpyDeviceToHost));
+            for (uint32_t i = 0; i < 2; i++) {
+                const size_t at = (size_t)inside[i] * q_stride;
+                if (yref[at] == 0.0f || fabsf(ymma[at] - yref[at]) > 1e-3f * fabsf(yref[at])) {
+                    printf("   inside query %u: ref %.6g mma %.6g\n", inside[i], (double)yref[at], (double)ymma[at]);
+                    mma_ok = 0;
+                }
+                const size_t bt = (size_t)outside[i] * q_stride;
+                for (uint32_t h = 0; h < n_head && mma_ok; h++) {
+                    for (uint32_t d = 0; d < hd; d++) {
+                        if (ymma[bt + (size_t)h * hd + d] != 0.0f) {
+                            printf("   outside query %u head %u dim %u: mma gives %.6g (should be 0)\n",
+                                   outside[i], h, d, (double)ymma[bt + (size_t)h * hd + d]);
+                            mma_ok = 0;
+                        }
+                    }
+                }
+            }
+        }
+        printf("%-44s %s\n", "mask edge, tensor cores",
+               mma_ok ? "distance 512 sees row 1100, 513 and beyond blind PASS" : "FAIL");
+        if (!mma_ok) { fails++; }
         free_meta(meta);
         cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dy);
     }
@@ -307,7 +425,9 @@ int main(void) {
         CK(cudaMemcpy(dlen, lenv.data(), (size_t)tok * 4, cudaMemcpyHostToDevice));
         CK(cudaMemset(dy, 0, yref.size() * 4));
         int packed_ok = 1;
-        if (!eg2vq_attn(dy, dq, dk, dv, dpos, dlen, tok, n_head, nkv, hd, half)) {
+        /* the plane is the item ceiling, so this case's own bound is the item
+         * lengths being different, not a cap the caller passes. */
+        if (!eg2vq_attn_scalar(dy, dq, dk, dv, dpos, dlen, tok, n_head, nkv, hd, half)) {
             printf("FAIL: the launcher refused the packed block\n");
             fails++;
             packed_ok = 0;
@@ -344,6 +464,27 @@ int main(void) {
                    (rel <= 1e-5 && min_cos >= 1.0 - 1e-6) ? "each row reads its own item PASS" : "FAIL");
             if (!(rel <= 1e-5 && min_cos >= 1.0 - 1e-6)) { fails++; }
         }
+
+        /* The same packed block on the tensor-core path, with the call's real
+         * span table -- this is the leg that proves a CTA never straddles an
+         * item: the tile ordinals are mapped through the item lengths, so the
+         * 40-row item's tile and the 1,200-row item's tiles are separate CTAs. */
+        CK(cudaMemset(dy, 0, yref.size() * 4));
+        const uint32_t off2[3] = { 0u, lens[0], lens[0] + lens[1] };
+        if (eg2vq_attn_mma(dy, dq, dk, dv, dpos, dlen, off2, 2u, tok, n_head, nkv, hd, half)) {
+            CK(cudaDeviceSynchronize());
+            std::vector<float> ymma(yref.size());
+            CK(cudaMemcpy(ymma.data(), dy, ymma.size() * 4, cudaMemcpyDeviceToHost));
+            const a_cmp cm = a_compare(yref, ymma, tok, n_head, hd);
+            const int badm = (cm.rel > kMmaRelBound || cm.min_cos < kMmaCosBound);
+            printf("%-44s mma rel %.2e mincos %.9f maxabs %.2e | %s\n", "two items packed, tensor cores",
+                   cm.rel, cm.min_cos, cm.max_abs,
+                   badm ? "FAIL" : "each row reads its own item PASS");
+            if (badm) { fails++; }
+        } else {
+            printf("%-44s the tensor-core launcher refused the packed block\n", "two items packed, tensor cores");
+            fails++;
+        }
         cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dy);
         cudaFree(dpos); cudaFree(dlen);
     }
@@ -363,7 +504,9 @@ int main(void) {
         CK(cudaMalloc(&dq, q.size() * 4)); CK(cudaMalloc(&dk, k.size() * 4));
         CK(cudaMalloc(&dv, v.size() * 4)); CK(cudaMalloc(&dy, y.size() * 4));
         CK(cudaMemcpy(dy, y.data(), y.size() * 4, cudaMemcpyHostToDevice));
-        const int took = eg2vq_attn(dy, dq, dk, dv, meta.pos, meta.len, tok, n_head + 1, nkv, hd, 512);
+        const uint32_t off1[2] = { 0u, tok };
+        const int took = eg2vq_attn(dy, dq, dk, dv, meta.pos, meta.len, tok, n_head + 1, nkv, hd, 512,
+                                    off1, 1u);
         CK(cudaDeviceSynchronize());
         std::vector<float> back(64);
         CK(cudaMemcpy(back.data(), dy, back.size() * 4, cudaMemcpyDeviceToHost));

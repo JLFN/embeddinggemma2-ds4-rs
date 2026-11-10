@@ -1,0 +1,19 @@
+# qa identity: old(31285531) vs new(8d618ecb), same bytes in one process
+id256x512-t1           rows=256    cols=512   tok=1    ts=512    old_rc=1 new_rc=1  differing 0 of 256 floats  maxabs 0.000e+00 maxrel 0.000e+00
+id256x512-t70          rows=256    cols=512   tok=70   ts=512    old_rc=1 new_rc=1  differing 0 of 17920 floats  maxabs 0.000e+00 maxrel 0.000e+00
+id256x512-t257         rows=256    cols=512   tok=257  ts=512    old_rc=1 new_rc=1  differing 0 of 65792 floats  maxabs 0.000e+00 maxrel 0.000e+00
+id256x512-t512         rows=256    cols=512   tok=512  ts=512    old_rc=1 new_rc=1  differing 0 of 131072 floats  maxabs 0.000e+00 maxrel 0.000e+00
+id256x512-t64          rows=256    cols=512   tok=64   ts=512    old_rc=1 new_rc=1  differing 0 of 16384 floats  maxabs 0.000e+00 maxrel 0.000e+00
+big12288x2048-t1       rows=12288  cols=2048  tok=1    ts=2048   old_rc=1 new_rc=1  differing 0 of 12288 floats  maxabs 0.000e+00 maxrel 0.000e+00
+big12288x2048-t64      rows=12288  cols=2048  tok=64   ts=2048   old_rc=1 new_rc=1  differing 0 of 786432 floats  maxabs 0.000e+00 maxrel 0.000e+00
+big12288x2048-t512     rows=12288  cols=2048  tok=512  ts=2048   old_rc=1 new_rc=1  differing 0 of 6291456 floats  maxabs 0.000e+00 maxrel 0.000e+00
+rows64x512-t1          rows=64     cols=512   tok=1    ts=512    old_rc=1 new_rc=1  differing 0 of 64 floats  maxabs 0.000e+00 maxrel 0.000e+00
+rows64x512-t65         rows=64     cols=512   tok=65   ts=512    old_rc=1 new_rc=1  differing 0 of 4160 floats  maxabs 0.000e+00 maxrel 0.000e+00
+big12288x2048-t70      rows=12288  cols=2048  tok=70   ts=2048   old_rc=1 new_rc=1  differing 0 of 860160 floats  maxabs 0.000e+00 maxrel 0.000e+00
+big12288x2048-t257     rows=12288  cols=2048  tok=257  ts=2048   old_rc=1 new_rc=1  differing 0 of 3158016 floats  maxabs 0.000e+00 maxrel 0.000e+00
+rows512x512-t65        rows=512    cols=512   tok=65   ts=512    old_rc=1 new_rc=1  differing 0 of 33280 floats  maxabs 0.000e+00 maxrel 0.000e+00
+strided512x512-t130    rows=512    cols=512   tok=130  ts=576    old_rc=1 new_rc=1  differing 0 of 66560 floats  maxabs 0.000e+00 maxrel 0.000e+00
+rows2048x1024-t512     rows=2048   cols=1024  tok=512  ts=1024   old_rc=1 new_rc=1  differing 0 of 1048576 floats  maxabs 0.000e+00 maxrel 0.000e+00
+launcher refusal path: old refused 9 of 9, new refused 9 of 9
+cases with differing floats: 0 of 15
+QA_IDENTITY_OK

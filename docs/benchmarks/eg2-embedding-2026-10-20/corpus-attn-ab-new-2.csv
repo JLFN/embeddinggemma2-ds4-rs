@@ -1,0 +1,7 @@
+label,backend,clock,items,tokens,wall_s,tokens_per_s,note
+cli_cold,cuda,wall,1,115,.558685530,205.8403,port_secs=0.024611
+srv_single_p50,cuda,wall,1,115,.015780832,7287.321,3 repeats; min=.014469476 max=.025163487 mean=0.018471
+srv_single_p95,cuda,wall,1,115,.025163487,4570.113,p95
+srv_batch_1,cuda,wall,143,80747,3.904524044,20680.36,corpus=143 pages
+srv_batch_4,cuda,wall,143,80747,2.042188016,39539.45,corpus=143 pages
+srv_batch_8,cuda,wall,143,80747,1.800234191,44853.60,corpus=143 pages
