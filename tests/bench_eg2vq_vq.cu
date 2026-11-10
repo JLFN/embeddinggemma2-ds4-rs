@@ -101,9 +101,10 @@ int main(int argc, char **argv) {
     };
     const uint32_t toks[] = { 1, 115, 306, 565, 1414, 4520 };
 
-    printf("# bench_eg2vq_vq — %d repeats per row, one kernel launch per measurement\n", repeats);
-    printf("%-16s %6s %6s %7s %10s %10s %10s %9s\n",
-           "shape", "rows", "cols", "tokens", "ms_min", "ms_med", "ms_max", "gflop/s");
+    printf("# bench_eg2vq_vq — %d repeats per row, one kernel launch per measurement, five paths\n", repeats);
+    printf("%-16s %6s %6s %7s %10s %10s %10s %10s %10s %8s %9s %9s\n",
+           "shape", "rows", "cols", "tokens", "ms_scalar", "ms_mma64", "ms_mma128",
+           "ms_w32", "ms_w64", "speedup", "gf_scalar", "gf_best");
     int fail = 0;
     for (const q_shape &s : shapes) {
         /* one payload per shape, reused across the token counts */
@@ -130,34 +131,51 @@ int main(int argc, char **argv) {
             CK(cudaFree(dy));
             CK(cudaMalloc(&dy, out_elems * 4));
             const double flop = 2.0 * (double)s.rows * (double)s.cols * (double)tok;
-            if (!eg2vq_vq_gemm(dy, dx, s.cols, dpay, s.rows, s.cols, tok)) {
-                printf("%-16s REFUSED by the launcher\n", s.tag);
-                fail = 1;
-                continue;
-            }
-            std::vector<float> ms;
-            for (int rep = 0; rep < repeats + 3; rep++) {
-                cudaEvent_t a, b;
-                CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
-                CK(cudaEventRecord(a));
-                if (!eg2vq_vq_gemm(dy, dx, s.cols, dpay, s.rows, s.cols, tok)) { fail = 1; break; }
-                CK(cudaEventRecord(b));
-                CK(cudaEventSynchronize(b));
-                float msec = 0.0f;
-                CK(cudaEventElapsedTime(&msec, a, b));
-                if (rep >= 3) { ms.push_back(msec); }
-                CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
-            }
-            if (ms.empty()) { continue; }
-            std::vector<float> sorted = ms;
-            for (size_t i = 0; i + 1 < sorted.size(); i++) {
-                for (size_t j = i + 1; j < sorted.size(); j++) {
-                    if (sorted[j] < sorted[i]) { const float t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t; }
+            /* Both paths on the same bytes: the scalar kernel and the tensor-core
+             * kernel, each timed alone, so the unit's A/B is one window. */
+            struct benchpath {
+                int (*fn)(float *, const float *, uint32_t, const uint8_t *, uint32_t, uint32_t, uint32_t);
+                const char *name;
+            };
+            const benchpath paths[5] = {
+                { eg2vq_vq_gemm_scalar, "scalar" },
+                { eg2vq_vq_gemm_mma64,  "mma64" },   /* register-direct A fragment, PTX mma */
+                { eg2vq_vq_gemm_mma128, "mma128" },
+                { eg2vq_vq_gemm_wmma32, "w32" },     /* staged f16 tile, nvcuda::wmma (PR 143 form) */
+                { eg2vq_vq_gemm_wmma64, "w64" },
+            };
+            float med[5] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+            for (int p = 0; p < 5; p++) {
+                std::vector<float> ms;
+                for (int rep = 0; rep < repeats + 3; rep++) {
+                    cudaEvent_t a, b;
+                    CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+                    CK(cudaEventRecord(a));
+                    if (!paths[p].fn(dy, dx, s.cols, dpay, s.rows, s.cols, tok)) { fail = 1; break; }
+                    CK(cudaEventRecord(b));
+                    CK(cudaEventSynchronize(b));
+                    float msec = 0.0f;
+                    CK(cudaEventElapsedTime(&msec, a, b));
+                    if (rep >= 3) { ms.push_back(msec); }
+                    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
                 }
+                if (ms.empty()) { continue; }
+                std::vector<float> sorted = ms;
+                for (size_t i = 0; i + 1 < sorted.size(); i++) {
+                    for (size_t j = i + 1; j < sorted.size(); j++) {
+                        if (sorted[j] < sorted[i]) { const float t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t; }
+                    }
+                }
+                med[p] = sorted[sorted.size() / 2];
             }
-            const float mn = sorted.front(), mx = sorted.back(), md = sorted[sorted.size() / 2];
-            printf("%-16s %6u %6u %7u %10.4f %10.4f %10.4f %9.1f\n",
-                   s.tag, s.rows, s.cols, tok, mn, md, mx, flop / ((double)md * 1.0e6));
+            int ok = 1;
+            for (int p = 0; p < 5; p++) { if (med[p] <= 0.0f) { ok = 0; } }
+            if (!ok) { continue; }
+            float best = med[1];
+            for (int p = 2; p < 5; p++) { if (med[p] > 0.0f && med[p] < best) { best = med[p]; } }
+            printf("%-16s %6u %6u %7u %10.4f %10.4f %10.4f %10.4f %10.4f %8.2f %9.1f %9.1f\n",
+                   s.tag, s.rows, s.cols, tok, med[0], med[1], med[2], med[3], med[4],
+                   med[0] / best, flop / ((double)med[0] * 1.0e6), flop / ((double)best * 1.0e6));
         }
         CK(cudaFree(dpay));
         CK(cudaFree(dx));

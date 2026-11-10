@@ -1,0 +1,8 @@
+# gate 7 device leg, old (7cafa2a2) vs new (working tree), same 300 ids, interleaved
+# command: tests/parity/eg2vq_embd_gpu_oracle <artifact> out/phase5-ids.tsv --items 300 --no-cpu
+round 1 old  3.15 s total  0.011 s/item  2556.9 tokens/s  (steady 2559.6)
+round 1 new  1.92 s total  0.006 s/item  4193.9 tokens/s  (steady 4197.8)
+round 2 old  3.13 s total  0.010 s/item  2578.7 tokens/s  (steady 2580.6)
+round 2 new  1.92 s total  0.006 s/item  4193.4 tokens/s  (steady 4197.2)
+ratio old/new: 2556.9/4193.9 = 1.64x; 2578.7/4193.4 = 1.63x
+both builds: EG2VQ_GPU_PASS
