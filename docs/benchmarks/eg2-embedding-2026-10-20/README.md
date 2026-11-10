@@ -11,11 +11,11 @@ number instead of a feeling.
 | Artifact | `EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf`, sha256 `5bcf2216…`, 417.2 MiB, 1376 tensors |
 | Family | `gemma_vq` (embedding; no language-model head) |
 | Backends | `cuda` (RTX 4070 SUPER, 12 GB, CUDA 13.3) and `cpu` (28 threads) |
-| Host | `vizzio`, 31 GiB RAM |
+| Memory | 31 GiB RAM |
 | Workload | the 143 pages of *Riksavtalet 2023-2025* (Kollektivavtal2023_230607_0.pdf), 36,385 words, 80,747 tokens through the tower as Swedish legal text |
 | Route | `POST /v1/embeddings`, task `Retrieval-document` for the corpus, `Retrieval-query` for single items |
 | Harness | `speed-bench/eg2_embed_sweep.sh` (this repo's speed-bench CSV standard) |
-| Raw result | `speed-bench/eg2_embed_vizzio.csv` and its `_health.json` |
+| Raw result | `speed-bench/eg2_embed_bench.csv` and its `_health.json` |
 
 Every server row is **wall clock around the request**, because the route returns
 no elapsed field and `GET /v1/stats` counts only the chat/completion/responses
@@ -128,7 +128,7 @@ interleaved pairing published. [All samples](perf-tables.md) and the
 ```sh
 cd ds4-rs
 sh speed-bench/eg2_embed_sweep.sh \
-  /data/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
+  <root>/embeddinggemma2/out/EmbeddingGemma-2-914f7f8-vq4x4096-q80token-gemma_vq.gguf \
   <dir of pNNN.txt pages> 8098
 ```
 

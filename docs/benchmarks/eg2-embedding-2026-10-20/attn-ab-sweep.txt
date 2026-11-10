@@ -1,7 +1,7 @@
 # the embedding corpus (143 pages, 80,747 tokens) old vs new, 2026-10-21 08:44-09:04,
 # interleaved old r1, old r2, new r1, old r3, new r2, old r4 (each new run is
 # sandwiched between old runs)
-# source: speed-bench/eg2_embed_vizzio_attn-ab-{old-r1..r4,new-r1,new-r2}.csv
+# source: speed-bench/eg2_embed_bench_attn-ab-{old-r1..r4,new-r1,new-r2}.csv
 # batch 14 is the sweep's own PARTIAL row (14 items, 5,091 tokens), not the corpus.
 # The first attempt at this A/B measured nothing: ports 8099/8101 were held by an
 # unrelated python3 listener, so the sweep's own /health probe passed against the

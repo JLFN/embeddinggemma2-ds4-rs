@@ -6,7 +6,7 @@
       "colour": "#687789",
       "runs": 1,
       "files": [
-        "eg2_embed_vizzio.csv"
+        "eg2_embed_bench.csv"
       ],
       "mean": [
         3307.137,
@@ -32,9 +32,9 @@
       "colour": "#087f8c",
       "runs": 3,
       "files": [
-        "eg2_embed_vizzio_attn-vec4.csv",
-        "eg2_embed_vizzio_attn-vec4_r2.csv",
-        "eg2_embed_vizzio_attn-vec4_r3.csv"
+        "eg2_embed_bench_attn-vec4.csv",
+        "eg2_embed_bench_attn-vec4_r2.csv",
+        "eg2_embed_bench_attn-vec4_r3.csv"
       ],
       "mean": [
         5455.359333333334,
@@ -60,8 +60,8 @@
       "colour": "#7c3aed",
       "runs": 2,
       "files": [
-        "eg2_embed_vizzio_vq-ab-new-r1.csv",
-        "eg2_embed_vizzio_vq-ab-new-r2.csv"
+        "eg2_embed_bench_vq-ab-new-r1.csv",
+        "eg2_embed_bench_vq-ab-new-r2.csv"
       ],
       "mean": [
         6861.269,
@@ -87,8 +87,8 @@
       "colour": "#c2410c",
       "runs": 2,
       "files": [
-        "eg2_embed_vizzio_attn-ab-new-r1.csv",
-        "eg2_embed_vizzio_attn-ab-new-r2.csv"
+        "eg2_embed_bench_attn-ab-new-r1.csv",
+        "eg2_embed_bench_attn-ab-new-r2.csv"
       ],
       "mean": [
         9335.957,

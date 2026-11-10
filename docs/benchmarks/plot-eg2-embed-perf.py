@@ -40,14 +40,14 @@ DATE = DATA.name[-10:]
 # --- the corpus ladder (speed-bench CSVs, in the order the units landed) -------
 # Each entry: label, colour, list of CSV basenames (one per run of that build).
 LADDER = [
-    ("baseline", "#687789", ["eg2_embed_vizzio.csv"]),
-    ("attention vectorized", "#087f8c", ["eg2_embed_vizzio_attn-vec4.csv",
-                                         "eg2_embed_vizzio_attn-vec4_r2.csv",
-                                         "eg2_embed_vizzio_attn-vec4_r3.csv"]),
-    ("payload GEMM rows 8", "#7c3aed", ["eg2_embed_vizzio_vq-ab-new-r1.csv",
-                                        "eg2_embed_vizzio_vq-ab-new-r2.csv"]),
-    ("attention grouped", "#c2410c", ["eg2_embed_vizzio_attn-ab-new-r1.csv",
-                                      "eg2_embed_vizzio_attn-ab-new-r2.csv"]),
+    ("baseline", "#687789", ["eg2_embed_bench.csv"]),
+    ("attention vectorized", "#087f8c", ["eg2_embed_bench_attn-vec4.csv",
+                                         "eg2_embed_bench_attn-vec4_r2.csv",
+                                         "eg2_embed_bench_attn-vec4_r3.csv"]),
+    ("payload GEMM rows 8", "#7c3aed", ["eg2_embed_bench_vq-ab-new-r1.csv",
+                                        "eg2_embed_bench_vq-ab-new-r2.csv"]),
+    ("attention grouped", "#c2410c", ["eg2_embed_bench_attn-ab-new-r1.csv",
+                                      "eg2_embed_bench_attn-ab-new-r2.csv"]),
 ]
 BATCHES = (1, 2, 4, 8)
 
@@ -228,7 +228,7 @@ def plot(builds, shapes, kbuilds, profiles, report):
     ax.legend(loc="lower right", framealpha=0.92, fontsize=9)
 
     fig.text(0.5, 0.055,
-             "Corpus: speed-bench/eg2_embed_vizzio*.csv (shape: one fresh ds4-server per sweep).  "
+             "Corpus: speed-bench/eg2_embed_bench*.csv (shape: one fresh ds4-server per sweep).  "
              "Attention: docs/benchmarks/eg2-embedding-2026-10-20/bench-attn-{before,after}.txt and "
              "attn-ab-new-r{1,2}.txt.\nSplit: the committed nsys cuda_gpu_kern_sum reports of one "
              "8-item / 2,451-token request; the older report (401.2 ms) profiles a build whose score "
